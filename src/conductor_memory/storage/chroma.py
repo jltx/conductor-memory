@@ -149,6 +149,140 @@ class FileIndexMetadata:
         return indexed_files
 
 
+class SummaryIndexMetadata:
+    """Tracks metadata for summarized files to support incremental re-summarization"""
+    
+    def __init__(self, client: chromadb.ClientAPI, collection_name: str = "summary_index_metadata"):
+        """
+        Initialize summary index metadata tracker
+        
+        Args:
+            client: Chroma client instance
+            collection_name: Name of the metadata collection
+        """
+        self.client = client
+        self.collection_name = collection_name
+        
+        try:
+            self.collection = self.client.get_collection(name=collection_name)
+            logger.info(f"Connected to existing summary index metadata collection: {collection_name}")
+        except Exception:
+            self.collection = self.client.create_collection(
+                name=collection_name,
+                metadata={"hnsw:space": "cosine"}
+            )
+            logger.info(f"Created new summary index metadata collection: {collection_name}")
+    
+    def get_summary_info(self, file_path: str) -> Optional[Dict[str, Any]]:
+        """Get stored summary metadata for a file"""
+        try:
+            result = self.collection.get(ids=[file_path], include=["metadatas"])
+            if result["ids"]:
+                return result["metadatas"][0]
+        except Exception as e:
+            logger.debug(f"Summary not found for file: {file_path} - {e}")
+        return None
+    
+    def update_summary_info(
+        self, 
+        file_path: str, 
+        content_hash: str, 
+        summary_chunk_id: str,
+        model: str,
+        pattern: str = "",
+        domain: str = ""
+    ) -> None:
+        """Update or insert summary metadata after summarization"""
+        metadata = {
+            "content_hash": content_hash,
+            "summary_chunk_id": summary_chunk_id,
+            "model": model,
+            "pattern": pattern,
+            "domain": domain,
+            "summarized_at": datetime.now().isoformat()
+        }
+        
+        try:
+            self.collection.upsert(
+                ids=[file_path],
+                metadatas=[metadata],
+                documents=[file_path]  # Required by Chroma
+            )
+        except Exception as e:
+            logger.warning(f"Error updating summary index metadata for {file_path}: {e}")
+    
+    def delete_summary_info(self, file_path: str) -> Optional[str]:
+        """Delete summary metadata and return the summary chunk ID to remove"""
+        try:
+            result = self.collection.get(ids=[file_path], include=["metadatas"])
+            if result["ids"] and result["metadatas"]:
+                chunk_id = result["metadatas"][0].get("summary_chunk_id", "")
+                self.collection.delete(ids=[file_path])
+                return chunk_id if chunk_id else None
+        except Exception as e:
+            logger.warning(f"Error deleting summary index metadata for {file_path}: {e}")
+        return None
+    
+    def needs_resummarization(self, file_path: str, content_hash: str) -> bool:
+        """
+        Check if a file needs to be re-summarized based on content hash
+        
+        Args:
+            file_path: Relative path to the file
+            content_hash: Hash of current file content
+            
+        Returns:
+            True if file needs re-summarization
+        """
+        summary_info = self.get_summary_info(file_path)
+        if summary_info is None:
+            return True  # Not summarized yet
+        
+        stored_hash = summary_info.get("content_hash", "")
+        return content_hash != stored_hash
+    
+    def get_all_summarized_files(self) -> Dict[str, Dict[str, Any]]:
+        """Get all summarized file paths and their metadata"""
+        summarized_files = {}
+        try:
+            result = self.collection.get(include=["metadatas"])
+            if result["ids"]:
+                for i, file_path in enumerate(result["ids"]):
+                    summarized_files[file_path] = result["metadatas"][i]
+        except Exception as e:
+            logger.warning(f"Error getting summarized files: {e}")
+        return summarized_files
+    
+    def get_summary_stats(self) -> Dict[str, Any]:
+        """Get summary statistics"""
+        try:
+            all_files = self.get_all_summarized_files()
+            
+            # Count by pattern
+            patterns = {}
+            domains = {}
+            models = {}
+            
+            for file_path, info in all_files.items():
+                pattern = info.get("pattern", "unknown")
+                domain = info.get("domain", "unknown")
+                model = info.get("model", "unknown")
+                
+                patterns[pattern] = patterns.get(pattern, 0) + 1
+                domains[domain] = domains.get(domain, 0) + 1
+                models[model] = models.get(model, 0) + 1
+            
+            return {
+                "total_summarized": len(all_files),
+                "by_pattern": patterns,
+                "by_domain": domains,
+                "by_model": models
+            }
+        except Exception as e:
+            logger.warning(f"Error getting summary stats: {e}")
+            return {"total_summarized": 0, "error": str(e)}
+
+
 class ChromaVectorStore(VectorStore):
     """
     Chroma-based implementation of VectorStore for persistent vector storage
@@ -196,6 +330,9 @@ class ChromaVectorStore(VectorStore):
         
         # Initialize file index metadata tracker
         self.file_index = FileIndexMetadata(self.client, f"{collection_name}_file_index")
+        
+        # Initialize summary index metadata tracker (for incremental re-summarization)
+        self.summary_index = SummaryIndexMetadata(self.client, f"{collection_name}_summary_index")
 
     def add(self, chunk: MemoryChunk, embedding: List[float]) -> None:
         """

@@ -9,8 +9,9 @@ A standalone semantic memory service with codebase indexing for AI agents. Provi
 - **Codebase Indexing**: AST-aware chunking for Python, with support for 15+ languages
 - **Multi-Codebase Support**: Index and search across multiple projects
 - **Incremental Indexing**: Only re-indexes changed files (tracks mtime + content hash)
-- **MCP Integration**: Model Context Protocol servers for AI agent tools
-- **HTTP REST API**: FastAPI-based server with automatic OpenAPI docs
+- **Background Summarization**: LLM-powered file summaries using Ollama
+- **MCP Integration**: Model Context Protocol server for AI agent tools
+- **Web Dashboard**: Real-time monitoring of indexing and summarization progress
 
 ## Installation
 
@@ -34,9 +35,7 @@ Create `~/.conductor-memory/config.json`:
 ```json
 {
   "host": "127.0.0.1",
-  "http_port": 9800,
-  "tcp_port": 9801,
-  "persist_directory": "~/.conductor-memory/data",
+  "persist_directory": "~/.conductor-memory",
   "codebases": [
     {
       "name": "my-project",
@@ -45,30 +44,64 @@ Create `~/.conductor-memory/config.json`:
       "ignore_patterns": ["__pycache__", ".git", "node_modules", "venv"]
     }
   ],
-  "embedding_model": "all-MiniLM-L12-v2"
+  "embedding_model": "all-MiniLM-L12-v2",
+  "enable_file_watcher": true,
+  "summarization": {
+    "enabled": true,
+    "llm_enabled": true,
+    "ollama_url": "http://localhost:11434",
+    "model": "qwen2.5-coder:1.5b"
+  }
 }
 ```
 
 ### 2. Start the Server
 
 ```bash
-# Start the SSE server (recommended for multi-client setups)
-python -m conductor_memory.server.sse --config ~/.conductor-memory/config.json
+# Start the SSE server
+python -m conductor_memory.server.sse --port 9820
 
-# Or use stdio mode (spawned by MCP clients like OpenCode/Claude)
-python -m conductor_memory.server.stdio --config ~/.conductor-memory/config.json
-
-# Or start the unified HTTP + TCP server
-python scripts/start_server.py --config ~/.conductor-memory/config.json
+# Or use the start script (Windows)
+.\scripts\start.ps1
 ```
 
-### 3. Use the API
+The server will be available at:
+- **Dashboard**: http://localhost:9820/
+- **MCP SSE endpoint**: http://localhost:9820/sse
+- **Health check**: http://localhost:9820/health
+
+### 3. Configure Your AI Client
+
+Add to your `opencode.json`:
+```json
+{
+  "mcp": {
+    "memory": {
+      "type": "remote",
+      "url": "http://localhost:9820/sse"
+    }
+  }
+}
+```
+
+Or for Claude Desktop (`claude_desktop_config.json`):
+```json
+{
+  "mcpServers": {
+    "memory": {
+      "url": "http://localhost:9820/sse"
+    }
+  }
+}
+```
+
+### 4. Use the API
 
 ```python
 import requests
 
 # Search for relevant code
-response = requests.post("http://localhost:9800/search", json={
+response = requests.post("http://localhost:9820/search", json={
     "query": "how does authentication work",
     "max_results": 5
 })
@@ -77,30 +110,6 @@ results = response.json()
 for r in results["results"]:
     print(f"Score: {r['relevance_score']:.3f}")
     print(f"Content: {r['content'][:200]}...")
-    print()
-```
-
-### 4. Programmatic Usage
-
-```python
-from conductor_memory import MemoryService, ServerConfig
-
-# Load config and initialize
-config = ServerConfig.from_file("~/.conductor-memory/config.json")
-service = MemoryService(config)
-service.initialize()  # Blocks until indexing completes
-
-# Search
-results = service.search("authentication middleware", max_results=5)
-for r in results["results"]:
-    print(r["content"])
-
-# Store a memory
-service.store(
-    content="Important architectural decision about auth...",
-    tags=["architecture", "auth"],
-    memory_type="decision"
-)
 ```
 
 ## Configuration
@@ -108,9 +117,8 @@ service.store(
 ### Default Data Directory
 
 By default, conductor-memory stores data in `~/.conductor-memory/`:
-- `data/` - ChromaDB vector database
+- ChromaDB vector database
 - `config.json` - Server configuration
-- `memory_server.log` - Server logs
 
 ### Environment Variables
 
@@ -118,11 +126,7 @@ By default, conductor-memory stores data in `~/.conductor-memory/`:
 # Override config file location
 CONDUCTOR_MEMORY_CONFIG=/path/to/config.json
 
-# ChromaDB settings
-CHROMA_PERSIST_DIR=~/.conductor-memory/data
-CHROMA_COLLECTION=memory_chunks
-
-# Embedding model
+# Embedding settings
 EMBEDDING_MODEL=all-MiniLM-L12-v2
 EMBEDDING_DEVICE=cuda  # Use GPU if available
 ```
@@ -137,6 +141,17 @@ EMBEDDING_DEVICE=cuda  # Use GPU if available
 | `ignore_patterns` | Patterns to exclude | `__pycache__`, `.git`, etc. |
 | `enabled` | Whether to index this codebase | `true` |
 | `description` | Human-readable description | `""` |
+
+### Summarization Configuration
+
+| Field | Description | Default |
+|-------|-------------|---------|
+| `enabled` | Enable background summarization | `false` |
+| `llm_enabled` | Enable LLM calls | `false` |
+| `ollama_url` | Ollama server URL | `http://localhost:11434` |
+| `model` | LLM model for summarization | `qwen2.5-coder:1.5b` |
+| `rate_limit_seconds` | Delay between LLM calls | `0.5` |
+| `timeout_seconds` | LLM request timeout | `30.0` |
 
 ## Search Modes
 
@@ -157,93 +172,7 @@ The `search_mode` parameter controls how queries are processed:
 - **Question words** (how, what, why) → semantic mode
 - **Mixed/unclear** → hybrid mode
 
-## MCP Integration
-
-Conductor Memory supports two transport modes:
-- **stdio**: Spawned as a subprocess (simpler, one process per client)
-- **SSE (Server-Sent Events)**: Runs as a persistent HTTP server (shared across clients)
-
-### Starting the SSE Server
-
-For SSE mode, start the server first:
-
-```bash
-# Using the Python module directly
-python -m conductor_memory.server.sse --config ~/.conductor-memory/config.json
-
-# Or with custom host/port
-python -m conductor_memory.server.sse --host 127.0.0.1 --port 9820
-
-# Windows batch script
-scripts\start_mcp_sse.bat
-```
-
-The SSE server runs on `http://127.0.0.1:9820/sse` by default.
-
-### OpenCode Configuration
-
-Add to your `opencode.json`:
-
-**Option 1: stdio mode** (spawns a new process):
-```json
-{
-  "mcp": {
-    "memory": {
-      "command": ["python", "-m", "conductor_memory.server.stdio", "--config", "~/.conductor-memory/config.json"],
-      "enabled": true
-    }
-  }
-}
-```
-
-**Option 2: SSE mode** (connects to running server):
-```json
-{
-  "mcp": {
-    "memory": {
-      "type": "remote",
-      "url": "http://localhost:9820/sse"
-    }
-  }
-}
-```
-
-### Claude Code Configuration
-
-Add to your `claude_desktop_config.json` (typically at `%APPDATA%\Claude\claude_desktop_config.json` on Windows or `~/Library/Application Support/Claude/claude_desktop_config.json` on macOS):
-
-**Option 1: stdio mode**:
-```json
-{
-  "mcpServers": {
-    "memory": {
-      "command": "python",
-      "args": ["-m", "conductor_memory.server.stdio", "--config", "~/.conductor-memory/config.json"]
-    }
-  }
-}
-```
-
-**Option 2: SSE mode** (requires starting the server first):
-```json
-{
-  "mcpServers": {
-    "memory": {
-      "url": "http://localhost:9820/sse"
-    }
-  }
-}
-```
-
-### Other MCP Clients
-
-Any MCP-compatible client can connect using either transport:
-
-**stdio**: Spawn `python -m conductor_memory.server.stdio --config <path>`
-
-**SSE**: Connect to `http://<host>:<port>/sse` (default: `http://localhost:9820/sse`)
-
-### Available MCP Tools
+## Available MCP Tools
 
 | Tool | Description |
 |------|-------------|
@@ -252,46 +181,19 @@ Any MCP-compatible client can connect using either transport:
 | `memory_store_decision` | Store architectural decisions (auto-pinned) |
 | `memory_store_lesson` | Store debugging insights and lessons learned |
 | `memory_status` | Check indexing status and memory system health |
+| `memory_summarization_status` | Check LLM summarization progress |
 | `memory_prune` | Remove obsolete memories based on age/relevance |
 | `memory_delete` | Delete a specific memory by ID |
 
-## API Reference
-
-### HTTP Endpoints
+## REST API Endpoints
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
+| `/` | GET | Web dashboard |
 | `/health` | GET | Health check |
-| `/status` | GET | Server status with indexing progress |
-| `/codebases` | GET | List all codebases |
-| `/codebases/{name}/status` | GET | Codebase-specific status |
-| `/codebases/{name}/reindex` | POST | Trigger re-indexing |
-| `/search` | POST | Semantic/hybrid search |
-| `/store` | POST | Store memory |
-| `/prune` | POST | Prune memories |
-
-### Search Request
-
-```json
-{
-  "query": "how does X work",
-  "codebase": "my-project",  // optional, searches all if omitted
-  "max_results": 10,
-  "search_mode": "auto"  // auto, semantic, keyword, hybrid
-}
-```
-
-### Store Request
-
-```json
-{
-  "content": "Important information...",
-  "codebase": "my-project",
-  "tags": ["architecture", "decision"],
-  "memory_type": "decision",  // code, conversation, decision, lesson
-  "pin": true  // Prevents pruning
-}
-```
+| `/api/status` | GET | Full service status |
+| `/api/summarization` | GET | Summarization progress |
+| `/sse` | GET | MCP SSE endpoint |
 
 ## Architecture
 
@@ -302,10 +204,10 @@ conductor-memory/
 │   ├── storage/        # ChromaDB vector store
 │   ├── embedding/      # Sentence transformer embedder
 │   ├── search/         # Hybrid search, BM25, chunking
+│   ├── llm/            # Ollama client, summarizer
 │   ├── config/         # Configuration classes
 │   ├── service/        # MemoryService orchestrator
-│   ├── server/         # HTTP, stdio, SSE servers
-│   └── client/         # HTTP client tools
+│   └── server/         # SSE server with web dashboard
 ├── scripts/            # Startup scripts
 ├── tests/              # Test suite
 └── docs/               # Documentation

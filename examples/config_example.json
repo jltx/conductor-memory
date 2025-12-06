@@ -68,5 +68,39 @@
   "watch_interval": 5.0,
   "enable_file_watcher": true,
   "log_level": "INFO",
-  "embedding_model": "all-MiniLM-L12-v2"
+  "embedding_model": "all-MiniLM-L12-v2",
+  "summarization": {
+    "enabled": true,
+    "llm_enabled": true,
+    "ollama_url": "http://localhost:11434",
+    "model": "qwen2.5-coder:1.5b",
+    "_model_options": [
+      "qwen2.5-coder:0.5b  (398MB, fastest, basic quality)",
+      "qwen2.5-coder:1.5b  (986MB, fast, good quality) [DEFAULT]",
+      "qwen2.5-coder:3b    (1.9GB, moderate, better quality)",
+      "qwen2.5-coder:7b    (4.7GB, slower, best quality)",
+      "qwen3:1.7b          (1.4GB, newer general model)",
+      "qwen3:4b            (2.5GB, newer, 256K context)"
+    ],
+    "rate_limit_seconds": 0.5,
+    "timeout_seconds": 30.0,
+    "max_file_lines": 600,
+    "max_file_tokens": 4000,
+    "temperature": 0.1,
+    "max_response_tokens": 1024,
+    "skip_patterns": [
+      "**/test/**",
+      "**/*_test.*",
+      "**/vendor/**",
+      "**/node_modules/**",
+      "**/__pycache__/**",
+      "**/build/**",
+      "**/dist/**"
+    ],
+    "priority_patterns": [
+      "**/src/**",
+      "**/lib/**",
+      "**/core/**"
+    ]
+  }
 }

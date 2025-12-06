@@ -11,6 +11,8 @@ from pathlib import Path
 from typing import List, Optional, Dict, Any, Set
 from dataclasses import dataclass, field
 
+from .summarization import SummarizationConfig
+
 logger = logging.getLogger(__name__)
 
 
@@ -221,6 +223,9 @@ class ServerConfig:
     # Boost configuration
     boost_config: BoostConfig = field(default_factory=BoostConfig)
     
+    # Summarization configuration
+    summarization_config: SummarizationConfig = field(default_factory=SummarizationConfig)
+    
     def __post_init__(self):
         """Validate and normalize the configuration"""
         self.persist_directory = os.path.abspath(os.path.expanduser(self.persist_directory))
@@ -249,7 +254,8 @@ class ServerConfig:
             'embedding_model': self.embedding_model,
             'device': self.device,
             'embedding_batch_size': self.embedding_batch_size,
-            'boost_config': self.boost_config.to_dict()
+            'boost_config': self.boost_config.to_dict(),
+            'summarization': self.summarization_config.to_dict()
         }
     
     @classmethod
@@ -259,6 +265,7 @@ class ServerConfig:
             CodebaseConfig.from_dict(cb) for cb in data.get('codebases', [])
         ]
         boost_config = BoostConfig.from_dict(data.get('boost_config', {}))
+        summarization_config = SummarizationConfig.from_dict(data)
         return cls(
             host=data.get('host', '127.0.0.1'),
             port=data.get('port', 8000),
@@ -270,7 +277,8 @@ class ServerConfig:
             embedding_model=data.get('embedding_model', 'all-MiniLM-L12-v2'),
             device=data.get('device', 'auto'),
             embedding_batch_size=str(data.get('embedding_batch_size', 'auto')),
-            boost_config=boost_config
+            boost_config=boost_config,
+            summarization_config=summarization_config
         )
     
     @classmethod

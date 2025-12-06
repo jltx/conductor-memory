@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Any, Tuple
 
 from ..config.server import ServerConfig, CodebaseConfig
+from ..config.summarization import SummarizationConfig
 from ..storage.chroma import ChromaVectorStore
 from ..search.chunking import ChunkingManager, ChunkingStrategy
 from ..search.boosting import BoostCalculator
@@ -24,6 +25,7 @@ from ..core.models import MemoryChunk, RoleEnum, MemoryType
 from ..core.resources import detect_resources, get_optimal_device, SystemResources
 from ..embedding.sentence_transformer import SentenceTransformerEmbedder
 from ..search.hybrid import HybridSearcher, SearchMode
+from ..llm.summarizer import FileSummarizer, FileSummary
 
 logger = logging.getLogger(__name__)
 
@@ -115,6 +117,21 @@ class MemoryService:
         self.heuristic_extractor = HeuristicExtractor()
         self._import_graphs: Dict[str, ImportGraph] = {}  # One per codebase
         
+        # Phase 4: Background summarization
+        self._summarization_config = config.summarization_config
+        self._summarizer: Optional[FileSummarizer] = None
+        self._summarizer_task: Optional[asyncio.Task] = None
+        self._summary_queue: asyncio.PriorityQueue = asyncio.PriorityQueue()
+        self._query_active: asyncio.Event = asyncio.Event()
+        self._summarization_stats = {
+            "files_summarized": 0,
+            "files_queued": 0,
+            "files_failed": 0,
+            "current_file": None,
+            "is_running": False,
+            "last_error": None
+        }
+        
         # Initialize vector stores for each enabled codebase
         for codebase in config.get_enabled_codebases():
             self._init_codebase(codebase)
@@ -196,10 +213,20 @@ class MemoryService:
             for codebase, task in indexing_tasks:
                 await task
             
-            # Note: File watchers are NOT started here because when called via
-            # _run_sync(), we're in a temporary event loop that will close.
-            # File watchers should be started via start_file_watchers() in the
-            # main server's event loop.
+            # Note: File watchers and background summarizer are NOT started here 
+            # because when called via _run_sync(), we're in a temporary event loop 
+            # that will close. They should be started via start_file_watchers() 
+            # and start_background_summarizer() in the main server's event loop.
+        else:
+            # For background indexing mode, start summarizer after a delay
+            # to allow initial indexing to make progress
+            async def _delayed_summarizer_start():
+                # Wait for all codebases to finish initial indexing
+                while any(s["status"] == "indexing" for s in self._indexing_status.values()):
+                    await asyncio.sleep(2.0)
+                await self._start_background_summarizer()
+            
+            asyncio.create_task(_delayed_summarizer_start())
     
     async def search_async(
         self,
@@ -221,7 +248,10 @@ class MemoryService:
         has_annotations: Optional[bool] = None,
         has_docstrings: Optional[bool] = None,
         min_class_count: Optional[int] = None,
-        min_function_count: Optional[int] = None
+        min_function_count: Optional[int] = None,
+        # Phase 5: Summary integration
+        include_summaries: bool = False,
+        boost_summarized: bool = True
     ) -> Dict[str, Any]:
         """
         Search for relevant memories using semantic similarity, keyword matching, or both.
@@ -243,11 +273,16 @@ class MemoryService:
             has_docstrings: Filter files that have/don't have docstrings
             min_class_count: Minimum number of classes in file
             min_function_count: Minimum number of functions in file
+            include_summaries: Include LLM-generated summaries with results (default False)
+            boost_summarized: Apply boost to results that have LLM summaries (default True)
             
         Returns:
             Dict with results, total_found, query_time_ms, summary, and search_mode_used
         """
         start_time = datetime.now()
+        
+        # Signal that a query is active - background summarizer will yield
+        self._query_active.set()
         
         try:
             # Determine search mode
@@ -347,13 +382,27 @@ class MemoryService:
             # Remove duplicates based on content similarity
             deduplicated_chunks = self._deduplicate_chunks(similar_chunks)
             
+            # Phase 5: Apply summary boost if enabled
+            # This boosts results for files that have LLM-generated summaries
+            if boost_summarized and deduplicated_chunks:
+                deduplicated_chunks = await self._apply_summary_boost_async(
+                    deduplicated_chunks, codebase
+                )
+                # Re-sort after summary boost
+                deduplicated_chunks.sort(key=lambda x: x.relevance_score, reverse=True)
+            
             # Limit results
             filtered_chunks = deduplicated_chunks[:max_results]
+            
+            # Phase 5: Lookup summaries if requested
+            file_summaries = {}
+            if include_summaries:
+                file_summaries = await self._get_file_summaries_async(filtered_chunks, codebase)
             
             # Format results
             results = []
             for chunk in filtered_chunks:
-                results.append({
+                result = {
                     "id": chunk.id,
                     "project_id": chunk.project_id,
                     "role": chunk.role.value if hasattr(chunk.role, 'value') else str(chunk.role),
@@ -361,7 +410,18 @@ class MemoryService:
                     "tags": chunk.tags,
                     "source": chunk.source,
                     "relevance_score": chunk.relevance_score
-                })
+                }
+                
+                # Add summary if available and requested
+                if include_summaries:
+                    file_path = self._extract_file_path_from_chunk(chunk)
+                    if file_path and file_path in file_summaries:
+                        result["file_summary"] = file_summaries[file_path]
+                        result["has_summary"] = True
+                    else:
+                        result["has_summary"] = False
+                
+                results.append(result)
             
             # Generate summary
             summary = self._generate_context_summary(filtered_chunks, query)
@@ -383,6 +443,9 @@ class MemoryService:
                 "results": [],
                 "total_found": 0
             }
+        finally:
+            # Clear query active flag - allow background summarizer to resume
+            self._query_active.clear()
     
     async def store_async(
         self,
@@ -724,6 +787,15 @@ class MemoryService:
         self._file_watcher_tasks.clear()
         logger.info("All file watchers stopped")
     
+    async def start_background_summarizer_async(self) -> None:
+        """
+        Start background summarization.
+        
+        This should be called from the main event loop AFTER initialization,
+        not from within initialize() which may run in a temporary event loop.
+        """
+        await self._start_background_summarizer()
+    
     def search(
         self,
         query: str,
@@ -741,14 +813,17 @@ class MemoryService:
         has_annotations: Optional[bool] = None,
         has_docstrings: Optional[bool] = None,
         min_class_count: Optional[int] = None,
-        min_function_count: Optional[int] = None
+        min_function_count: Optional[int] = None,
+        include_summaries: bool = False,
+        boost_summarized: bool = True
     ) -> Dict[str, Any]:
         """Sync wrapper for search_async"""
         return _run_sync(self.search_async(
             query, codebase, max_results, project_id, search_mode, 
             domain_boosts, include_tags, exclude_tags,
             languages, class_names, function_names, annotations,
-            has_annotations, has_docstrings, min_class_count, min_function_count
+            has_annotations, has_docstrings, min_class_count, min_function_count,
+            include_summaries, boost_summarized
         ))
     
     def store(
@@ -951,7 +1026,7 @@ class MemoryService:
         
         bar_width = 30
         filled = int(bar_width * current / total) if total > 0 else bar_width
-        bar = "█" * filled + "░" * (bar_width - filled)
+        bar = "#" * filled + "-" * (bar_width - filled)
         
         # Use carriage return to update line in place
         line = f"\r[{codebase_name}] {phase}: [{bar}] {current}/{total} files ({pct}%)"
@@ -1821,11 +1896,237 @@ class MemoryService:
                     logger.info(f"[{codebase.name}] File watcher summary: {len(new_files)} added, {len(modified_files)} modified, {len(deleted_files)} deleted")
                     status["indexed_files_count"] = len(vector_store.get_indexed_files())
                     
+                    # Phase 6: Queue changed files for re-summarization
+                    if self._summarization_stats["is_running"]:
+                        for file_path, mtime, content_hash, content, was_indexed in files_changed:
+                            relative_path = str(file_path.relative_to(codebase_path))
+                            await self.queue_file_for_summarization(
+                                codebase.name, 
+                                relative_path, 
+                                str(codebase_path),
+                                priority=0.8  # Higher priority for changed files
+                            )
+                        
+                        # Remove summaries for deleted files
+                        for deleted_path in deleted_files:
+                            await self.remove_file_summary(codebase.name, deleted_path)
+                    
             except asyncio.CancelledError:
                 logger.info(f"[{codebase.name}] File watcher stopped")
                 break
             except Exception as e:
                 logger.error(f"[{codebase.name}] Error in file watcher: {e}")
+    
+    # ─────────────────────────────────────────────────────────────────────────
+    # Phase 5: Summary Integration for Search Results
+    # ─────────────────────────────────────────────────────────────────────────
+    
+    def _extract_file_path_from_chunk(self, chunk: MemoryChunk) -> Optional[str]:
+        """Extract file path from a chunk's tags."""
+        for tag in chunk.tags:
+            if tag.startswith("file:"):
+                return tag[5:]  # Remove "file:" prefix
+        return None
+    
+    async def _get_file_summaries_async(
+        self, 
+        chunks: List[MemoryChunk], 
+        codebase: Optional[str] = None
+    ) -> Dict[str, Dict[str, Any]]:
+        """
+        Look up LLM-generated summaries for files referenced in search results.
+        
+        Args:
+            chunks: List of result chunks to find summaries for
+            codebase: Optional codebase to search in
+            
+        Returns:
+            Dict mapping file paths to their summary data
+        """
+        # Extract unique file paths from chunks
+        file_paths = set()
+        for chunk in chunks:
+            file_path = self._extract_file_path_from_chunk(chunk)
+            if file_path:
+                file_paths.add(file_path)
+        
+        if not file_paths:
+            return {}
+        
+        summaries = {}
+        
+        # Query vector stores for summary chunks (tagged with "summary")
+        if codebase:
+            stores_to_search = {codebase: self._vector_stores.get(codebase)}
+        else:
+            stores_to_search = self._vector_stores
+        
+        for codebase_name, vector_store in stores_to_search.items():
+            if not vector_store:
+                continue
+            
+            try:
+                # Get all summary chunks for this codebase
+                # Query by tag filter using ChromaDB's where clause
+                summary_results = vector_store.collection.get(
+                    where={"source": "llm_summarization"},
+                    include=["metadatas", "documents"]
+                )
+                
+                if not summary_results["ids"]:
+                    continue
+                
+                # Match summaries to file paths
+                for i, doc_id in enumerate(summary_results["ids"]):
+                    doc = summary_results["documents"][i] if summary_results["documents"] else ""
+                    metadata = summary_results["metadatas"][i] if summary_results["metadatas"] else {}
+                    
+                    # Extract file path from tags in metadata
+                    tags = metadata.get("tags", [])
+                    if isinstance(tags, str):
+                        tags = tags.split(",")
+                    
+                    for tag in tags:
+                        tag = tag.strip()
+                        if tag.startswith("file:"):
+                            summary_file = tag[5:]
+                            if summary_file in file_paths:
+                                # Parse summary fields from the document text
+                                summaries[summary_file] = self._parse_summary_text(doc, metadata)
+                                break
+                            
+            except Exception as e:
+                logger.debug(f"[{codebase_name}] Error fetching summaries: {e}")
+        
+        return summaries
+    
+    def _parse_summary_text(self, doc_text: str, metadata: Dict[str, Any]) -> Dict[str, Any]:
+        """Parse summary document text into structured format."""
+        summary_data = {
+            "raw_summary": doc_text
+        }
+        
+        # Parse structured fields from the summary text
+        lines = doc_text.split('\n')
+        for line in lines:
+            line = line.strip()
+            if line.startswith("Purpose:"):
+                summary_data["purpose"] = line[8:].strip()
+            elif line.startswith("Pattern:"):
+                summary_data["pattern"] = line[8:].strip()
+            elif line.startswith("Domain:"):
+                summary_data["domain"] = line[7:].strip()
+            elif line.startswith("Language:"):
+                summary_data["language"] = line[9:].strip()
+            elif line.startswith("Key exports:"):
+                exports_str = line[12:].strip()
+                if exports_str and exports_str != "none":
+                    summary_data["key_exports"] = [e.strip() for e in exports_str.split(",")]
+            elif line.startswith("Dependencies:"):
+                deps_str = line[13:].strip()
+                if deps_str and deps_str != "none":
+                    summary_data["dependencies"] = [d.strip() for d in deps_str.split(",")]
+        
+        # Add pattern and domain from metadata tags if available
+        tags = metadata.get("tags", [])
+        if isinstance(tags, str):
+            tags = tags.split(",")
+        
+        for tag in tags:
+            tag = tag.strip()
+            if tag.startswith("pattern:") and "pattern" not in summary_data:
+                summary_data["pattern"] = tag[8:]
+            elif tag.startswith("domain:") and "domain" not in summary_data:
+                summary_data["domain"] = tag[7:]
+        
+        return summary_data
+    
+    async def _apply_summary_boost_async(
+        self, 
+        chunks: List[MemoryChunk], 
+        codebase: Optional[str] = None,
+        boost_factor: float = 1.15
+    ) -> List[MemoryChunk]:
+        """
+        Apply a relevance boost to chunks from files that have LLM summaries.
+        
+        Files with summaries are considered more "understood" by the system,
+        so they get a small boost in search relevance.
+        
+        Args:
+            chunks: List of chunks to potentially boost
+            codebase: Optional codebase filter
+            boost_factor: Multiplier for boosting (default 1.15 = 15% boost)
+            
+        Returns:
+            Chunks with updated relevance scores
+        """
+        # Get set of files that have summaries
+        summarized_files = await self._get_summarized_files_async(codebase)
+        
+        if not summarized_files:
+            return chunks
+        
+        boosted_count = 0
+        for chunk in chunks:
+            file_path = self._extract_file_path_from_chunk(chunk)
+            if file_path and file_path in summarized_files:
+                chunk.relevance_score *= boost_factor
+                boosted_count += 1
+        
+        if boosted_count > 0:
+            logger.debug(f"Applied summary boost to {boosted_count}/{len(chunks)} chunks")
+        
+        return chunks
+    
+    async def _get_summarized_files_async(self, codebase: Optional[str] = None) -> set:
+        """
+        Get set of file paths that have LLM summaries.
+        
+        This is cached per search to avoid repeated DB queries.
+        
+        Args:
+            codebase: Optional codebase filter
+            
+        Returns:
+            Set of file paths with summaries
+        """
+        summarized_files = set()
+        
+        if codebase:
+            stores_to_search = {codebase: self._vector_stores.get(codebase)}
+        else:
+            stores_to_search = self._vector_stores
+        
+        for codebase_name, vector_store in stores_to_search.items():
+            if not vector_store:
+                continue
+            
+            try:
+                # Query for summaries only
+                summary_results = vector_store.collection.get(
+                    where={"source": "llm_summarization"},
+                    include=["metadatas"]
+                )
+                
+                if not summary_results["ids"]:
+                    continue
+                
+                for metadata in (summary_results["metadatas"] or []):
+                    tags = metadata.get("tags", [])
+                    if isinstance(tags, str):
+                        tags = tags.split(",")
+                    
+                    for tag in tags:
+                        tag = tag.strip()
+                        if tag.startswith("file:"):
+                            summarized_files.add(tag[5:])
+                            break
+                            
+            except Exception as e:
+                logger.debug(f"[{codebase_name}] Error fetching summarized files: {e}")
+        
+        return summarized_files
     
     def _generate_context_summary(self, chunks: List[MemoryChunk], query: str) -> str:
         """Generate a summary of search results"""
@@ -1854,6 +2155,757 @@ class MemoryService:
             parts.append(f"Areas: {', '.join(sorted(sources)[:5])}")
         
         return " | ".join(parts)
+    
+    # ─────────────────────────────────────────────────────────────────────────
+    # Background Summarization (Phase 4)
+    # ─────────────────────────────────────────────────────────────────────────
+    
+    async def _start_background_summarizer(self) -> None:
+        """
+        Initialize and start the background summarizer after indexing completes.
+        
+        This method:
+        1. Checks if summarization is enabled
+        2. Initializes the LLM client and summarizer
+        3. Queues files by centrality score (most important first)
+        4. Starts the background summarization task
+        """
+        if not self._summarization_config.enabled:
+            logger.info("[Summarization] Background summarization is disabled")
+            return
+        
+        if not self._summarization_config.llm_enabled:
+            logger.info("[Summarization] LLM summarization is disabled")
+            return
+        
+        try:
+            from ..llm.ollama_client import OllamaClient
+            
+            # Create LLM client
+            llm_client = OllamaClient(
+                base_url=self._summarization_config.ollama_url,
+                model=self._summarization_config.model,
+                timeout=self._summarization_config.timeout_seconds
+            )
+            
+            # Health check - ensure Ollama is running
+            if not await llm_client.health_check():
+                logger.warning(
+                    f"[Summarization] Ollama not available at {self._summarization_config.ollama_url}. "
+                    f"Background summarization will not start. "
+                    f"Run 'ollama serve' and 'ollama pull {self._summarization_config.model}' to enable."
+                )
+                await llm_client.close()
+                return
+            
+            # Warm up model (pre-load into memory to avoid timeouts)
+            if not await llm_client.warm_up(timeout=120.0):
+                logger.warning(
+                    f"[Summarization] Failed to warm up model '{self._summarization_config.model}'. "
+                    f"Summarization may be slow or fail on first requests."
+                )
+                # Continue anyway - model might load on first real request
+            
+            # Initialize summarizer
+            self._summarizer = FileSummarizer(llm_client, self._summarization_config)
+            
+            # Queue files by centrality (highest first), or all indexed files if no import graph
+            total_queued = 0
+            for codebase in self.config.get_enabled_codebases():
+                codebase_path = Path(codebase.path)
+                vector_store = self._vector_stores.get(codebase.name)
+                
+                # Try to get files by centrality
+                priority_queue = self.get_file_centrality_scores(codebase.name, max_files=1000)
+                
+                if priority_queue:
+                    # Use centrality-ordered files
+                    for file_path, score in priority_queue:
+                        if self._summarizer._should_skip_file(file_path):
+                            continue
+                        await self._summary_queue.put((-score, codebase.name, file_path, str(codebase_path)))
+                        total_queued += 1
+                elif vector_store:
+                    # Fallback: queue all indexed files with equal priority
+                    indexed_files = vector_store.get_indexed_files()
+                    logger.info(f"[Summarization] No import graph for {codebase.name}, queuing {len(indexed_files)} indexed files")
+                    for file_path in indexed_files.keys():
+                        if self._summarizer._should_skip_file(file_path):
+                            continue
+                        await self._summary_queue.put((0.5, codebase.name, file_path, str(codebase_path)))
+                        total_queued += 1
+            
+            self._summarization_stats["files_queued"] = total_queued
+            
+            if total_queued == 0:
+                logger.info("[Summarization] No files to summarize")
+                await llm_client.close()
+                return
+            
+            # Start background task
+            self._summarizer_task = asyncio.create_task(self._background_summarizer())
+            self._summarization_stats["is_running"] = True
+            
+            logger.info(
+                f"[Summarization] Started background summarizer with {total_queued} files queued "
+                f"(using {self._summarization_config.model})"
+            )
+            
+        except ImportError as e:
+            logger.warning(f"[Summarization] LLM client not available: {e}")
+        except Exception as e:
+            logger.error(f"[Summarization] Failed to start background summarizer: {e}")
+    
+    async def _background_summarizer(self) -> None:
+        """
+        Background task that summarizes files in priority order.
+        
+        This runs continuously, processing files from the queue.
+        It yields to active queries to avoid impacting search latency.
+        """
+        logger.info("[Summarization] Background summarizer task started")
+        
+        while True:
+            # Yield to active queries - don't summarize while searches are happening
+            if self._query_active.is_set():
+                await asyncio.sleep(0.1)
+                continue
+            
+            try:
+                # Get next file (with timeout to allow checking for cancellation)
+                try:
+                    priority, codebase_name, file_path, codebase_path = await asyncio.wait_for(
+                        self._summary_queue.get(),
+                        timeout=5.0
+                    )
+                except asyncio.TimeoutError:
+                    # Queue empty or waiting - check if we should stop
+                    if self._summary_queue.empty():
+                        logger.info("[Summarization] Queue empty, background summarizer idle")
+                    continue
+                
+                # Update current file status
+                self._summarization_stats["current_file"] = file_path
+                
+                # Read file content
+                full_path = Path(codebase_path) / file_path
+                if not full_path.exists():
+                    logger.debug(f"[Summarization] Skipping missing file: {file_path}")
+                    self._summary_queue.task_done()
+                    continue
+                
+                try:
+                    content = full_path.read_text(encoding='utf-8', errors='ignore')
+                except Exception as e:
+                    logger.debug(f"[Summarization] Failed to read {file_path}: {e}")
+                    self._summary_queue.task_done()
+                    continue
+                
+                if not content.strip():
+                    self._summary_queue.task_done()
+                    continue
+                
+                # Compute content hash for incremental tracking
+                content_hash = ChromaVectorStore.compute_content_hash(content)
+                
+                # Check if file needs (re-)summarization
+                vector_store = self._vector_stores.get(codebase_name)
+                if vector_store and not vector_store.summary_index.needs_resummarization(file_path, content_hash):
+                    logger.debug(f"[Summarization] Skipping (unchanged): {file_path}")
+                    self._summarization_stats["files_skipped"] = self._summarization_stats.get("files_skipped", 0) + 1
+                    self._summary_queue.task_done()
+                    continue
+                
+                # Get heuristic metadata if available
+                heuristic_metadata = None
+                try:
+                    heuristic_metadata = self.heuristic_extractor.extract_file_metadata(file_path, content)
+                except Exception:
+                    pass  # Heuristics are optional
+                
+                # Generate summary
+                logger.debug(f"[Summarization] Processing: {file_path}")
+                summary = await self._summarizer.summarize_file(file_path, content, heuristic_metadata)
+                
+                if summary.error:
+                    self._summarization_stats["files_failed"] += 1
+                    self._summarization_stats["last_error"] = f"{file_path}: {summary.error}"
+                    logger.warning(f"[Summarization] Failed to summarize {file_path}: {summary.error}")
+                else:
+                    # Store summary with content hash for tracking
+                    await self._store_summary(codebase_name, file_path, summary, content_hash)
+                    self._summarization_stats["files_summarized"] += 1
+                    
+                    # Log progress periodically
+                    if self._summarization_stats["files_summarized"] % 10 == 0:
+                        remaining = self._summary_queue.qsize()
+                        completed = self._summarization_stats["files_summarized"]
+                        failed = self._summarization_stats["files_failed"]
+                        skipped = self._summarization_stats.get("files_skipped", 0)
+                        logger.info(
+                            f"[Summarization] Progress: {completed} completed, {failed} failed, {skipped} skipped, {remaining} remaining"
+                        )
+                
+                self._summary_queue.task_done()
+                
+                # Rate limit to avoid overwhelming the LLM
+                await asyncio.sleep(self._summarization_config.rate_limit_seconds)
+                
+            except asyncio.CancelledError:
+                logger.info("[Summarization] Background summarizer stopped")
+                self._summarization_stats["is_running"] = False
+                self._summarization_stats["current_file"] = None
+                break
+            except Exception as e:
+                logger.error(f"[Summarization] Error in background summarizer: {e}")
+                self._summarization_stats["last_error"] = str(e)
+                await asyncio.sleep(1.0)  # Brief pause before retrying
+    
+    async def _store_summary(
+        self, 
+        codebase: str, 
+        file_path: str, 
+        summary: FileSummary,
+        content_hash: Optional[str] = None
+    ) -> None:
+        """
+        Store a file summary as a searchable memory chunk.
+        
+        Also updates the summary index for incremental re-summarization tracking.
+        
+        Args:
+            codebase: Codebase name
+            file_path: Path to the file
+            summary: FileSummary with LLM-generated summary
+            content_hash: Optional hash of file content for tracking changes
+        """
+        vector_store = self._vector_stores.get(codebase)
+        if not vector_store:
+            logger.warning(f"[Summarization] Vector store not found for codebase: {codebase}")
+            return
+        
+        # Check if there's an existing summary to remove
+        existing_info = vector_store.summary_index.get_summary_info(file_path)
+        if existing_info:
+            old_chunk_id = existing_info.get("summary_chunk_id")
+            if old_chunk_id:
+                try:
+                    vector_store.delete(old_chunk_id)
+                    logger.debug(f"[Summarization] Removed old summary for: {file_path}")
+                except Exception as e:
+                    logger.debug(f"[Summarization] Failed to remove old summary: {e}")
+        
+        # Format summary as searchable text
+        key_exports = ", ".join(summary.key_exports) if summary.key_exports else "none"
+        dependencies = ", ".join(summary.dependencies) if summary.dependencies else "none"
+        
+        summary_text = f"""File Summary: {file_path}
+Language: {summary.language}
+Pattern: {summary.pattern}
+Domain: {summary.domain}
+
+Purpose: {summary.purpose}
+
+Key exports: {key_exports}
+Dependencies: {dependencies}"""
+        
+        # Build tags for filtering
+        tags = [
+            "summary",
+            f"file:{file_path}",
+            f"pattern:{summary.pattern.lower()}",
+            f"domain:{summary.domain}",
+            f"lang:{summary.language}"
+        ]
+        
+        # Add key exports as tags for searchability
+        for export in summary.key_exports[:5]:  # Limit to first 5
+            tags.append(f"export:{export}")
+        
+        # Store with pinning so summaries aren't pruned
+        result = await self.store_async(
+            content=summary_text,
+            codebase=codebase,
+            role="system",
+            tags=tags,
+            pin=True,
+            source="llm_summarization",
+            memory_type="code"  # Treat as code-related memory
+        )
+        
+        # Update summary index for incremental tracking
+        if result.get("success") and result.get("id") and content_hash:
+            vector_store.summary_index.update_summary_info(
+                file_path=file_path,
+                content_hash=content_hash,
+                summary_chunk_id=result["id"],
+                model=summary.model_used,
+                pattern=summary.pattern,
+                domain=summary.domain
+            )
+        
+        logger.debug(f"[Summarization] Stored summary for: {file_path}")
+    
+    async def stop_background_summarizer_async(self) -> None:
+        """Stop the background summarization task."""
+        if self._summarizer_task and not self._summarizer_task.done():
+            self._summarizer_task.cancel()
+            try:
+                await self._summarizer_task
+            except asyncio.CancelledError:
+                pass
+        
+        if self._summarizer and hasattr(self._summarizer, 'llm_client'):
+            await self._summarizer.llm_client.close()
+        
+        self._summarization_stats["is_running"] = False
+        self._summarization_stats["current_file"] = None
+        logger.info("[Summarization] Background summarizer stopped")
+    
+    def get_summarization_status(self) -> Dict[str, Any]:
+        """
+        Get the current status of background summarization.
+        
+        Returns:
+            Dictionary with summarization status and progress
+        """
+        # Get summary stats from all codebases
+        total_summarized = 0
+        summary_stats_by_codebase = {}
+        
+        for codebase_name, vector_store in self._vector_stores.items():
+            try:
+                stats = vector_store.summary_index.get_summary_stats()
+                summary_stats_by_codebase[codebase_name] = stats
+                total_summarized += stats.get("total_summarized", 0)
+            except Exception as e:
+                logger.debug(f"[{codebase_name}] Error getting summary stats: {e}")
+        
+        return {
+            "enabled": self._summarization_config.enabled,
+            "llm_enabled": self._summarization_config.llm_enabled,
+            "model": self._summarization_config.model,
+            "is_running": self._summarization_stats["is_running"],
+            "files_queued": self._summary_queue.qsize() if self._summary_queue else 0,
+            "files_completed": self._summarization_stats["files_summarized"],
+            "files_skipped": self._summarization_stats.get("files_skipped", 0),
+            "files_failed": self._summarization_stats["files_failed"],
+            "total_summarized": total_summarized,
+            "current_file": self._summarization_stats["current_file"],
+            "last_error": self._summarization_stats["last_error"],
+            "by_codebase": summary_stats_by_codebase
+        }
+    
+    async def queue_file_for_summarization(
+        self, 
+        codebase_name: str, 
+        file_path: str, 
+        codebase_path: str,
+        priority: float = 0.5
+    ) -> bool:
+        """
+        Queue a single file for (re-)summarization.
+        
+        Called by the file watcher when a file is modified.
+        
+        Args:
+            codebase_name: Name of the codebase
+            file_path: Relative path to the file
+            codebase_path: Absolute path to the codebase root
+            priority: Priority score (higher = process sooner, default 0.5)
+            
+        Returns:
+            True if file was queued, False if summarization is not running
+        """
+        if not self._summarization_stats["is_running"]:
+            return False
+        
+        if not self._summarizer:
+            return False
+        
+        # Check if file should be skipped
+        if self._summarizer._should_skip_file(file_path):
+            return False
+        
+        # Queue with negative priority (PriorityQueue uses min-first)
+        await self._summary_queue.put((-priority, codebase_name, file_path, codebase_path))
+        self._summarization_stats["files_queued"] = self._summary_queue.qsize()
+        
+        logger.info(f"[Summarization] Queued for re-summarization: {file_path}")
+        return True
+    
+    async def remove_file_summary(self, codebase_name: str, file_path: str) -> bool:
+        """
+        Remove the summary for a deleted file.
+        
+        Args:
+            codebase_name: Name of the codebase
+            file_path: Relative path to the file
+            
+        Returns:
+            True if summary was removed
+        """
+        vector_store = self._vector_stores.get(codebase_name)
+        if not vector_store:
+            return False
+        
+        chunk_id = vector_store.summary_index.delete_summary_info(file_path)
+        if chunk_id:
+            try:
+                vector_store.delete(chunk_id)
+                logger.info(f"[Summarization] Removed summary for deleted file: {file_path}")
+                return True
+            except Exception as e:
+                logger.debug(f"[Summarization] Failed to remove summary chunk: {e}")
+        
+        return False
+    
+    # ─────────────────────────────────────────────────────────────────────────
+    # Browse/List API - For Web Dashboard
+    # ─────────────────────────────────────────────────────────────────────────
+    
+    async def list_indexed_files_async(
+        self,
+        codebase: Optional[str] = None,
+        limit: int = 50,
+        offset: int = 0,
+        search_filter: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        List indexed files with pagination support.
+        
+        Args:
+            codebase: Codebase name (None = first available)
+            limit: Maximum number of results
+            offset: Offset for pagination
+            search_filter: Optional filename filter (substring match)
+            
+        Returns:
+            Dict with files list, total count, and pagination info
+        """
+        if not self._vector_stores:
+            return {"error": "No codebases configured", "files": [], "total": 0}
+        
+        # Get target codebase
+        if codebase:
+            vector_store = self._vector_stores.get(codebase)
+            if not vector_store:
+                return {"error": f"Codebase not found: {codebase}", "files": [], "total": 0}
+        else:
+            # Use first available codebase
+            codebase = next(iter(self._vector_stores.keys()))
+            vector_store = self._vector_stores[codebase]
+        
+        try:
+            # Get all indexed files
+            indexed_files = vector_store.file_index.get_all_indexed_files()
+            
+            # Get all summarized files for has_summary flag
+            summarized_files = vector_store.summary_index.get_all_summarized_files()
+            
+            # Build file list with metadata
+            files = []
+            for file_path, metadata in indexed_files.items():
+                # Apply search filter if provided
+                if search_filter and search_filter.lower() not in file_path.lower():
+                    continue
+                
+                chunk_ids_str = metadata.get("chunk_ids", "")
+                chunk_count = len(chunk_ids_str.split(",")) if chunk_ids_str else 0
+                
+                files.append({
+                    "path": file_path,
+                    "mtime": metadata.get("mtime"),
+                    "content_hash": metadata.get("content_hash", "")[:12] + "...",  # Truncate hash
+                    "chunk_count": chunk_count,
+                    "indexed_at": metadata.get("indexed_at"),
+                    "has_summary": file_path in summarized_files
+                })
+            
+            # Sort by path
+            files.sort(key=lambda f: f["path"])
+            
+            # Apply pagination
+            total = len(files)
+            files = files[offset:offset + limit]
+            
+            return {
+                "codebase": codebase,
+                "files": files,
+                "total": total,
+                "limit": limit,
+                "offset": offset,
+                "has_more": offset + limit < total
+            }
+            
+        except Exception as e:
+            logger.error(f"Error listing indexed files: {e}")
+            return {"error": str(e), "files": [], "total": 0}
+    
+    async def get_file_details_async(
+        self,
+        codebase: str,
+        file_path: str
+    ) -> Dict[str, Any]:
+        """
+        Get detailed information about a specific indexed file.
+        
+        Args:
+            codebase: Codebase name
+            file_path: Relative path to the file
+            
+        Returns:
+            Dict with file metadata, chunks, and summary if available
+        """
+        vector_store = self._vector_stores.get(codebase)
+        if not vector_store:
+            return {"error": f"Codebase not found: {codebase}"}
+        
+        try:
+            # Get file index metadata
+            file_info = vector_store.file_index.get_file_info(file_path)
+            if not file_info:
+                return {"error": f"File not found in index: {file_path}"}
+            
+            # Get chunk IDs
+            chunk_ids_str = file_info.get("chunk_ids", "")
+            chunk_ids = chunk_ids_str.split(",") if chunk_ids_str else []
+            
+            # Fetch chunks from main collection
+            chunks = []
+            if chunk_ids:
+                try:
+                    result = vector_store.collection.get(
+                        ids=chunk_ids,
+                        include=["documents", "metadatas"]
+                    )
+                    
+                    for i, chunk_id in enumerate(result["ids"]):
+                        doc = result["documents"][i] if result["documents"] else ""
+                        meta = result["metadatas"][i] if result["metadatas"] else {}
+                        
+                        chunks.append({
+                            "id": chunk_id,
+                            "content": doc,
+                            "tags": meta.get("tags", "").split(",") if meta.get("tags") else [],
+                            "source": meta.get("source", ""),
+                            "memory_type": meta.get("memory_type", "code")
+                        })
+                except Exception as e:
+                    logger.warning(f"Error fetching chunks for {file_path}: {e}")
+            
+            # Get summary if available
+            summary = None
+            summary_info = vector_store.summary_index.get_summary_info(file_path)
+            if summary_info:
+                summary_chunk_id = summary_info.get("summary_chunk_id")
+                if summary_chunk_id:
+                    try:
+                        summary_result = vector_store.collection.get(
+                            ids=[summary_chunk_id],
+                            include=["documents"]
+                        )
+                        if summary_result["ids"]:
+                            summary = {
+                                "content": summary_result["documents"][0] if summary_result["documents"] else "",
+                                "model": summary_info.get("model", ""),
+                                "pattern": summary_info.get("pattern", ""),
+                                "domain": summary_info.get("domain", ""),
+                                "summarized_at": summary_info.get("summarized_at", "")
+                            }
+                    except Exception as e:
+                        logger.warning(f"Error fetching summary for {file_path}: {e}")
+            
+            return {
+                "codebase": codebase,
+                "file_path": file_path,
+                "mtime": file_info.get("mtime"),
+                "content_hash": file_info.get("content_hash", ""),
+                "indexed_at": file_info.get("indexed_at"),
+                "chunk_count": len(chunks),
+                "chunks": chunks,
+                "summary": summary
+            }
+            
+        except Exception as e:
+            logger.error(f"Error getting file details: {e}")
+            return {"error": str(e)}
+    
+    async def list_memories_async(
+        self,
+        memory_type: Optional[str] = None,
+        codebase: Optional[str] = None,
+        limit: int = 50,
+        offset: int = 0
+    ) -> Dict[str, Any]:
+        """
+        List stored memories (conversations, decisions, lessons).
+        
+        Args:
+            memory_type: Filter by type: "conversation", "decision", "lesson" (None = all non-code)
+            codebase: Codebase name (None = search all)
+            limit: Maximum number of results
+            offset: Offset for pagination
+            
+        Returns:
+            Dict with memories list, total count, and pagination info
+        """
+        if not self._vector_stores:
+            return {"error": "No codebases configured", "memories": [], "total": 0}
+        
+        try:
+            all_memories = []
+            
+            # Determine which codebases to search
+            if codebase:
+                stores_to_search = {codebase: self._vector_stores.get(codebase)}
+                if not stores_to_search[codebase]:
+                    return {"error": f"Codebase not found: {codebase}", "memories": [], "total": 0}
+            else:
+                stores_to_search = self._vector_stores
+            
+            # Memory types to include (exclude 'code' type)
+            valid_types = ["conversation", "decision", "lesson"]
+            if memory_type and memory_type in valid_types:
+                filter_types = [memory_type]
+            else:
+                filter_types = valid_types
+            
+            # Query each codebase
+            for codebase_name, vector_store in stores_to_search.items():
+                if not vector_store:
+                    continue
+                
+                for mtype in filter_types:
+                    try:
+                        # Query by memory_type
+                        result = vector_store.collection.get(
+                            where={"memory_type": mtype},
+                            include=["documents", "metadatas"]
+                        )
+                        
+                        if result["ids"]:
+                            for i, memory_id in enumerate(result["ids"]):
+                                doc = result["documents"][i] if result["documents"] else ""
+                                meta = result["metadatas"][i] if result["metadatas"] else {}
+                                
+                                # Skip LLM summaries (they're stored with code type but have special source)
+                                if meta.get("source") == "llm_summarization":
+                                    continue
+                                
+                                all_memories.append({
+                                    "id": memory_id,
+                                    "type": mtype,
+                                    "codebase": codebase_name,
+                                    "content_preview": doc[:200] + "..." if len(doc) > 200 else doc,
+                                    "content": doc,
+                                    "tags": meta.get("tags", "").split(",") if meta.get("tags") else [],
+                                    "source": meta.get("source", ""),
+                                    "created_at": meta.get("created_at", ""),
+                                    "role": meta.get("role", "")
+                                })
+                    except Exception as e:
+                        logger.debug(f"Error querying memories from {codebase_name}: {e}")
+            
+            # Sort by created_at (newest first)
+            all_memories.sort(key=lambda m: m.get("created_at", ""), reverse=True)
+            
+            # Apply pagination
+            total = len(all_memories)
+            memories = all_memories[offset:offset + limit]
+            
+            return {
+                "memories": memories,
+                "total": total,
+                "limit": limit,
+                "offset": offset,
+                "has_more": offset + limit < total,
+                "filter_type": memory_type
+            }
+            
+        except Exception as e:
+            logger.error(f"Error listing memories: {e}")
+            return {"error": str(e), "memories": [], "total": 0}
+    
+    async def list_summaries_async(
+        self,
+        codebase: Optional[str] = None,
+        limit: int = 50,
+        offset: int = 0
+    ) -> Dict[str, Any]:
+        """
+        List files that have LLM-generated summaries.
+        
+        Args:
+            codebase: Codebase name (None = first available)
+            limit: Maximum number of results
+            offset: Offset for pagination
+            
+        Returns:
+            Dict with summaries list, total count, and pagination info
+        """
+        if not self._vector_stores:
+            return {"error": "No codebases configured", "summaries": [], "total": 0}
+        
+        # Get target codebase
+        if codebase:
+            vector_store = self._vector_stores.get(codebase)
+            if not vector_store:
+                return {"error": f"Codebase not found: {codebase}", "summaries": [], "total": 0}
+        else:
+            codebase = next(iter(self._vector_stores.keys()))
+            vector_store = self._vector_stores[codebase]
+        
+        try:
+            # Get all summarized files
+            summarized_files = vector_store.summary_index.get_all_summarized_files()
+            
+            # Build summary list
+            summaries = []
+            for file_path, info in summarized_files.items():
+                # Fetch summary content
+                summary_content = ""
+                summary_chunk_id = info.get("summary_chunk_id")
+                if summary_chunk_id:
+                    try:
+                        result = vector_store.collection.get(
+                            ids=[summary_chunk_id],
+                            include=["documents"]
+                        )
+                        if result["ids"] and result["documents"]:
+                            summary_content = result["documents"][0]
+                    except Exception:
+                        pass
+                
+                summaries.append({
+                    "file_path": file_path,
+                    "pattern": info.get("pattern", ""),
+                    "domain": info.get("domain", ""),
+                    "model": info.get("model", ""),
+                    "summarized_at": info.get("summarized_at", ""),
+                    "content_preview": summary_content[:300] + "..." if len(summary_content) > 300 else summary_content,
+                    "content": summary_content
+                })
+            
+            # Sort by file path
+            summaries.sort(key=lambda s: s["file_path"])
+            
+            # Apply pagination
+            total = len(summaries)
+            summaries = summaries[offset:offset + limit]
+            
+            return {
+                "codebase": codebase,
+                "summaries": summaries,
+                "total": total,
+                "limit": limit,
+                "offset": offset,
+                "has_more": offset + limit < total
+            }
+            
+        except Exception as e:
+            logger.error(f"Error listing summaries: {e}")
+            return {"error": str(e), "summaries": [], "total": 0}
     
     # ─────────────────────────────────────────────────────────────────────────
     # Import Graph and Heuristic Metadata API

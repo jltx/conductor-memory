@@ -54,3 +54,7 @@ config.json
 # OS
 .DS_Store
 Thumbs.db
+".conductor-memory.pid"  
+"logs/*.stderr"  
+"logs/*.log"  
+"logs/dashboard_output.html"  

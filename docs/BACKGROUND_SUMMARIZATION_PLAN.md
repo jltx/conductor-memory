@@ -12,7 +12,7 @@ Add a background summarization system that:
 
 ## Configuration
 
-**Model:** `qwen2.5-coder:7b-instruct-q4_K_M`
+**Default Model:** `qwen2.5-coder:1.5b` (fast, code-focused, ~1GB)
 
 **New config section in `config.json`:**
 ```json
@@ -21,7 +21,7 @@ Add a background summarization system that:
     "enabled": true,
     "llm_enabled": true,
     "ollama_url": "http://localhost:11434",
-    "model": "qwen2.5-coder:7b-instruct-q4_K_M",
+    "model": "qwen2.5-coder:1.5b",
     "rate_limit_seconds": 0.5,
     "max_file_lines": 600,
     "max_file_tokens": 4000,
@@ -30,6 +30,16 @@ Add a background summarization system that:
   }
 }
 ```
+
+**Available Model Options:**
+| Model | Size | Speed | Quality | Notes |
+|-------|------|-------|---------|-------|
+| `qwen2.5-coder:0.5b` | 398MB | Ultra fast | Basic | Maximum throughput |
+| **`qwen2.5-coder:1.5b`** | 986MB | **Very fast** | **Good** | **Default** |
+| `qwen2.5-coder:3b` | 1.9GB | Fast | Very good | Better accuracy |
+| `qwen2.5-coder:7b` | 4.7GB | Moderate | Excellent | Highest quality |
+| `qwen3:1.7b` | 1.4GB | Very fast | Good | Newer general model |
+| `qwen3:4b` | 2.5GB | Fast | Very good | Newer, 256K context |
 
 ## Supported Languages
 
@@ -84,7 +94,7 @@ class ImportGraph:
 
 **Goal:** Integrate with Ollama for local LLM summarization.
 
-**Model:** `qwen2.5-coder:7b-instruct-q4_K_M`
+**Default Model:** `qwen2.5-coder:1.5b` (configurable)
 
 **Large File Handling:** For files > threshold (600 lines or 4000 tokens), extract skeleton only:
 - Class/interface signatures
