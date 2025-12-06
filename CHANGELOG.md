@@ -7,17 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.1] - 2024-12-06
+
+### Added
+- New MCP tool `memory_queue_codebase_summarization` to manually queue codebases for summarization
+- Method `queue_codebase_for_summarization()` in MemoryService for programmatic access
+- Test script `test_queue_summarization.py` for testing codebase queueing
+- Support for queuing only missing files or re-summarizing entire codebases
+
+### Fixed
+- Issue where new codebases added after initial startup weren't automatically queued for summarization
+- Summarization now properly initializes for all codebases on server restart
+
+## [1.0.0] - 2024-12-06
+
 ### Added
 - MIT License for open source distribution
 - Comprehensive installation guide (INSTALL.md)
 - Platform-specific installation scripts for Windows and Linux
 - GitHub Actions workflow for automated releases and PyPI publishing
 - Cross-platform packaging configuration
+- Initial release of conductor-memory
+- Semantic memory service with codebase indexing for AI agents
+- Hybrid search combining semantic vectors + BM25 keyword search
+- Heuristic filtering by classes, functions, annotations, and file types
+- Multi-language AST-aware parsing for 15+ programming languages
+- Multi-codebase support with incremental indexing
+- LLM integration for background file summarization via Ollama
+- MCP (Model Context Protocol) server integration
+- Web dashboard for real-time monitoring
+- RESTful API for integration
+- Advanced search parameters and relevance boosting
+- Production-ready configuration system
 
 ### Changed
 - Updated project URLs in pyproject.toml to point to correct GitHub repository
-
-## [1.0.0] - 2024-12-06
 
 ### Added
 - Initial release of conductor-memory

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "conductor-memory"
-version = "1.0.0"
+version = "1.0.1"
 description = "Semantic memory service with codebase indexing for AI agents"
 readme = "README.md"
 license = "MIT"

@@ -222,6 +222,7 @@ The `search_mode` parameter controls how queries are processed:
 | `memory_store_lesson` | Store debugging insights and lessons learned | `content`, `tags` |
 | `memory_status` | Check indexing status and memory system health | - |
 | `memory_summarization_status` | Check LLM summarization progress with timing estimates | - |
+| `memory_queue_codebase_summarization` | Queue specific codebase for LLM summarization | `codebase`, `only_missing` |
 | `memory_reindex_codebase` | Force reindexing of a specific codebase | `codebase` |
 | `memory_prune` | Remove obsolete memories based on age/relevance | `max_age_days` |
 | `memory_delete` | Delete a specific memory by ID | `memory_id` |
