@@ -38,6 +38,9 @@ ENV/
 htmlcov/
 .tox/
 .nox/
+tests/*_debug*.py
+tests/*_result.json
+/test_*.py
 
 # Data directories
 data/
