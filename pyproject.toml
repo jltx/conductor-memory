@@ -7,7 +7,7 @@ name = "conductor-memory"
 version = "1.0.0"
 description = "Semantic memory service with codebase indexing for AI agents"
 readme = "README.md"
-license = {text = "MIT"}
+license = "MIT"
 requires-python = ">=3.10"
 authors = [
     {name = "Joshua"}
@@ -16,7 +16,6 @@ keywords = ["mcp", "memory", "semantic-search", "vector-database", "chromadb", "
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
@@ -60,8 +59,10 @@ conductor-memory-stdio = "conductor_memory.server.stdio:main"
 conductor-memory-sse = "conductor_memory.server.sse:main"
 
 [project.urls]
-Homepage = "https://github.com/yourusername/conductor-memory"
-Repository = "https://github.com/yourusername/conductor-memory"
+Homepage = "https://github.com/jltx/conductor-memory"
+Repository = "https://github.com/jltx/conductor-memory"
+Issues = "https://github.com/jltx/conductor-memory/issues"
+Documentation = "https://github.com/jltx/conductor-memory#readme"
 
 [tool.setuptools.packages.find]
 where = ["src"]
