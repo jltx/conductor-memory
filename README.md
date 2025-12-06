@@ -52,11 +52,14 @@ Create `~/.conductor-memory/config.json`:
 ### 2. Start the Server
 
 ```bash
-# Start HTTP + TCP MCP server
-conductor-memory --config ~/.conductor-memory/config.json
+# Start the SSE server (recommended for multi-client setups)
+python -m conductor_memory.server.sse --config ~/.conductor-memory/config.json
 
-# Or start just the stdio MCP server (for OpenCode integration)
-conductor-memory-stdio --config ~/.conductor-memory/config.json
+# Or use stdio mode (spawned by MCP clients like OpenCode/Claude)
+python -m conductor_memory.server.stdio --config ~/.conductor-memory/config.json
+
+# Or start the unified HTTP + TCP server
+python scripts/start_server.py --config ~/.conductor-memory/config.json
 ```
 
 ### 3. Use the API
@@ -156,33 +159,89 @@ The `search_mode` parameter controls how queries are processed:
 
 ## MCP Integration
 
+Conductor Memory supports two transport modes:
+- **stdio**: Spawned as a subprocess (simpler, one process per client)
+- **SSE (Server-Sent Events)**: Runs as a persistent HTTP server (shared across clients)
+
+### Starting the SSE Server
+
+For SSE mode, start the server first:
+
+```bash
+# Using the Python module directly
+python -m conductor_memory.server.sse --config ~/.conductor-memory/config.json
+
+# Or with custom host/port
+python -m conductor_memory.server.sse --host 127.0.0.1 --port 9820
+
+# Windows batch script
+scripts\start_mcp_sse.bat
+```
+
+The SSE server runs on `http://127.0.0.1:9820/sse` by default.
+
 ### OpenCode Configuration
 
 Add to your `opencode.json`:
 
+**Option 1: stdio mode** (spawns a new process):
 ```json
 {
   "mcp": {
-    "conductor_memory": {
-      "command": ["conductor-memory-stdio", "--config", "~/.conductor-memory/config.json"],
+    "memory": {
+      "command": ["python", "-m", "conductor_memory.server.stdio", "--config", "~/.conductor-memory/config.json"],
       "enabled": true
     }
   }
 }
 ```
 
-Or use the remote SSE server:
-
+**Option 2: SSE mode** (connects to running server):
 ```json
 {
   "mcp": {
-    "conductor_memory": {
+    "memory": {
       "type": "remote",
       "url": "http://localhost:9820/sse"
     }
   }
 }
 ```
+
+### Claude Code Configuration
+
+Add to your `claude_desktop_config.json` (typically at `%APPDATA%\Claude\claude_desktop_config.json` on Windows or `~/Library/Application Support/Claude/claude_desktop_config.json` on macOS):
+
+**Option 1: stdio mode**:
+```json
+{
+  "mcpServers": {
+    "memory": {
+      "command": "python",
+      "args": ["-m", "conductor_memory.server.stdio", "--config", "~/.conductor-memory/config.json"]
+    }
+  }
+}
+```
+
+**Option 2: SSE mode** (requires starting the server first):
+```json
+{
+  "mcpServers": {
+    "memory": {
+      "url": "http://localhost:9820/sse"
+    }
+  }
+}
+```
+
+### Other MCP Clients
+
+Any MCP-compatible client can connect using either transport:
+
+**stdio**: Spawn `python -m conductor_memory.server.stdio --config <path>`
+
+**SSE**: Connect to `http://<host>:<port>/sse` (default: `http://localhost:9820/sse`)
 
 ### Available MCP Tools
 
