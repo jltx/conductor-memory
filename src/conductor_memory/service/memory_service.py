@@ -2354,8 +2354,72 @@ class MemoryService:
         
         This runs continuously, processing files from the queue.
         It yields to active queries to avoid impacting search latency.
+        Supports parallel processing via max_concurrent_summarizations config.
         """
-        logger.info("[Summarization] Background summarizer task started")
+        max_concurrent = self._summarization_config.max_concurrent_summarizations
+        logger.info(f"[Summarization] Background summarizer started (max_concurrent={max_concurrent})")
+        self._summarization_stats["is_running"] = True
+        
+        # Semaphore to limit concurrent LLM requests
+        semaphore = asyncio.Semaphore(max_concurrent)
+        
+        async def process_with_tracking(priority, codebase_name, file_path, codebase_path):
+            """Process a single file with stats tracking and rate limiting."""
+            async with semaphore:
+                # Update current file (note: shows most recent when parallel)
+                self._summarization_stats["current_file"] = file_path
+                
+                try:
+                    success, processing_time = await self._process_single_file_for_summary(
+                        codebase_name, codebase_path, file_path
+                    )
+                    
+                    if success:
+                        self._summarization_stats["files_summarized"] += 1
+                        
+                        # Update timing statistics
+                        self._summarization_stats["total_time_seconds"] += processing_time
+                        completed_count = self._summarization_stats["files_summarized"]
+                        self._summarization_stats["avg_time_per_file"] = (
+                            self._summarization_stats["total_time_seconds"] / completed_count
+                        )
+                        
+                        # Calculate estimated time remaining
+                        # With parallel processing, effective time per file is divided by concurrency
+                        remaining_files = self._summary_queue.qsize()
+                        if max_concurrent > 1:
+                            # Parallel: files complete faster but rate limit still applies per file
+                            avg_time_per_slot = self._summarization_stats["avg_time_per_file"] / max_concurrent
+                            batches_remaining = (remaining_files + max_concurrent - 1) // max_concurrent
+                            est_time = batches_remaining * (avg_time_per_slot + self._summarization_config.rate_limit_seconds)
+                        else:
+                            # Sequential: original calculation
+                            avg_time_with_rate_limit = (
+                                self._summarization_stats["avg_time_per_file"] + 
+                                self._summarization_config.rate_limit_seconds
+                            )
+                            est_time = avg_time_with_rate_limit * remaining_files
+                        
+                        self._summarization_stats["estimated_time_remaining"] = est_time
+                        
+                        # Log progress periodically
+                        if completed_count % 10 == 0:
+                            failed = self._summarization_stats["files_failed"]
+                            skipped = self._summarization_stats.get("files_skipped", 0)
+                            avg_time = self._summarization_stats["avg_time_per_file"]
+                            
+                            logger.info(
+                                f"[Summarization] Progress: {completed_count} completed, {failed} failed, {skipped} skipped, "
+                                f"{remaining_files} remaining | Avg: {avg_time:.1f}s/file, Est. remaining: {est_time/60:.1f}min"
+                            )
+                    
+                except Exception as e:
+                    logger.error(f"[Summarization] Error processing {file_path}: {e}")
+                    self._summarization_stats["last_error"] = str(e)
+                finally:
+                    self._summary_queue.task_done()
+                    # Rate limit after each file
+                    await asyncio.sleep(self._summarization_config.rate_limit_seconds)
         
         while True:
             # Yield to active queries - don't summarize while searches are happening
@@ -2364,105 +2428,33 @@ class MemoryService:
                 continue
             
             try:
-                # Get next file (with timeout to allow checking for cancellation)
-                try:
-                    priority, codebase_name, file_path, codebase_path = await asyncio.wait_for(
-                        self._summary_queue.get(),
-                        timeout=5.0
-                    )
-                except asyncio.TimeoutError:
-                    # Queue empty or waiting - check if we should stop
+                # Collect a batch of files to process in parallel
+                batch = []
+                for _ in range(max_concurrent):
+                    try:
+                        file_data = await asyncio.wait_for(
+                            self._summary_queue.get(),
+                            timeout=0.1 if batch else 5.0  # Short timeout if we have files, long if empty
+                        )
+                        batch.append(file_data)
+                    except asyncio.TimeoutError:
+                        break  # No more files available right now
+                
+                if not batch:
+                    # No files in queue
                     if self._summary_queue.empty():
                         logger.info("[Summarization] Queue empty, background summarizer idle")
+                        await asyncio.sleep(5.0)
                     continue
                 
-                # Update current file status
-                self._summarization_stats["current_file"] = file_path
+                # Process batch in parallel
+                tasks = [
+                    asyncio.create_task(process_with_tracking(*file_data))
+                    for file_data in batch
+                ]
                 
-                # Read file content
-                full_path = Path(codebase_path) / file_path
-                if not full_path.exists():
-                    logger.debug(f"[Summarization] Skipping missing file: {file_path}")
-                    self._summary_queue.task_done()
-                    continue
-                
-                try:
-                    content = full_path.read_text(encoding='utf-8', errors='ignore')
-                except Exception as e:
-                    logger.debug(f"[Summarization] Failed to read {file_path}: {e}")
-                    self._summary_queue.task_done()
-                    continue
-                
-                if not content.strip():
-                    self._summary_queue.task_done()
-                    continue
-                
-                # Compute content hash for incremental tracking
-                content_hash = ChromaVectorStore.compute_content_hash(content)
-                
-                # Check if file needs (re-)summarization
-                vector_store = self._vector_stores.get(codebase_name)
-                if vector_store and not vector_store.summary_index.needs_resummarization(file_path, content_hash):
-                    logger.debug(f"[Summarization] Skipping (unchanged): {file_path}")
-                    self._summarization_stats["files_skipped"] = self._summarization_stats.get("files_skipped", 0) + 1
-                    self._summary_queue.task_done()
-                    continue
-                
-                # Get heuristic metadata if available
-                heuristic_metadata = None
-                try:
-                    heuristic_metadata = self.heuristic_extractor.extract_file_metadata(file_path, content)
-                except Exception:
-                    pass  # Heuristics are optional
-                
-                # Generate summary with timing
-                import time
-                start_time = time.time()
-                logger.debug(f"[Summarization] Processing: {file_path}")
-                summary = await self._summarizer.summarize_file(file_path, content, heuristic_metadata)
-                end_time = time.time()
-                processing_time = end_time - start_time
-                
-                if summary.error:
-                    self._summarization_stats["files_failed"] += 1
-                    self._summarization_stats["last_error"] = f"{file_path}: {summary.error}"
-                    logger.warning(f"[Summarization] Failed to summarize {file_path}: {summary.error}")
-                else:
-                    # Store summary with content hash for tracking
-                    await self._store_summary(codebase_name, file_path, summary, content_hash)
-                    self._summarization_stats["files_summarized"] += 1
-                    
-                    # Update timing statistics
-                    self._summarization_stats["total_time_seconds"] += processing_time
-                    completed_count = self._summarization_stats["files_summarized"]
-                    self._summarization_stats["avg_time_per_file"] = self._summarization_stats["total_time_seconds"] / completed_count
-                    
-                    # Calculate estimated time remaining (including rate limit delay)
-                    remaining_files = self._summary_queue.qsize()
-                    avg_time_with_rate_limit = (
-                        self._summarization_stats["avg_time_per_file"] + 
-                        self._summarization_config.rate_limit_seconds
-                    )
-                    self._summarization_stats["estimated_time_remaining"] = (
-                        avg_time_with_rate_limit * remaining_files
-                    )
-                    
-                    # Log progress periodically with timing info
-                    if completed_count % 10 == 0:
-                        failed = self._summarization_stats["files_failed"]
-                        skipped = self._summarization_stats.get("files_skipped", 0)
-                        avg_time = self._summarization_stats["avg_time_per_file"]
-                        est_remaining = self._summarization_stats["estimated_time_remaining"]
-                        
-                        logger.info(
-                            f"[Summarization] Progress: {completed_count} completed, {failed} failed, {skipped} skipped, "
-                            f"{remaining_files} remaining | Avg: {avg_time:.1f}s/file, Est. remaining: {est_remaining/60:.1f}min"
-                        )
-                
-                self._summary_queue.task_done()
-                
-                # Rate limit to avoid overwhelming the LLM
-                await asyncio.sleep(self._summarization_config.rate_limit_seconds)
+                # Wait for all tasks in batch to complete
+                await asyncio.gather(*tasks, return_exceptions=True)
                 
             except asyncio.CancelledError:
                 logger.info("[Summarization] Background summarizer stopped")
@@ -2473,6 +2465,69 @@ class MemoryService:
                 logger.error(f"[Summarization] Error in background summarizer: {e}")
                 self._summarization_stats["last_error"] = str(e)
                 await asyncio.sleep(1.0)  # Brief pause before retrying
+    
+    async def _process_single_file_for_summary(
+        self,
+        codebase_name: str,
+        codebase_path: str,
+        file_path: str
+    ) -> tuple[bool, float]:
+        """
+        Process a single file for summarization.
+        
+        Returns:
+            Tuple of (success: bool, processing_time: float)
+        """
+        import time
+        
+        # Read file content
+        full_path = Path(codebase_path) / file_path
+        if not full_path.exists():
+            logger.debug(f"[Summarization] Skipping missing file: {file_path}")
+            return (False, 0.0)
+        
+        try:
+            content = full_path.read_text(encoding='utf-8', errors='ignore')
+        except Exception as e:
+            logger.debug(f"[Summarization] Failed to read {file_path}: {e}")
+            return (False, 0.0)
+        
+        if not content.strip():
+            return (False, 0.0)
+        
+        # Compute content hash for incremental tracking
+        content_hash = ChromaVectorStore.compute_content_hash(content)
+        
+        # Check if file needs (re-)summarization
+        vector_store = self._vector_stores.get(codebase_name)
+        if vector_store and not vector_store.summary_index.needs_resummarization(file_path, content_hash):
+            logger.debug(f"[Summarization] Skipping (unchanged): {file_path}")
+            self._summarization_stats["files_skipped"] = self._summarization_stats.get("files_skipped", 0) + 1
+            return (False, 0.0)
+        
+        # Get heuristic metadata if available
+        heuristic_metadata = None
+        try:
+            heuristic_metadata = self.heuristic_extractor.extract_file_metadata(file_path, content)
+        except Exception:
+            pass  # Heuristics are optional
+        
+        # Generate summary with timing
+        start_time = time.time()
+        logger.debug(f"[Summarization] Processing: {file_path}")
+        summary = await self._summarizer.summarize_file(file_path, content, heuristic_metadata)
+        end_time = time.time()
+        processing_time = end_time - start_time
+        
+        if summary.error:
+            self._summarization_stats["files_failed"] += 1
+            self._summarization_stats["last_error"] = f"{file_path}: {summary.error}"
+            logger.warning(f"[Summarization] Failed to summarize {file_path}: {summary.error}")
+            return (False, processing_time)
+        else:
+            # Store summary with content hash for tracking
+            await self._store_summary(codebase_name, file_path, summary, content_hash)
+            return (True, processing_time)
     
     async def _store_summary(
         self, 
