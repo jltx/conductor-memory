@@ -4,15 +4,17 @@ This file defines how AI coding assistants should leverage the conductor-memory 
 
 ## Memory MCP Tools Available
 
-| Tool | Purpose |
-|------|---------|
-| `memory_search` | Semantic/keyword search across indexed codebases |
-| `memory_store` | Store conversation context for later retrieval |
-| `memory_store_decision` | Store architectural decisions (auto-pinned) |
-| `memory_store_lesson` | Store debugging insights/lessons learned (auto-pinned) |
-| `memory_status` | Check indexing status and codebase info |
-| `memory_delete` | Remove outdated memories by ID |
-| `memory_prune` | Clean up old unpinned memories |
+| Tool | Purpose | Key Features |
+|------|---------|--------------|
+| `memory_search` | Advanced semantic/keyword search with filtering | Heuristic filtering, summary integration, relevance boosting |
+| `memory_store` | Store conversation context for later retrieval | Tagging, pinning, source tracking |
+| `memory_store_decision` | Store architectural decisions (auto-pinned) | Structured decision format, permanent storage |
+| `memory_store_lesson` | Store debugging insights/lessons learned (auto-pinned) | Problem-solution format, searchable |
+| `memory_status` | Check indexing status and codebase info | Multi-codebase status, file counts |
+| `memory_summarization_status` | Check LLM summarization progress | Time estimates, completion tracking |
+| `memory_reindex_codebase` | Force reindexing of specific codebase | Refresh metadata, update heuristics |
+| `memory_delete` | Remove outdated memories by ID | Cleanup, maintenance |
+| `memory_prune` | Clean up old unpinned memories | Bulk cleanup by age |
 
 ## Search Strategy: Tiered Approach
 
@@ -33,11 +35,18 @@ Action: memory_search("login authentication user credentials")
 - Returns: Code snippets with file locations
 - Best for: Known concepts, specific lookups, context augmentation
 
+**Advanced Query Features:**
+- **Heuristic Filtering**: `min_class_count=1`, `languages=["python"]`, `include_tags=["domain:service"]`
+- **Summary Integration**: `include_summaries=True` for LLM-generated file summaries
+- **Relevance Boosting**: `boost_summarized=True` for 15% boost to summarized files
+- **Multi-codebase**: `codebase="backend-api"` for targeted searches
+- **Smart Mode Detection**: Auto-detects semantic vs keyword search based on query
+
 **Query Tips:**
 - Use multiple related terms: `"feed timeline posts list"` not just `"feed"`
 - Include technical terms: `"repository pattern data layer"` 
+- Filter by complexity: `min_class_count=2` for substantial files
 - Try variations if first query returns nothing
-- Specify codebase parameter for multi-codebase setups
 
 ### Tier 2: Explore Agent (Escalate When Needed)
 
@@ -233,3 +242,60 @@ Want me to explore the full authentication architecture in more depth?
 - **"Codebase not found"**: Check memory_status for available codebases
 - **"Memory not found" on delete**: Memory may have been pruned or ID is incorrect
 - **Slow indexing**: Large codebases take time on first index; check memory_status for progress
+
+## Advanced Features (Latest)
+
+### Heuristic Filtering
+Filter search results by code structure and complexity:
+```
+memory_search(
+    query="authentication logic",
+    min_class_count=2,           # Files with 2+ classes
+    languages=["python"],        # Python files only
+    include_tags=["domain:service"]  # Service layer code
+)
+```
+
+### Summary Integration
+Include LLM-generated file summaries for better context:
+```
+memory_search(
+    query="user management",
+    include_summaries=True,      # Include structured summaries
+    boost_summarized=True        # 15% boost to summarized files
+)
+```
+
+Returns enhanced results with:
+- `has_summary`: Boolean indicating if file has summary
+- `file_summary`: Structured summary with purpose, pattern, domain, exports
+
+### Multi-Codebase Search
+Search across specific codebases or all at once:
+```
+memory_search(query="api endpoints", codebase="backend")  # Specific codebase
+memory_search(query="api endpoints")                      # All codebases
+```
+
+### Performance Monitoring
+Track summarization progress with time estimates:
+```
+memory_summarization_status()  # Returns timing estimates and queue status
+```
+
+## Next Features (Roadmap)
+
+### Conversation Memory Integration
+- **Context Persistence**: Automatically store important conversation context
+- **Decision Tracking**: Link code changes to architectural decisions
+- **Learning Integration**: Connect debugging sessions to code improvements
+
+### Enhanced Search Intelligence  
+- **Semantic Code Relationships**: Understand function call graphs and dependencies
+- **Pattern Recognition**: Identify similar code patterns across codebases
+- **Change Impact Analysis**: Predict which files might be affected by changes
+
+### Advanced Summarization
+- **Incremental Updates**: Smart re-summarization when files change
+- **Cross-File Context**: Summaries that understand file relationships
+- **Custom Prompts**: Domain-specific summarization strategies

@@ -1,25 +1,24 @@
 # Conductor Memory - TODO
 
-## Background Summarization (Phase 4) - COMPLETED
+## ✅ COMPLETED PHASES
 
-The background summarization system has been implemented and wired up.
+### Phase 4: Background Summarization - COMPLETED
+- LLM-powered file summarization using Ollama
+- Priority queue based on file centrality
+- Query yielding to avoid search latency impact
+- Graceful startup with health checks
 
-### What's Implemented
-- [x] `llm/ollama_client.py` - Async Ollama API client
-- [x] `llm/lmstudio_client.py` - LMStudio client (alternative)
-- [x] `llm/summarizer.py` - FileSummarizer with skeleton extraction for large files
-- [x] `llm/base.py` - Base LLM client interface
-- [x] `config/summarization.py` - SummarizationConfig dataclass
-- [x] `config/server.py` - Integrated summarization_config into ServerConfig
-- [x] `search/import_graph.py` - Import graph with centrality calculation
-- [x] `search/heuristics.py` - Heuristic extraction (classes, functions, annotations)
-- [x] `service/memory_service.py` - Background summarizer with:
-  - Priority queue based on file centrality
-  - Query yielding (pauses during active searches)
-  - Progress logging every 10 files
-  - Summary storage as pinned memory chunks
-  - Graceful startup with Ollama health check
-- [x] `server/stdio.py` - Added `memory_summarization_status` MCP tool
+### Phase 5: Summary Integration - COMPLETED  
+- `include_summaries` parameter for enhanced search results
+- `boost_summarized` parameter for 15% relevance boost
+- Structured summary data with purpose, pattern, exports
+- Full integration with MCP tools and HTTP API
+
+### Phase 6: Incremental Re-summarization & Web UI - COMPLETED
+- Smart detection of file changes for efficient updates
+- Real-time web dashboard with progress tracking
+- Enhanced status reporting with timing estimates
+- Callback-based startup system
 
 ### Configuration
 
@@ -172,8 +171,40 @@ Phase 6 adds incremental re-summarization when files change and a web dashboard.
 - [ ] Fix PowerShell conda activation error in PATH (harmless but noisy)
 - [ ] Consider adding log rotation for `logs/conductor-memory.log`
 
-### Future Enhancements (Phase 7+)
-- [ ] Support for more LLM backends (OpenAI, Anthropic for cloud option)
-- [ ] Summary quality metrics and validation
-- [ ] Batch re-summarization command for forcing refresh
-- [ ] Summary diff view when files change
+### ✅ Issues Resolved During Testing
+- [x] **Heuristic Metadata Storage**: Fixed - Now properly storing `class_count:N`, `function_count:N`, `lang:python` tags
+- [x] **Phase 5 Summary Integration**: Fixed - `include_summaries=True` returns structured summary data
+- [x] **Phase 5 Summary Boost**: Fixed - 15% boost correctly applied (0.012454 → 0.014322)
+- [x] **Callback-based Startup**: Fixed - Summarizer starts immediately when indexing completes
+- [x] **Time Estimation**: Added - Real-time progress tracking with completion estimates
+- [x] **Tag Filtering**: Working - `include_tags` with proper tag names returns results
+
+### 🔧 Known Minor Issues
+- [ ] Keyword search mode returns 0 results for exact class names (semantic/hybrid work fine)
+- [ ] Search result inconsistency: Same wildcard query may return different results on repeated calls
+
+## 🚀 NEXT PHASE PRIORITIES
+
+### Phase 7: Conversation Memory Integration
+- [ ] **Context Persistence**: Automatically store important conversation context
+- [ ] **Decision Tracking**: Link code changes to architectural decisions  
+- [ ] **Learning Integration**: Connect debugging sessions to code improvements
+- [ ] **Session Management**: Track conversation threads and outcomes
+
+### Phase 8: Enhanced Search Intelligence
+- [ ] **Semantic Code Relationships**: Understand function call graphs and dependencies
+- [ ] **Pattern Recognition**: Identify similar code patterns across codebases
+- [ ] **Change Impact Analysis**: Predict which files might be affected by changes
+- [ ] **Smart Suggestions**: Recommend related files/functions based on context
+
+### Phase 9: Advanced Summarization
+- [ ] **Cross-File Context**: Summaries that understand file relationships
+- [ ] **Custom Prompts**: Domain-specific summarization strategies
+- [ ] **Quality Metrics**: Validation and scoring of summary quality
+- [ ] **Multi-Model Support**: OpenAI, Anthropic for cloud options
+
+### Minor Enhancements
+- [ ] Fix keyword search for exact class names
+- [ ] Add summary diff view when files change
+- [ ] Implement batch re-summarization command
+- [ ] Add log rotation for large deployments

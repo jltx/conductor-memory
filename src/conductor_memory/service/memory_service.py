@@ -129,8 +129,15 @@ class MemoryService:
             "files_failed": 0,
             "current_file": None,
             "is_running": False,
-            "last_error": None
+            "last_error": None,
+            "total_time_seconds": 0.0,
+            "avg_time_per_file": 0.0,
+            "estimated_time_remaining": 0.0
         }
+        
+        # Indexing completion tracking for callback-based summarizer startup
+        self._indexing_completion_callbacks = []
+        self._completed_codebases = set()
         
         # Initialize vector stores for each enabled codebase
         for codebase in config.get_enabled_codebases():
@@ -158,6 +165,32 @@ class MemoryService:
         }
         # Initialize import graph for this codebase
         self._import_graphs[codebase.name] = ImportGraph()
+    
+    def _register_indexing_completion_callback(self, callback):
+        """Register a callback to be called when all indexing is complete"""
+        self._indexing_completion_callbacks.append(callback)
+    
+    def _on_codebase_indexing_complete(self, codebase_name: str):
+        """Called when a codebase finishes indexing"""
+        self._completed_codebases.add(codebase_name)
+        logger.debug(f"[Indexing] Codebase {codebase_name} completed. Completed: {self._completed_codebases}")
+        
+        # Check if all enabled codebases are complete
+        enabled_codebase_names = {cb.name for cb in self.config.get_enabled_codebases()}
+        if self._completed_codebases >= enabled_codebase_names:
+            logger.info(f"[Indexing] All codebases completed ({len(self._completed_codebases)}/{len(enabled_codebase_names)}), triggering {len(self._indexing_completion_callbacks)} completion callbacks")
+            # Trigger all registered callbacks
+            for callback in self._indexing_completion_callbacks:
+                try:
+                    if asyncio.iscoroutinefunction(callback):
+                        asyncio.create_task(callback())
+                    else:
+                        callback()
+                except Exception as e:
+                    logger.error(f"Error in indexing completion callback: {e}")
+            
+            # Clear callbacks after triggering
+            self._indexing_completion_callbacks.clear()
     
     # ─────────────────────────────────────────────────────────────────────────
     # Public API - Async versions
@@ -218,15 +251,35 @@ class MemoryService:
             # that will close. They should be started via start_file_watchers() 
             # and start_background_summarizer() in the main server's event loop.
         else:
-            # For background indexing mode, start summarizer after a delay
-            # to allow initial indexing to make progress
-            async def _delayed_summarizer_start():
-                # Wait for all codebases to finish initial indexing
-                while any(s["status"] == "indexing" for s in self._indexing_status.values()):
-                    await asyncio.sleep(2.0)
+            # For background indexing mode, start summarizer when indexing completes
+            async def _on_indexing_complete():
+                logger.info("[Summarization] All indexing completed, starting background summarizer")
                 await self._start_background_summarizer()
             
-            asyncio.create_task(_delayed_summarizer_start())
+            # Register callback to start summarizer when indexing is done
+            self._register_indexing_completion_callback(_on_indexing_complete)
+            
+            # Check if indexing is already complete (e.g., all codebases already indexed)
+            enabled_codebase_names = {cb.name for cb in self.config.get_enabled_codebases()}
+            already_completed = {
+                name for name, status in self._indexing_status.items() 
+                if status.get("status") == "completed"
+            }
+            
+            if already_completed >= enabled_codebase_names:
+                logger.info("[Summarization] Indexing already complete, starting background summarizer immediately")
+                asyncio.create_task(_on_indexing_complete())
+            
+            # Also add a fallback timeout in case callback system fails
+            async def _fallback_summarizer_start():
+                await asyncio.sleep(self._summarization_config.startup_delay_seconds)
+                
+                # Check if summarizer already started via callback
+                if self._summarizer_task is None:
+                    logger.warning("[Summarization] Fallback timeout reached, starting background summarizer anyway")
+                    await self._start_background_summarizer()
+            
+            asyncio.create_task(_fallback_summarizer_start())
     
     async def search_async(
         self,
@@ -1128,6 +1181,7 @@ class MemoryService:
                 status["status"] = "completed"
                 status["progress"] = 1.0
                 status["indexed_files_count"] = existing_count
+                self._on_codebase_indexing_complete(codebase.name)
                 return
             
             # Process files in batches for better GPU utilization
@@ -1139,6 +1193,7 @@ class MemoryService:
             status["status"] = "completed"
             status["progress"] = 1.0
             status["indexed_files_count"] = len(vector_store.get_indexed_files())
+            self._on_codebase_indexing_complete(codebase.name)
             
             # Build BM25 index for hybrid search
             import time
@@ -2215,30 +2270,67 @@ class MemoryService:
                 codebase_path = Path(codebase.path)
                 vector_store = self._vector_stores.get(codebase.name)
                 
+                if not vector_store:
+                    logger.warning(f"[Summarization] No vector store found for codebase: {codebase.name}")
+                    continue
+                
+                # Check indexing status for this codebase
+                codebase_status = self._indexing_status.get(codebase.name, {})
+                logger.info(f"[Summarization] Codebase {codebase.name} status: {codebase_status.get('status', 'unknown')}")
+                
                 # Try to get files by centrality
                 priority_queue = self.get_file_centrality_scores(codebase.name, max_files=1000)
                 
                 if priority_queue:
                     # Use centrality-ordered files
+                    logger.info(f"[Summarization] Using centrality ordering for {codebase.name}, found {len(priority_queue)} files")
+                    skipped_count = 0
                     for file_path, score in priority_queue:
                         if self._summarizer._should_skip_file(file_path):
+                            skipped_count += 1
                             continue
                         await self._summary_queue.put((-score, codebase.name, file_path, str(codebase_path)))
                         total_queued += 1
-                elif vector_store:
+                    if skipped_count > 0:
+                        logger.info(f"[Summarization] Skipped {skipped_count} files matching skip patterns for {codebase.name}")
+                else:
                     # Fallback: queue all indexed files with equal priority
                     indexed_files = vector_store.get_indexed_files()
-                    logger.info(f"[Summarization] No import graph for {codebase.name}, queuing {len(indexed_files)} indexed files")
+                    logger.info(f"[Summarization] No import graph for {codebase.name}, found {len(indexed_files)} indexed files")
+                    
+                    if not indexed_files:
+                        logger.warning(f"[Summarization] No indexed files found for {codebase.name} - indexing may not be complete")
+                        continue
+                    
+                    skipped_count = 0
                     for file_path in indexed_files.keys():
                         if self._summarizer._should_skip_file(file_path):
+                            skipped_count += 1
                             continue
                         await self._summary_queue.put((0.5, codebase.name, file_path, str(codebase_path)))
                         total_queued += 1
+                    
+                    if skipped_count > 0:
+                        logger.info(f"[Summarization] Skipped {skipped_count} files matching skip patterns for {codebase.name}")
+                    
+                logger.info(f"[Summarization] Queued {total_queued} files from {codebase.name}")
             
             self._summarization_stats["files_queued"] = total_queued
             
             if total_queued == 0:
-                logger.info("[Summarization] No files to summarize")
+                logger.warning("[Summarization] No files queued for summarization")
+                
+                # Provide diagnostic information
+                for codebase in self.config.get_enabled_codebases():
+                    vector_store = self._vector_stores.get(codebase.name)
+                    if vector_store:
+                        indexed_files = vector_store.get_indexed_files()
+                        logger.info(f"[Summarization] {codebase.name}: {len(indexed_files)} indexed files")
+                        
+                        # Check how many already have summaries
+                        summarized_files = vector_store.summary_index.get_all_summarized_files()
+                        logger.info(f"[Summarization] {codebase.name}: {len(summarized_files)} files already summarized")
+                
                 await llm_client.close()
                 return
             
@@ -2323,9 +2415,13 @@ class MemoryService:
                 except Exception:
                     pass  # Heuristics are optional
                 
-                # Generate summary
+                # Generate summary with timing
+                import time
+                start_time = time.time()
                 logger.debug(f"[Summarization] Processing: {file_path}")
                 summary = await self._summarizer.summarize_file(file_path, content, heuristic_metadata)
+                end_time = time.time()
+                processing_time = end_time - start_time
                 
                 if summary.error:
                     self._summarization_stats["files_failed"] += 1
@@ -2336,14 +2432,27 @@ class MemoryService:
                     await self._store_summary(codebase_name, file_path, summary, content_hash)
                     self._summarization_stats["files_summarized"] += 1
                     
-                    # Log progress periodically
-                    if self._summarization_stats["files_summarized"] % 10 == 0:
-                        remaining = self._summary_queue.qsize()
-                        completed = self._summarization_stats["files_summarized"]
+                    # Update timing statistics
+                    self._summarization_stats["total_time_seconds"] += processing_time
+                    completed_count = self._summarization_stats["files_summarized"]
+                    self._summarization_stats["avg_time_per_file"] = self._summarization_stats["total_time_seconds"] / completed_count
+                    
+                    # Calculate estimated time remaining
+                    remaining_files = self._summary_queue.qsize()
+                    self._summarization_stats["estimated_time_remaining"] = (
+                        self._summarization_stats["avg_time_per_file"] * remaining_files
+                    )
+                    
+                    # Log progress periodically with timing info
+                    if completed_count % 10 == 0:
                         failed = self._summarization_stats["files_failed"]
                         skipped = self._summarization_stats.get("files_skipped", 0)
+                        avg_time = self._summarization_stats["avg_time_per_file"]
+                        est_remaining = self._summarization_stats["estimated_time_remaining"]
+                        
                         logger.info(
-                            f"[Summarization] Progress: {completed} completed, {failed} failed, {skipped} skipped, {remaining} remaining"
+                            f"[Summarization] Progress: {completed_count} completed, {failed} failed, {skipped} skipped, "
+                            f"{remaining_files} remaining | Avg: {avg_time:.1f}s/file, Est. remaining: {est_remaining/60:.1f}min"
                         )
                 
                 self._summary_queue.task_done()
@@ -2481,19 +2590,29 @@ Dependencies: {dependencies}"""
             except Exception as e:
                 logger.debug(f"[{codebase_name}] Error getting summary stats: {e}")
         
+        # Calculate timing estimates
+        files_queued = self._summary_queue.qsize() if self._summary_queue else 0
+        avg_time_per_file = self._summarization_stats.get("avg_time_per_file", 0.0)
+        estimated_time_remaining = avg_time_per_file * files_queued
+        
         return {
             "enabled": self._summarization_config.enabled,
             "llm_enabled": self._summarization_config.llm_enabled,
             "model": self._summarization_config.model,
             "is_running": self._summarization_stats["is_running"],
-            "files_queued": self._summary_queue.qsize() if self._summary_queue else 0,
+            "files_queued": files_queued,
             "files_completed": self._summarization_stats["files_summarized"],
             "files_skipped": self._summarization_stats.get("files_skipped", 0),
             "files_failed": self._summarization_stats["files_failed"],
             "total_summarized": total_summarized,
             "current_file": self._summarization_stats["current_file"],
             "last_error": self._summarization_stats["last_error"],
-            "by_codebase": summary_stats_by_codebase
+            "by_codebase": summary_stats_by_codebase,
+            # Timing estimates
+            "avg_time_per_file_seconds": avg_time_per_file,
+            "estimated_time_remaining_seconds": estimated_time_remaining,
+            "estimated_time_remaining_minutes": estimated_time_remaining / 60.0,
+            "total_processing_time_seconds": self._summarization_stats.get("total_time_seconds", 0.0)
         }
     
     async def queue_file_for_summarization(

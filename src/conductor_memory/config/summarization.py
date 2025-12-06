@@ -22,6 +22,9 @@ class SummarizationConfig:
     rate_limit_seconds: float = 0.5
     timeout_seconds: float = 30.0
     
+    # Startup timing (fallback timeout if callback system fails)
+    startup_delay_seconds: float = 60.0  # Fallback timeout for summarizer startup
+    
     # File size limits
     max_file_lines: int = 600
     max_file_tokens: int = 4000
@@ -60,6 +63,7 @@ class SummarizationConfig:
             model=summarization_config.get('model', "qwen2.5-coder:1.5b"),
             rate_limit_seconds=summarization_config.get('rate_limit_seconds', 0.5),
             timeout_seconds=summarization_config.get('timeout_seconds', 30.0),
+            startup_delay_seconds=summarization_config.get('startup_delay_seconds', 30.0),
             max_file_lines=summarization_config.get('max_file_lines', 600),
             max_file_tokens=summarization_config.get('max_file_tokens', 4000),
             temperature=summarization_config.get('temperature', 0.1),
@@ -82,6 +86,7 @@ class SummarizationConfig:
             'model': self.model,
             'rate_limit_seconds': self.rate_limit_seconds,
             'timeout_seconds': self.timeout_seconds,
+            'startup_delay_seconds': self.startup_delay_seconds,
             'max_file_lines': self.max_file_lines,
             'max_file_tokens': self.max_file_tokens,
             'temperature': self.temperature,

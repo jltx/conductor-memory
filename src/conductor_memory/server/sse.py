@@ -716,6 +716,24 @@ async def web_dashboard(request):
             const statusClass = data.is_running ? 'status-running' : 'status-idle';
             const statusText = data.is_running ? 'Running' : 'Idle';
             
+            // Format timing information
+            const avgTime = data.avg_time_per_file_seconds || 0;
+            const avgTimeText = avgTime > 0 ? `${avgTime.toFixed(1)}s` : 'N/A';
+            
+            const estRemaining = data.estimated_time_remaining_minutes || 0;
+            let estRemainingText = 'N/A';
+            if (estRemaining > 0 && data.files_queued > 0) {
+                if (estRemaining < 1) {
+                    estRemainingText = `${Math.round(estRemaining * 60)}s`;
+                } else if (estRemaining < 60) {
+                    estRemainingText = `${estRemaining.toFixed(1)}min`;
+                } else {
+                    const hours = Math.floor(estRemaining / 60);
+                    const mins = Math.round(estRemaining % 60);
+                    estRemainingText = `${hours}h ${mins}m`;
+                }
+            }
+            
             document.getElementById('summary-stats').innerHTML = `
                 <div class="stat"><div class="stat-value ${statusClass}">${statusText}</div><div class="stat-label">Status</div></div>
                 <div class="stat"><div class="stat-value">${data.total_summarized || 0}</div><div class="stat-label">Summarized</div></div>
@@ -723,6 +741,8 @@ async def web_dashboard(request):
                 <div class="stat"><div class="stat-value">${data.files_completed || 0}</div><div class="stat-label">This Session</div></div>
                 <div class="stat"><div class="stat-value">${data.files_skipped || 0}</div><div class="stat-label">Skipped</div></div>
                 <div class="stat"><div class="stat-value">${data.files_failed || 0}</div><div class="stat-label">Failed</div></div>
+                <div class="stat"><div class="stat-value">${avgTimeText}</div><div class="stat-label">Avg Time/File</div></div>
+                <div class="stat"><div class="stat-value">${estRemainingText}</div><div class="stat-label">Est. Remaining</div></div>
             `;
             
             const total = (data.files_completed || 0) + (data.files_queued || 0);
@@ -730,7 +750,7 @@ async def web_dashboard(request):
             
             document.getElementById('progress-section').innerHTML = data.is_running && total > 0 ? `
                 <div style="display: flex; justify-content: space-between; font-size: 13px; color: #888; margin-top: 10px;">
-                    <span>Progress</span><span>${pct}%</span>
+                    <span>Progress (${data.files_completed}/${total})</span><span>${pct}% • ${estRemainingText} remaining</span>
                 </div>
                 <div class="progress-bar"><div class="progress-fill" style="width: ${pct}%"></div></div>
             ` : '';
@@ -1283,7 +1303,10 @@ async def memory_search(
     has_annotations: bool | None = None,
     has_docstrings: bool | None = None,
     min_class_count: int | None = None,
-    min_function_count: int | None = None
+    min_function_count: int | None = None,
+    # Phase 5: Summary Integration
+    include_summaries: bool = False,
+    boost_summarized: bool = True
 ) -> dict[str, Any]:
     """
     Search for relevant memories using semantic similarity, keyword matching, or both.
@@ -1305,6 +1328,8 @@ async def memory_search(
         has_docstrings: Filter files that have/don't have docstrings
         min_class_count: Minimum number of classes in file
         min_function_count: Minimum number of functions in file
+        include_summaries: Include file summary data in results (Phase 5)
+        boost_summarized: Apply relevance boost to files with summaries (Phase 5)
     
     Returns:
         Dictionary with search results and metadata including search_mode_used
@@ -1328,7 +1353,9 @@ async def memory_search(
         has_annotations=has_annotations,
         has_docstrings=has_docstrings,
         min_class_count=min_class_count,
-        min_function_count=min_function_count
+        min_function_count=min_function_count,
+        include_summaries=include_summaries,
+        boost_summarized=boost_summarized
     )
 
 
@@ -1592,11 +1619,35 @@ async def memory_summarization_status() -> dict[str, Any]:
         - files_completed: Files summarized this session
         - total_summarized: Total files with summaries (persistent)
         - current_file: File currently being processed
+        - avg_time_per_file_seconds: Average processing time per file
+        - estimated_time_remaining_seconds: Estimated time to complete queue
+        - estimated_time_remaining_minutes: Estimated time in minutes
     """
     if not memory_service:
         return {"error": "Memory service not initialized"}
     
     return memory_service.get_summarization_status()
+
+
+@mcp.tool()
+async def memory_reindex_codebase(codebase: str) -> dict[str, Any]:
+    """
+    Force reindexing of a specific codebase to update metadata and heuristics.
+    
+    Args:
+        codebase: Name of the codebase to reindex
+    
+    Returns:
+        Dictionary with reindexing results
+    """
+    if not memory_service:
+        return {"error": "Memory service not initialized"}
+    
+    try:
+        result = await memory_service.reindex_codebase_async(codebase)
+        return result
+    except Exception as e:
+        return {"error": f"Failed to reindex codebase '{codebase}': {str(e)}"}
 
 
 def main():

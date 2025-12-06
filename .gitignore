@@ -46,15 +46,15 @@ data/
 # Logs
 *.log
 memory_server.log
+logs/
 
 # Config files with secrets (use .example versions)
 memory_server_config.json
 config.json
 
+# Runtime files
+.conductor-memory.pid
+
 # OS
 .DS_Store
 Thumbs.db
-".conductor-memory.pid"  
-"logs/*.stderr"  
-"logs/*.log"  
-"logs/dashboard_output.html"  

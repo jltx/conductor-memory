@@ -1,17 +1,32 @@
 # Conductor Memory
 
-A standalone semantic memory service with codebase indexing for AI agents. Provides intelligent context retrieval through hybrid semantic + keyword search.
+A production-ready semantic memory service with intelligent codebase indexing for AI agents. Provides context-aware search through hybrid semantic + keyword matching with advanced heuristic filtering.
 
 ## Features
 
-- **Semantic Search**: Vector similarity search using sentence-transformers
-- **Hybrid Search**: Combines semantic and BM25 keyword search with Reciprocal Rank Fusion
-- **Codebase Indexing**: AST-aware chunking for Python, with support for 15+ languages
-- **Multi-Codebase Support**: Index and search across multiple projects
-- **Incremental Indexing**: Only re-indexes changed files (tracks mtime + content hash)
-- **Background Summarization**: LLM-powered file summaries using Ollama
-- **MCP Integration**: Model Context Protocol server for AI agent tools
-- **Web Dashboard**: Real-time monitoring of indexing and summarization progress
+### 🔍 **Advanced Search**
+- **Hybrid Search**: Combines semantic vectors + BM25 keyword search with Reciprocal Rank Fusion
+- **Heuristic Filtering**: Filter by classes, functions, annotations, file types, and complexity metrics
+- **Smart Mode Detection**: Auto-detects optimal search strategy (semantic/keyword/hybrid)
+- **Summary Integration**: Include LLM-generated file summaries in search results with relevance boosting
+
+### 📁 **Intelligent Indexing**
+- **Multi-Language Support**: AST-aware parsing for 15+ programming languages via tree-sitter
+- **Multi-Codebase**: Index and search across multiple projects simultaneously
+- **Incremental Updates**: Only re-indexes changed files (mtime + content hash tracking)
+- **Metadata Extraction**: Automatic extraction of classes, functions, imports, and complexity metrics
+
+### 🤖 **LLM Integration**
+- **Background Summarization**: Automatic file summarization using Ollama with callback-based startup
+- **Time Estimation**: Real-time progress tracking with completion time estimates
+- **Incremental Re-summarization**: Smart detection of file changes for efficient updates
+- **Pattern Recognition**: Identifies architectural patterns and domains in code
+
+### 🔧 **Production Ready**
+- **MCP Integration**: Full Model Context Protocol server for AI agent tools
+- **Web Dashboard**: Real-time monitoring with enhanced status reporting
+- **RESTful API**: Complete HTTP API for integration
+- **Robust Configuration**: Flexible config system with validation and hot-reloading
 
 ## Installation
 
@@ -174,16 +189,26 @@ The `search_mode` parameter controls how queries are processed:
 
 ## Available MCP Tools
 
-| Tool | Description |
-|------|-------------|
-| `memory_search` | Search codebase with hybrid semantic+keyword matching |
-| `memory_store` | Store important context for later retrieval |
-| `memory_store_decision` | Store architectural decisions (auto-pinned) |
-| `memory_store_lesson` | Store debugging insights and lessons learned |
-| `memory_status` | Check indexing status and memory system health |
-| `memory_summarization_status` | Check LLM summarization progress |
-| `memory_prune` | Remove obsolete memories based on age/relevance |
-| `memory_delete` | Delete a specific memory by ID |
+| Tool | Description | Key Parameters |
+|------|-------------|----------------|
+| `memory_search` | Advanced search with filtering and summary integration | `include_summaries`, `boost_summarized`, `include_tags`, `min_class_count` |
+| `memory_store` | Store important context for later retrieval | `content`, `tags`, `pin` |
+| `memory_store_decision` | Store architectural decisions (auto-pinned) | `content`, `tags` |
+| `memory_store_lesson` | Store debugging insights and lessons learned | `content`, `tags` |
+| `memory_status` | Check indexing status and memory system health | - |
+| `memory_summarization_status` | Check LLM summarization progress with timing estimates | - |
+| `memory_reindex_codebase` | Force reindexing of a specific codebase | `codebase` |
+| `memory_prune` | Remove obsolete memories based on age/relevance | `max_age_days` |
+| `memory_delete` | Delete a specific memory by ID | `memory_id` |
+
+### Advanced Search Parameters
+
+- **`include_summaries`**: Include LLM-generated file summaries in results
+- **`boost_summarized`**: Apply 15% relevance boost to files with summaries  
+- **`include_tags`/`exclude_tags`**: Filter by metadata tags (supports wildcards)
+- **`min_class_count`/`min_function_count`**: Filter by code complexity
+- **`languages`**: Filter by programming language
+- **`search_mode`**: Force specific search strategy
 
 ## REST API Endpoints
 
@@ -217,9 +242,11 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for detailed architecture docum
 
 ## Performance
 
-- **Indexing Speed**: ~50-100 files/second
-- **Search Latency**: ~10-50ms for typical queries
-- **Memory Usage**: ~100MB base + ~1MB per 1000 code chunks
+- **Indexing Speed**: ~50-100 files/second with heuristic metadata extraction
+- **Search Latency**: ~10-50ms for typical queries (hybrid search with filtering)
+- **Summarization Speed**: ~0.6s per file average (with qwen2.5-coder:1.5b)
+- **Memory Usage**: ~100MB base + ~1MB per 1000 code chunks + summary metadata
+- **Scalability**: Tested with 400+ files across multiple codebases
 
 ## Development
 
