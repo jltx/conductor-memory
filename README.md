@@ -30,16 +30,41 @@ A production-ready semantic memory service with intelligent codebase indexing fo
 
 ## Installation
 
+### Quick Install (Recommended)
+
 ```bash
 pip install conductor-memory
 ```
 
-Or from source:
+### Platform-Specific Installation
+
+#### Windows
+```cmd
+# Using pip
+pip install conductor-memory
+
+# Or use the convenience script
+curl -O https://raw.githubusercontent.com/jltx/conductor-memory/main/scripts/install-windows.ps1
+powershell -ExecutionPolicy Bypass -File install-windows.ps1
+```
+
+#### macOS/Linux
 ```bash
-git clone https://github.com/yourusername/conductor-memory
+# Using pip
+pip install conductor-memory
+
+# Or use the install script (Linux)
+curl -sSL https://raw.githubusercontent.com/jltx/conductor-memory/main/scripts/install-linux.sh | bash
+```
+
+### Development Installation
+```bash
+git clone https://github.com/jltx/conductor-memory
 cd conductor-memory
 pip install -e .
 ```
+
+📖 **For detailed installation instructions, see [INSTALL.md](INSTALL.md)**
 
 ## Quick Start
 
