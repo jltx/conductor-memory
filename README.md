@@ -110,6 +110,25 @@ The server will be available at:
 - **MCP SSE endpoint**: http://localhost:9820/sse
 - **Health check**: http://localhost:9820/health
 
+### Web Dashboard
+
+The dashboard provides a real-time view of your memory system with three main tabs:
+
+#### Status Tab
+Monitor indexing and summarization progress across all codebases:
+
+![Dashboard Status](docs/brave_screenshot_localhost-dashboard.png)
+
+#### Search Tab
+Search across your indexed codebases with advanced filtering options:
+
+![Dashboard Search](docs/brave_screenshot_localhost-search.png)
+
+#### Browse Tab
+Browse indexed files, memories, and summaries:
+
+![Dashboard Browse](docs/brave_screenshot_localhost-browse.png)
+
 ### 3. Configure Your AI Client
 
 Add to your `opencode.json`:
