@@ -2437,10 +2437,14 @@ class MemoryService:
                     completed_count = self._summarization_stats["files_summarized"]
                     self._summarization_stats["avg_time_per_file"] = self._summarization_stats["total_time_seconds"] / completed_count
                     
-                    # Calculate estimated time remaining
+                    # Calculate estimated time remaining (including rate limit delay)
                     remaining_files = self._summary_queue.qsize()
+                    avg_time_with_rate_limit = (
+                        self._summarization_stats["avg_time_per_file"] + 
+                        self._summarization_config.rate_limit_seconds
+                    )
                     self._summarization_stats["estimated_time_remaining"] = (
-                        self._summarization_stats["avg_time_per_file"] * remaining_files
+                        avg_time_with_rate_limit * remaining_files
                     )
                     
                     # Log progress periodically with timing info
@@ -2590,10 +2594,11 @@ Dependencies: {dependencies}"""
             except Exception as e:
                 logger.debug(f"[{codebase_name}] Error getting summary stats: {e}")
         
-        # Calculate timing estimates
+        # Calculate timing estimates (including rate limit delay)
         files_queued = self._summary_queue.qsize() if self._summary_queue else 0
         avg_time_per_file = self._summarization_stats.get("avg_time_per_file", 0.0)
-        estimated_time_remaining = avg_time_per_file * files_queued
+        avg_time_with_rate_limit = avg_time_per_file + self._summarization_config.rate_limit_seconds
+        estimated_time_remaining = avg_time_with_rate_limit * files_queued
         
         return {
             "enabled": self._summarization_config.enabled,
