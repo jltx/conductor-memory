@@ -49,6 +49,7 @@ class TreeSitterParser(ContentParser):
         self._parsers: Dict[str, Parser] = {}  # Cached parsers
         self._languages: Dict[str, Language] = {}
         self._configs: Dict[str, LanguageConfig] = {}
+        self._heuristic_extractor = None  # Lazy initialization
     
     def supports(self, file_path: str) -> bool:
         """Check if this parser supports the given file extension."""
@@ -558,6 +559,22 @@ class TreeSitterParser(ContentParser):
         module = str(path.with_suffix('')).replace('/', '.').replace('\\', '.')
         # Remove leading dots
         return module.lstrip('.')
+    
+    def extract_heuristics(self, content: str, file_path: str):
+        """Extract structured metadata without LLM calls.
+        
+        Args:
+            content: Raw file content as string
+            file_path: Path to the file being parsed
+            
+        Returns:
+            HeuristicMetadata object or None if extraction fails
+        """
+        if self._heuristic_extractor is None:
+            from ..heuristics import HeuristicExtractor
+            self._heuristic_extractor = HeuristicExtractor()
+        
+        return self._heuristic_extractor.extract_file_metadata(file_path, content)
 
 
 # Export the main parser class

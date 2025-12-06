@@ -43,6 +43,20 @@ class ContentParser(ABC):
             List of (chunk_text, metadata) tuples
         """
         pass
+    
+    def extract_heuristics(self, content: str, file_path: str):
+        """Extract structured metadata without LLM calls.
+        
+        Args:
+            content: Raw file content as string
+            file_path: Path to the file being parsed
+            
+        Returns:
+            HeuristicMetadata object or None if extraction fails
+        """
+        # Default implementation returns None
+        # Subclasses should override this method
+        return None
 
 
 class ParseError(Exception):

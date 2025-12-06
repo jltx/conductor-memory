@@ -58,6 +58,11 @@ class LanguageConfig:
         """Language-specific signature extraction implementation."""
         # Default implementation - extracts basic signature
         return code[node.start_byte:node.end_byte].decode('utf-8', errors='ignore').strip()
+    
+    def get_annotation_query(self) -> str:
+        """Get tree-sitter query for extracting annotations/decorators."""
+        # Default implementation - override in subclasses for language-specific patterns
+        return "(decorator) @annotation\n(annotation) @annotation\n(marker_annotation) @annotation"
 
 
 class PythonConfig(LanguageConfig):
@@ -107,6 +112,10 @@ class PythonConfig(LanguageConfig):
             return signature
         except:
             return code[node.start_byte:node.end_byte].decode('utf-8', errors='ignore').strip()
+    
+    def get_annotation_query(self) -> str:
+        """Get tree-sitter query for extracting Python decorators."""
+        return "(decorator) @annotation\n(decorator_list) @annotation"
 
 
 class JavaConfig(LanguageConfig):
@@ -156,6 +165,10 @@ class JavaConfig(LanguageConfig):
             return signature
         except:
             return code[node.start_byte:node.end_byte].decode('utf-8', errors='ignore').strip()
+    
+    def get_annotation_query(self) -> str:
+        """Get tree-sitter query for extracting Java annotations."""
+        return "(annotation) @annotation\n(marker_annotation) @annotation\n(modifiers) @annotation"
 
 
 class RubyConfig(LanguageConfig):
@@ -171,10 +184,11 @@ class RubyConfig(LanguageConfig):
             method_types=["method", "singleton_method"],
             import_types=["call"],  # require, load statements
             interface_types=["module"],  # Ruby uses modules for interfaces
-            definition_query="""(class) @class.def
-(module) @module.def
-(method) @method.def
-(singleton_method) @method.def""",
+            definition_query="""(class name: (constant) @class.name) @class.def
+(module name: (constant) @interface.name) @interface.def
+(method name: (identifier) @method.name) @method.def
+(singleton_method name: (identifier) @method.name) @method.def
+(call method: (identifier) @import.name) @import.def""",
             test_annotations=["describe", "context", "it", "before", "after"],
             test_name_patterns=["test_", "spec_", "_test", "_spec"]
         )
@@ -194,6 +208,10 @@ class RubyConfig(LanguageConfig):
             return first_line
         except:
             return code[node.start_byte:node.end_byte].decode('utf-8', errors='ignore').strip()
+    
+    def get_annotation_query(self) -> str:
+        """Get tree-sitter query for extracting Ruby annotations (limited)."""
+        return "(comment) @annotation"  # Ruby doesn't have formal annotations, use comments
 
 
 class GoConfig(LanguageConfig):
@@ -209,10 +227,12 @@ class GoConfig(LanguageConfig):
             method_types=["method_declaration"],
             import_types=["import_declaration", "import_spec"],
             interface_types=["interface_type"],
-            definition_query="""(type_declaration) @type.def
-(function_declaration name: (identifier) @func.name) @func.def
-(method_declaration) @method.def
-(import_declaration) @import.def""",
+            definition_query="""(type_declaration (type_spec (type_identifier) @class.name (struct_type))) @class.def
+(type_declaration (type_spec (type_identifier) @interface.name (interface_type))) @interface.def
+(function_declaration (identifier) @func.name) @func.def
+(method_declaration (field_identifier) @method.name) @method.def
+(import_declaration) @import.def
+(import_spec) @import.def""",
             test_annotations=[],  # Go doesn't use annotations
             test_name_patterns=["Test", "Benchmark", "Example"]
         )
@@ -238,6 +258,10 @@ class GoConfig(LanguageConfig):
             return signature
         except:
             return code[node.start_byte:node.end_byte].decode('utf-8', errors='ignore').strip()
+    
+    def get_annotation_query(self) -> str:
+        """Get tree-sitter query for extracting Go annotations (build tags, comments)."""
+        return "(comment) @annotation"  # Go uses build tags and comments for annotations
 
 
 class CConfig(LanguageConfig):
@@ -280,6 +304,10 @@ class CConfig(LanguageConfig):
             return signature
         except:
             return code[node.start_byte:node.end_byte].decode('utf-8', errors='ignore').strip()
+    
+    def get_annotation_query(self) -> str:
+        """Get tree-sitter query for extracting C annotations (limited)."""
+        return "(comment) @annotation"  # C uses preprocessor directives and comments
 
 
 class CSharpConfig(LanguageConfig):
@@ -327,6 +355,10 @@ class CSharpConfig(LanguageConfig):
             return signature
         except:
             return code[node.start_byte:node.end_byte].decode('utf-8', errors='ignore').strip()
+    
+    def get_annotation_query(self) -> str:
+        """Get tree-sitter query for extracting C# attributes."""
+        return "(attribute) @annotation\n(attribute_list) @annotation"
 
 
 class KotlinConfig(LanguageConfig):
@@ -374,6 +406,10 @@ class KotlinConfig(LanguageConfig):
             return signature
         except:
             return code[node.start_byte:node.end_byte].decode('utf-8', errors='ignore').strip()
+    
+    def get_annotation_query(self) -> str:
+        """Get tree-sitter query for extracting Kotlin annotations."""
+        return "(annotation) @annotation\n(file_annotation) @annotation"
 
 
 class SwiftConfig(LanguageConfig):
@@ -389,8 +425,9 @@ class SwiftConfig(LanguageConfig):
             method_types=["function_declaration"],  # Methods are functions in Swift
             import_types=["import_declaration"],
             interface_types=["protocol_declaration"],
-            definition_query="""(class_declaration) @class.def
-(function_declaration) @func.def
+            definition_query="""(class_declaration (type_identifier) @class.name) @class.def
+(protocol_declaration (type_identifier) @interface.name) @interface.def
+(function_declaration (simple_identifier) @func.name) @func.def
 (import_declaration) @import.def""",
             test_annotations=["@Test"],  # Swift Testing framework
             test_name_patterns=["test", "Test"]
@@ -416,6 +453,10 @@ class SwiftConfig(LanguageConfig):
             return signature
         except:
             return code[node.start_byte:node.end_byte].decode('utf-8', errors='ignore').strip()
+    
+    def get_annotation_query(self) -> str:
+        """Get tree-sitter query for extracting Swift attributes."""
+        return "(attribute) @annotation\n(availability_attribute) @annotation"
 
 
 class ObjectiveCConfig(LanguageConfig):
@@ -460,6 +501,10 @@ class ObjectiveCConfig(LanguageConfig):
             return signature
         except:
             return code[node.start_byte:node.end_byte].decode('utf-8', errors='ignore').strip()
+    
+    def get_annotation_query(self) -> str:
+        """Get tree-sitter query for extracting Objective-C attributes."""
+        return "(attribute) @annotation\n(property_attribute) @annotation"
 
 
 # Language configuration registry
