@@ -68,5 +68,5 @@
   "watch_interval": 5.0,
   "enable_file_watcher": true,
   "log_level": "INFO",
-  "embedding_model": "all-MiniLM-L6-v2"
+  "embedding_model": "all-MiniLM-L12-v2"
 }

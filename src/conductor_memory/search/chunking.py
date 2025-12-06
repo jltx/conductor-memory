@@ -4,6 +4,7 @@ Chunking Strategy and Memory Refresh Mechanism for the Hybrid Local/Cloud LLM Or
 
 import ast
 import logging
+import warnings
 from typing import List, Tuple, Optional
 from dataclasses import dataclass
 from enum import Enum
@@ -29,12 +30,26 @@ class ChunkMetadata:
     token_count: int = 0
     domain: Optional[str] = None
     module: Optional[str] = None
+    parent_class: Optional[str] = None  # For nested classes and methods in split classes
 
 class ChunkingManager:
     """Manages chunking strategies for memory management"""
     
     def __init__(self, strategy: ChunkingStrategy = ChunkingStrategy.FUNCTION_CLASS):
         self.strategy = strategy
+        self._tree_sitter_parser = None  # Lazy initialization
+    
+    @property
+    def tree_sitter_parser(self):
+        """Get or create tree-sitter parser instance."""
+        if self._tree_sitter_parser is None:
+            try:
+                from .parsers import TreeSitterParser
+                self._tree_sitter_parser = TreeSitterParser()
+            except ImportError as e:
+                logger.warning(f"Tree-sitter not available: {e}")
+                self._tree_sitter_parser = False  # Mark as unavailable
+        return self._tree_sitter_parser if self._tree_sitter_parser is not False else None
     
     def chunk_text(self, text: str, file_path: str, commit_hash: Optional[str] = None) -> List[Tuple[str, ChunkMetadata]]:
         """
@@ -42,7 +57,14 @@ class ChunkingManager:
         
         Returns list of (chunk_text, metadata) tuples
         """
-        # Auto-detect Python files and use AST chunking
+        # Try tree-sitter first for supported languages
+        if self.tree_sitter_parser and self.tree_sitter_parser.supports(file_path):
+            try:
+                return self.tree_sitter_parser.parse(text, file_path, commit_hash)
+            except Exception as e:
+                logger.warning(f"Tree-sitter parsing failed for {file_path}: {e}, falling back to legacy chunking")
+        
+        # Fallback to existing chunking strategies
         is_python = file_path.endswith('.py')
         
         if self.strategy == ChunkingStrategy.AST_PYTHON and is_python:
@@ -120,7 +142,10 @@ class ChunkingManager:
             text = text[1:]
         
         try:
-            tree = ast.parse(text)
+            # Suppress SyntaxWarnings from invalid escape sequences in source files
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", SyntaxWarning)
+                tree = ast.parse(text)
         except SyntaxError as e:
             logger.warning(f"AST parse failed for {file_path}: {e}. Falling back to naive chunking.")
             return self._chunk_by_function_class(text, file_path, commit_hash)

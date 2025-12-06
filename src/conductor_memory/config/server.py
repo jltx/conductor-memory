@@ -67,6 +67,8 @@ class CodebaseConfig:
         Pattern types:
         - `/pattern` - Root-relative: matches only at the codebase root
                        e.g., `/data` matches `data/file.csv` but NOT `src/data/file.py`
+        - `**/pattern` - Recursive glob: matches pattern at any depth
+                       e.g., `**/build` matches `app/build/file.java`
         - `pattern`  - Component match: matches the pattern as any path component
                        e.g., `__pycache__` matches `src/__pycache__/file.pyc`
         - `*.ext`    - Glob suffix: matches files ending with the pattern
@@ -79,7 +81,13 @@ class CodebaseConfig:
         path_components = path_str.split('/')
         
         for pattern in self.ignore_patterns:
-            if pattern.startswith('*'):
+            if pattern.startswith('**/'):
+                # Recursive glob pattern (e.g., **/build matches build at any depth)
+                target = pattern[3:]  # Remove **/ prefix
+                if target in path_components:
+                    logger.debug(f"[{self.name}] Ignoring '{path_str}' - matched recursive glob '{pattern}'")
+                    return True
+            elif pattern.startswith('*'):
                 # Glob-style suffix pattern (e.g., *.pyc)
                 if path_str.endswith(pattern[1:]):
                     logger.debug(f"[{self.name}] Ignoring '{path_str}' - matched glob pattern '{pattern}'")
@@ -122,15 +130,68 @@ class CodebaseConfig:
 
 
 @dataclass
+class BoostConfig:
+    """Configuration for search result boosting"""
+    
+    # Domain-based boosts (applied to code chunks)
+    domain_boosts: Dict[str, float] = field(default_factory=lambda: {
+        "class": 1.2,      # Classes are often important entry points
+        "function": 1.1,   # Functions are core logic
+        "imports": 0.9,    # Imports less relevant for most queries
+        "test": 0.7,       # Tests usually not what users want
+        "private": 0.8,    # Private methods less relevant
+        "accessor": 1.0    # Getters/setters neutral
+    })
+    
+    # Memory type boosts
+    memory_type_boosts: Dict[str, float] = field(default_factory=lambda: {
+        "code": 1.1,           # Code chunks slightly boosted (default)
+        "decision": 1.3,       # Architectural decisions highly valuable
+        "lesson": 1.2,         # Lessons learned valuable
+        "conversation": 1.0    # Conversations neutral
+    })
+    
+    # Recency boost settings
+    recency_enabled: bool = True
+    recency_decay_days: float = 30.0    # Half-life for recency boost
+    recency_max_boost: float = 1.5      # Maximum boost for very recent items
+    recency_min_boost: float = 0.8      # Minimum boost for very old items
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for serialization"""
+        return {
+            'domain_boosts': self.domain_boosts,
+            'memory_type_boosts': self.memory_type_boosts,
+            'recency_enabled': self.recency_enabled,
+            'recency_decay_days': self.recency_decay_days,
+            'recency_max_boost': self.recency_max_boost,
+            'recency_min_boost': self.recency_min_boost
+        }
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'BoostConfig':
+        """Create from dictionary"""
+        return cls(
+            domain_boosts=data.get('domain_boosts', cls.__dataclass_fields__['domain_boosts'].default_factory()),
+            memory_type_boosts=data.get('memory_type_boosts', cls.__dataclass_fields__['memory_type_boosts'].default_factory()),
+            recency_enabled=data.get('recency_enabled', True),
+            recency_decay_days=data.get('recency_decay_days', 30.0),
+            recency_max_boost=data.get('recency_max_boost', 1.5),
+            recency_min_boost=data.get('recency_min_boost', 0.8)
+        )
+
+
+@dataclass
 class ServerConfig:
     """Configuration for the MCP Memory Server"""
-    
+
     # Server settings
     host: str = "127.0.0.1"
     port: int = 8000
-    
+
     # Persistence directory for ChromaDB
-    persist_directory: str = "./data/chroma"
+    # Default: ~/.conductor-memory/data (cross-platform)
+    persist_directory: str = "~/.conductor-memory/data"
     
     # List of codebases to index
     codebases: List[CodebaseConfig] = field(default_factory=list)
@@ -143,7 +204,22 @@ class ServerConfig:
     log_level: str = "INFO"
     
     # Embedding settings
-    embedding_model: str = "all-MiniLM-L6-v2"
+    embedding_model: str = "all-MiniLM-L12-v2"
+    
+    # Compute device settings
+    # "auto" = auto-detect best available (cuda > mps > cpu)
+    # "cuda" / "cuda:0" = NVIDIA GPU
+    # "mps" = Apple Silicon GPU
+    # "cpu" = CPU only
+    device: str = "auto"
+    
+    # Batch size for embedding generation
+    # "auto" = auto-detect based on available memory
+    # Or specify an integer (e.g., 32, 64, 128, 256, 512)
+    embedding_batch_size: str = "auto"
+    
+    # Boost configuration
+    boost_config: BoostConfig = field(default_factory=BoostConfig)
     
     def __post_init__(self):
         """Validate and normalize the configuration"""
@@ -170,7 +246,10 @@ class ServerConfig:
             'watch_interval': self.watch_interval,
             'enable_file_watcher': self.enable_file_watcher,
             'log_level': self.log_level,
-            'embedding_model': self.embedding_model
+            'embedding_model': self.embedding_model,
+            'device': self.device,
+            'embedding_batch_size': self.embedding_batch_size,
+            'boost_config': self.boost_config.to_dict()
         }
     
     @classmethod
@@ -179,15 +258,19 @@ class ServerConfig:
         codebases = [
             CodebaseConfig.from_dict(cb) for cb in data.get('codebases', [])
         ]
+        boost_config = BoostConfig.from_dict(data.get('boost_config', {}))
         return cls(
             host=data.get('host', '127.0.0.1'),
             port=data.get('port', 8000),
-            persist_directory=data.get('persist_directory', './data/chroma'),
+            persist_directory=data.get('persist_directory', '~/.conductor-memory/data'),
             codebases=codebases,
             watch_interval=data.get('watch_interval', 5.0),
             enable_file_watcher=data.get('enable_file_watcher', True),
             log_level=data.get('log_level', 'INFO'),
-            embedding_model=data.get('embedding_model', 'all-MiniLM-L6-v2')
+            embedding_model=data.get('embedding_model', 'all-MiniLM-L12-v2'),
+            device=data.get('device', 'auto'),
+            embedding_batch_size=str(data.get('embedding_batch_size', 'auto')),
+            boost_config=boost_config
         )
     
     @classmethod

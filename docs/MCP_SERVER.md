@@ -140,7 +140,7 @@ CHROMA_PERSIST_DIRECTORY=./chroma_db
 CHROMA_COLLECTION_NAME=memory_chunks
 
 # Embedding model
-EMBEDDING_MODEL=all-MiniLM-L6-v2
+EMBEDDING_MODEL=all-MiniLM-L12-v2
 EMBEDDING_DEVICE=cpu
 ```
 

@@ -13,11 +13,24 @@ from pathlib import Path
 
 
 def get_default_config_path() -> Path:
-    """Get the default config file path"""
+    """Get the default config file path.
+
+    Priority order:
+    1. CONDUCTOR_MEMORY_CONFIG environment variable
+    2. ~/.conductor-memory/config.json (documented default)
+    3. ./memory_server_config.json (legacy/backwards compat)
+    """
+    # Check environment variable first
+    env_config = os.environ.get("CONDUCTOR_MEMORY_CONFIG")
+    if env_config:
+        env_path = Path(env_config)
+        if env_path.exists():
+            return env_path
+
+    # Then check standard locations
     locations = [
-        Path.cwd() / "memory_server_config.json",
         Path.home() / ".conductor-memory" / "config.json",
-        Path.home() / ".conductor-memory" / "memory_server_config.json",
+        Path.cwd() / "memory_server_config.json",
     ]
     for loc in locations:
         if loc.exists():

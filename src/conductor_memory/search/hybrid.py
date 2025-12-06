@@ -42,6 +42,7 @@ class BM25Index:
     BM25 keyword index for a collection of documents.
     
     Maintains an in-memory BM25 index that can be rebuilt when documents change.
+    Uses lazy rebuilding to avoid expensive recomputation on every document change.
     """
     
     def __init__(self):
@@ -50,19 +51,22 @@ class BM25Index:
         self._bm25: Optional[BM25Okapi] = None
         self._doc_ids: List[str] = []  # Ordered list of doc IDs matching BM25 corpus
         self._tokenized_corpus: List[List[str]] = []
+        self._needs_rebuild: bool = False  # Track if rebuild is needed
+        self._pending_additions: int = 0  # Track pending additions since last build
     
     def add_document(self, chunk: MemoryChunk) -> None:
-        """Add a document to the index (requires rebuild)"""
+        """Add a document to the index (marks for rebuild)"""
         self._documents[chunk.id] = chunk.doc_text
         self._chunk_map[chunk.id] = chunk
-        self._bm25 = None  # Invalidate index
+        self._needs_rebuild = True
+        self._pending_additions += 1
     
     def remove_document(self, chunk_id: str) -> None:
-        """Remove a document from the index (requires rebuild)"""
+        """Remove a document from the index (marks for rebuild)"""
         if chunk_id in self._documents:
             del self._documents[chunk_id]
             del self._chunk_map[chunk_id]
-            self._bm25 = None  # Invalidate index
+            self._needs_rebuild = True
     
     def clear(self) -> None:
         """Clear all documents"""
@@ -71,24 +75,51 @@ class BM25Index:
         self._bm25 = None
         self._doc_ids.clear()
         self._tokenized_corpus.clear()
+        self._needs_rebuild = False
+        self._pending_additions = 0
     
     def build(self) -> None:
         """Build or rebuild the BM25 index"""
+        import time
+        
         if not self._documents:
             self._bm25 = None
+            self._needs_rebuild = False
+            self._pending_additions = 0
             return
         
+        total_docs = len(self._documents)
+        logger.info(f"BM25: Starting tokenization of {total_docs} documents...")
+        
+        tokenize_start = time.time()
         self._doc_ids = list(self._documents.keys())
         self._tokenized_corpus = [
             self._tokenize(self._documents[doc_id])
             for doc_id in self._doc_ids
         ]
+        tokenize_elapsed = time.time() - tokenize_start
+        logger.info(f"BM25: Tokenization completed in {tokenize_elapsed:.2f}s")
+        
+        bm25_build_start = time.time()
         self._bm25 = BM25Okapi(self._tokenized_corpus)
+        bm25_build_elapsed = time.time() - bm25_build_start
+        logger.info(f"BM25: Index construction completed in {bm25_build_elapsed:.2f}s")
+        
+        self._needs_rebuild = False
+        self._pending_additions = 0
         logger.debug(f"Built BM25 index with {len(self._doc_ids)} documents")
+    
+    def ensure_built(self) -> None:
+        """Ensure the index is built, rebuilding only if necessary"""
+        if self._bm25 is None or self._needs_rebuild:
+            self.build()
     
     def search(self, query: str, top_k: int = 10) -> List[Tuple[MemoryChunk, float]]:
         """
         Search using BM25.
+        
+        Uses the current index even if stale (for performance).
+        Call ensure_built() before search if freshness is critical.
         
         Args:
             query: Search query
@@ -97,8 +128,15 @@ class BM25Index:
         Returns:
             List of (chunk, score) tuples, sorted by score descending
         """
+        # Build index if it doesn't exist at all
         if self._bm25 is None:
+            if not self._documents:
+                return []
             self.build()
+        
+        # Log if using stale index (but don't rebuild - too expensive)
+        if self._needs_rebuild and self._pending_additions > 0:
+            logger.debug(f"BM25: Using stale index ({self._pending_additions} pending additions)")
         
         if self._bm25 is None or not self._doc_ids:
             return []
@@ -147,6 +185,16 @@ class BM25Index:
     def document_count(self) -> int:
         """Number of documents in the index"""
         return len(self._documents)
+    
+    @property
+    def needs_rebuild(self) -> bool:
+        """Check if the index needs to be rebuilt"""
+        return self._needs_rebuild or self._bm25 is None
+    
+    @property
+    def is_built(self) -> bool:
+        """Check if the index has been built"""
+        return self._bm25 is not None
 
 
 class HybridSearcher:
@@ -346,6 +394,8 @@ class HybridSearcher:
         for codebase, index in self._bm25_indices.items():
             stats[codebase] = {
                 "document_count": index.document_count,
-                "index_built": index._bm25 is not None
+                "index_built": index.is_built,
+                "needs_rebuild": index.needs_rebuild,
+                "pending_additions": index._pending_additions
             }
         return stats

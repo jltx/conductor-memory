@@ -8,6 +8,7 @@ Both the HTTP server and stdio MCP server are thin wrappers around this service.
 import asyncio
 import concurrent.futures
 import logging
+import sys
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -16,7 +17,9 @@ from typing import Dict, List, Optional, Any
 from ..config.server import ServerConfig, CodebaseConfig
 from ..storage.chroma import ChromaVectorStore
 from ..search.chunking import ChunkingManager, ChunkingStrategy
+from ..search.boosting import BoostCalculator
 from ..core.models import MemoryChunk, RoleEnum, MemoryType
+from ..core.resources import detect_resources, get_optimal_device, SystemResources
 from ..embedding.sentence_transformer import SentenceTransformerEmbedder
 from ..search.hybrid import HybridSearcher, SearchMode
 
@@ -72,12 +75,39 @@ class MemoryService:
         self._file_watcher_tasks: Dict[str, asyncio.Task] = {}
         self._watch_interval = config.watch_interval
         
+        # Detect system resources
+        self._resources = detect_resources()
+        
+        # Determine device to use
+        if config.device == "auto":
+            self._device = get_optimal_device()
+        else:
+            self._device = config.device
+        
+        # Determine embedding batch size
+        if config.embedding_batch_size == "auto":
+            self._embedding_batch_size = self._resources.recommended_embedding_batch_size
+        else:
+            try:
+                self._embedding_batch_size = int(config.embedding_batch_size)
+            except ValueError:
+                logger.warning(f"Invalid embedding_batch_size '{config.embedding_batch_size}', using auto")
+                self._embedding_batch_size = self._resources.recommended_embedding_batch_size
+        
+        logger.info(f"Using device: {self._device}, embedding batch size: {self._embedding_batch_size}")
+        
         # Shared embedder and chunking manager
-        self.embedder = SentenceTransformerEmbedder()
+        self.embedder = SentenceTransformerEmbedder(
+            model_name=config.embedding_model,
+            device=self._device
+        )
         self.chunking_manager = ChunkingManager(ChunkingStrategy.FUNCTION_CLASS)
         
         # Hybrid search support
         self.hybrid_searcher = HybridSearcher(rrf_k=60, semantic_weight=0.5)
+        
+        # Boost calculator for relevance score adjustments
+        self.boost_calculator = BoostCalculator(config.boost_config)
         
         # Initialize vector stores for each enabled codebase
         for codebase in config.get_enabled_codebases():
@@ -143,20 +173,25 @@ class MemoryService:
             
             if wait_for_indexing:
                 # Add to list of tasks to await
-                indexing_tasks.append(self._index_codebase(codebase))
+                indexing_tasks.append((codebase, self._index_codebase(codebase)))
             else:
                 # Start as background task
                 asyncio.create_task(self._index_codebase(codebase))
-            
-            # Start file watcher if enabled
-            if self.config.enable_file_watcher:
-                self._file_watcher_tasks[codebase.name] = asyncio.create_task(
-                    self._watch_for_changes(codebase)
-                )
+                # Start file watcher immediately for background indexing
+                if self.config.enable_file_watcher:
+                    self._file_watcher_tasks[codebase.name] = asyncio.create_task(
+                        self._watch_for_changes(codebase)
+                    )
         
-        # Wait for all indexing to complete if requested
+        # Wait for all indexing to complete if requested (sequentially for clean progress output)
         if wait_for_indexing and indexing_tasks:
-            await asyncio.gather(*indexing_tasks)
+            for codebase, task in indexing_tasks:
+                await task
+            
+            # Note: File watchers are NOT started here because when called via
+            # _run_sync(), we're in a temporary event loop that will close.
+            # File watchers should be started via start_file_watchers() in the
+            # main server's event loop.
     
     async def search_async(
         self,
@@ -164,7 +199,12 @@ class MemoryService:
         codebase: Optional[str] = None,
         max_results: int = 10,
         project_id: Optional[str] = None,
-        search_mode: str = "auto"
+        search_mode: str = "auto",
+        # Phase 1: Boosting
+        domain_boosts: Optional[Dict[str, float]] = None,
+        # Phase 2: Tag Filtering
+        include_tags: Optional[List[str]] = None,
+        exclude_tags: Optional[List[str]] = None
     ) -> Dict[str, Any]:
         """
         Search for relevant memories using semantic similarity, keyword matching, or both.
@@ -175,6 +215,9 @@ class MemoryService:
             max_results: Maximum number of results to return
             project_id: Optional filter by project ID
             search_mode: "semantic", "keyword", "hybrid", or "auto" (default)
+            domain_boosts: Per-query domain boost overrides (e.g., {'class': 1.5, 'test': 0.5})
+            include_tags: Include only results matching these tags (supports prefix:* patterns)
+            exclude_tags: Exclude results matching these tags (supports prefix:* patterns)
             
         Returns:
             Dict with results, total_found, query_time_ms, summary, and search_mode_used
@@ -254,6 +297,19 @@ class MemoryService:
             # Filter by project_id if specified
             if project_id:
                 similar_chunks = [c for c in similar_chunks if c.project_id == project_id]
+            
+            # Apply boosting to adjust relevance scores
+            if similar_chunks:
+                similar_chunks = self.boost_calculator.apply_boosts_to_chunks(
+                    similar_chunks, 
+                    query_domain_boosts=domain_boosts
+                )
+                # Re-sort by updated relevance scores
+                similar_chunks.sort(key=lambda x: x.relevance_score, reverse=True)
+            
+            # Apply tag filtering (Phase 2)
+            if include_tags or exclude_tags:
+                similar_chunks = self._filter_by_tags(similar_chunks, include_tags, exclude_tags)
             
             # Remove duplicates based on content similarity
             deduplicated_chunks = self._deduplicate_chunks(similar_chunks)
@@ -546,11 +602,10 @@ class MemoryService:
                         vector_store.delete(memory_id)
                         
                         # Also remove from hybrid search index if present
-                        if codebase_name in self._hybrid_searchers:
-                            try:
-                                self._hybrid_searchers[codebase_name].remove_from_index(codebase_name, memory_id)
-                            except Exception:
-                                pass  # Not all memories are in the keyword index
+                        try:
+                            self.hybrid_searcher.remove_from_index(codebase_name, memory_id)
+                        except Exception:
+                            pass  # Not all memories are in the keyword index
                         
                         logger.info(f"Deleted memory {memory_id} from codebase {codebase_name}")
                         return {
@@ -605,16 +660,53 @@ class MemoryService:
         """Sync wrapper for initialize_async - blocks until indexing completes"""
         _run_sync(self.initialize_async(wait_for_indexing=True))
     
+    async def start_file_watchers_async(self) -> None:
+        """
+        Start file watchers for all codebases.
+        
+        This should be called from the main event loop AFTER initialization,
+        not from within initialize() which may run in a temporary event loop.
+        """
+        if not self.config.enable_file_watcher:
+            return
+        
+        enabled_codebases = self.config.get_enabled_codebases()
+        for codebase in enabled_codebases:
+            if codebase.name in self._vector_stores and codebase.name not in self._file_watcher_tasks:
+                self._file_watcher_tasks[codebase.name] = asyncio.create_task(
+                    self._watch_for_changes(codebase)
+                )
+        
+        if self._file_watcher_tasks:
+            logger.info(f"File watchers started for {len(self._file_watcher_tasks)} codebase(s)")
+    
+    async def stop_file_watchers_async(self) -> None:
+        """Stop all file watcher tasks"""
+        for name, task in self._file_watcher_tasks.items():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        self._file_watcher_tasks.clear()
+        logger.info("All file watchers stopped")
+    
     def search(
         self,
         query: str,
         codebase: Optional[str] = None,
         max_results: int = 10,
         project_id: Optional[str] = None,
-        search_mode: str = "auto"
+        search_mode: str = "auto",
+        domain_boosts: Optional[Dict[str, float]] = None,
+        include_tags: Optional[List[str]] = None,
+        exclude_tags: Optional[List[str]] = None
     ) -> Dict[str, Any]:
         """Sync wrapper for search_async"""
-        return _run_sync(self.search_async(query, codebase, max_results, project_id, search_mode))
+        return _run_sync(self.search_async(
+            query, codebase, max_results, project_id, search_mode, 
+            domain_boosts, include_tags, exclude_tags
+        ))
     
     def store(
         self,
@@ -807,6 +899,28 @@ class MemoryService:
     # Internal methods - Indexing
     # ─────────────────────────────────────────────────────────────────────────
     
+    def _print_progress(self, codebase_name: str, current: int, total: int, phase: str = "Indexing") -> None:
+        """Print a single-line progress indicator that updates in place"""
+        if total == 0:
+            pct = 100
+        else:
+            pct = int((current / total) * 100)
+        
+        bar_width = 30
+        filled = int(bar_width * current / total) if total > 0 else bar_width
+        bar = "█" * filled + "░" * (bar_width - filled)
+        
+        # Use carriage return to update line in place
+        line = f"\r[{codebase_name}] {phase}: [{bar}] {current}/{total} files ({pct}%)"
+        sys.stderr.write(line)
+        sys.stderr.flush()
+    
+    def _print_progress_complete(self, codebase_name: str, total: int, new_files: int, modified: int, deleted: int) -> None:
+        """Print completion message on a new line"""
+        sys.stderr.write("\n")  # Move to new line after progress bar
+        sys.stderr.flush()
+        logger.info(f"[{codebase_name}] Indexing complete: {total} files ({new_files} new, {modified} modified, {deleted} deleted)")
+
     async def _index_codebase(self, codebase: CodebaseConfig) -> None:
         """Index a single codebase - incremental if index exists"""
         codebase_path = Path(codebase.path)
@@ -817,88 +931,43 @@ class MemoryService:
             status["status"] = "indexing"
             status["progress"] = 0.0
             
-            logger.info(f"[{codebase.name}] Starting indexing for: {codebase_path}")
+            logger.info(f"[{codebase.name}] Starting indexing: {codebase_path}")
+            
+            # Clean up any orphan chunks from previous incomplete indexing
+            orphan_count = vector_store.cleanup_orphan_chunks(codebase.name)
+            if orphan_count > 0:
+                logger.info(f"[{codebase.name}] Recovered from incomplete indexing")
             
             # Find all code files
             code_extensions = codebase.get_extension_set()
-            logger.info(f"[{codebase.name}] DEBUG: Looking for extensions: {code_extensions}")
+            
+            # Show scanning phase
+            self._print_progress(codebase.name, 0, 1, "Scanning")
             
             code_files = []
             for ext in code_extensions:
-                ext_files = list(codebase_path.rglob(f'*{ext}'))
-                logger.info(f"[{codebase.name}] DEBUG: Found {len(ext_files)} files with extension {ext}")
-                code_files.extend(ext_files)
-            
-            logger.info(f"[{codebase.name}] DEBUG: Total files found before filtering: {len(code_files)}")
-            
-            # Log some example files found
-            if code_files:
-                logger.info(f"[{codebase.name}] DEBUG: First 10 files found:")
-                for i, f in enumerate(code_files[:10]):
-                    logger.info(f"[{codebase.name}] DEBUG:   {i+1}. {f}")
-                
-                # Check specifically for src files
-                src_files = [f for f in code_files if 'src' in str(f)]
-                logger.info(f"[{codebase.name}] DEBUG: Files containing 'src': {len(src_files)}")
-                if src_files:
-                    logger.info(f"[{codebase.name}] DEBUG: First 5 src files:")
-                    for i, f in enumerate(src_files[:5]):
-                        logger.info(f"[{codebase.name}] DEBUG:   {i+1}. {f}")
-                
-                # Check specifically for swing_models.py
-                swing_models_files = [f for f in code_files if 'swing_models.py' in str(f)]
-                if swing_models_files:
-                    logger.info(f"[{codebase.name}] DEBUG: Found swing_models.py: {swing_models_files}")
-                else:
-                    logger.info(f"[{codebase.name}] DEBUG: swing_models.py NOT found in discovered files")
+                code_files.extend(list(codebase_path.rglob(f'*{ext}')))
             
             # Filter out ignored patterns
-            files_before_filter = len(code_files)
-            code_files_filtered = []
-            ignored_files = []
+            code_files = [f for f in code_files if not codebase.should_ignore(str(f))]
             
-            for f in code_files:
-                if codebase.should_ignore(str(f)):
-                    ignored_files.append(f)
-                else:
-                    code_files_filtered.append(f)
-            
-            code_files = code_files_filtered
-            logger.info(f"[{codebase.name}] DEBUG: Files after ignore filtering: {len(code_files)} (filtered out: {len(ignored_files)})")
-            
-            # Log some ignored files to see patterns
-            if ignored_files:
-                logger.info(f"[{codebase.name}] DEBUG: First 10 ignored files:")
-                for i, f in enumerate(ignored_files[:10]):
-                    logger.info(f"[{codebase.name}] DEBUG:   IGNORED: {f}")
-                
-                # Check if any src files were ignored
-                ignored_src_files = [f for f in ignored_files if 'src' in str(f)]
-                if ignored_src_files:
-                    logger.warning(f"[{codebase.name}] DEBUG: {len(ignored_src_files)} src files were IGNORED!")
-                    for i, f in enumerate(ignored_src_files[:5]):
-                        logger.warning(f"[{codebase.name}] DEBUG:   IGNORED SRC: {f}")
-            
-            # Check final src files after filtering
-            final_src_files = [f for f in code_files if 'src' in str(f)]
-            logger.info(f"[{codebase.name}] DEBUG: Final src files after filtering: {len(final_src_files)}")
-            
-            # Check specifically for swing_models.py after filtering
-            final_swing_models = [f for f in code_files if 'swing_models.py' in str(f)]
-            if final_swing_models:
-                logger.info(f"[{codebase.name}] DEBUG: swing_models.py survived filtering: {final_swing_models}")
-            else:
-                logger.warning(f"[{codebase.name}] DEBUG: swing_models.py was filtered out or not found!")
+            self._print_progress(codebase.name, 1, 1, "Scanning")
+            sys.stderr.write(f" - found {len(code_files)} files\n")
+            sys.stderr.flush()
             
             # Get existing indexed files
             indexed_files = vector_store.get_indexed_files()
             current_file_paths = set()
             
-            # Determine which files need indexing
+            # Determine which files need indexing - show analyzing phase
             files_to_index = []
             files_to_reindex = []
             
-            for file_path in code_files:
+            total_to_analyze = len(code_files)
+            for idx, file_path in enumerate(code_files):
+                if idx % 50 == 0:  # Update every 50 files to reduce flickering
+                    self._print_progress(codebase.name, idx, total_to_analyze, "Analyzing")
+                
                 relative_path = str(file_path.relative_to(codebase_path))
                 current_file_paths.add(relative_path)
                 
@@ -914,13 +983,16 @@ class MemoryService:
                         else:
                             files_to_index.append((file_path, mtime, content_hash, content))
                 except Exception as e:
-                    logger.warning(f"[{codebase.name}] Error checking file {file_path}: {e}")
+                    logger.debug(f"[{codebase.name}] Error checking file {file_path}: {e}")
+            
+            self._print_progress(codebase.name, total_to_analyze, total_to_analyze, "Analyzing")
+            sys.stderr.write("\n")
+            sys.stderr.flush()
             
             # Find and remove deleted files
             deleted_files = set(indexed_files.keys()) - current_file_paths
             for deleted_path in deleted_files:
                 vector_store.remove_file_chunks(deleted_path)
-                logger.info(f"[{codebase.name}] Removed deleted file from index: {deleted_path}")
             
             # Remove old chunks for files to re-index
             for file_path, _, _, _ in files_to_reindex:
@@ -931,51 +1003,260 @@ class MemoryService:
             all_files = files_to_index + files_to_reindex
             status["total_files"] = len(all_files)
             
-            # Log summary
-            existing_count = len(indexed_files) - len(deleted_files)
-            logger.info(f"[{codebase.name}] Index status: {existing_count} files already indexed")
-            
+            # Check if up to date
             if not all_files and not deleted_files:
-                logger.info(f"[{codebase.name}] Index is up to date - no changes detected")
+                existing_count = len(indexed_files)
+                logger.info(f"[{codebase.name}] Index is up to date ({existing_count} files)")
                 status["status"] = "completed"
                 status["progress"] = 1.0
-                status["indexed_files_count"] = len(vector_store.get_indexed_files())
+                status["indexed_files_count"] = existing_count
                 return
             
-            if files_to_index:
-                logger.info(f"[{codebase.name}] New files to index: {len(files_to_index)}")
-            if files_to_reindex:
-                logger.info(f"[{codebase.name}] Modified files to re-index: {len(files_to_reindex)}")
-            if deleted_files:
-                logger.info(f"[{codebase.name}] Deleted files removed: {len(deleted_files)}")
-            
-            # Process files
-            for i, (file_path, mtime, content_hash, content) in enumerate(all_files):
-                await self._index_single_file(file_path, content, mtime, content_hash, codebase, vector_store)
-                status["files_processed"] = i + 1
-                status["progress"] = (i + 1) / len(all_files)
-                await asyncio.sleep(0)  # Yield control
+            # Process files in batches for better GPU utilization
+            total_files = len(all_files)
+            await self._index_files_batched(
+                all_files, codebase, vector_store, status, total_files
+            )
             
             status["status"] = "completed"
             status["progress"] = 1.0
             status["indexed_files_count"] = len(vector_store.get_indexed_files())
             
             # Build BM25 index for hybrid search
+            import time
+            bm25_start = time.time()
+            logger.info(f"[{codebase.name}] Building BM25 index...")
             self.hybrid_searcher.rebuild_index(codebase.name)
-            bm25_stats = self.hybrid_searcher.get_index_stats().get(codebase.name, {})
+            bm25_elapsed = time.time() - bm25_start
+            logger.info(f"[{codebase.name}] BM25 index built in {bm25_elapsed:.2f}s")
             
             # Final summary
-            logger.info(f"[{codebase.name}] Indexing completed:")
-            logger.info(f"[{codebase.name}]   Total files indexed: {status['indexed_files_count']}")
-            logger.info(f"[{codebase.name}]   New files added: {len(files_to_index)}")
-            logger.info(f"[{codebase.name}]   Modified files re-indexed: {len(files_to_reindex)}")
-            logger.info(f"[{codebase.name}]   BM25 index: {bm25_stats.get('document_count', 0)} documents")
+            self._print_progress_complete(
+                codebase.name,
+                status["indexed_files_count"],
+                len(files_to_index),
+                len(files_to_reindex),
+                len(deleted_files)
+            )
             
         except Exception as e:
+            sys.stderr.write("\n")  # Ensure we're on a new line
             logger.error(f"[{codebase.name}] Error during indexing: {e}")
             status["status"] = "error"
             status["error_message"] = str(e)
     
+    async def _index_files_batched(
+        self,
+        all_files: List[tuple],
+        codebase: CodebaseConfig,
+        vector_store: ChromaVectorStore,
+        status: dict,
+        total_files: int
+    ) -> None:
+        """
+        Index files using batched embedding generation for better GPU utilization.
+        
+        Collects chunks across multiple files and processes them in large batches
+        to maximize GPU throughput.
+        """
+        codebase_path = Path(codebase.path)
+        
+        # Determine optimal batch size based on available GPU memory
+        # RTX 4090 with 24GB can handle large batches
+        embedding_batch_size = self._get_optimal_batch_size()
+        
+        # Collect all chunks first, then batch embed
+        all_chunk_data = []  # List of (file_path, mtime, content_hash, chunk_text, metadata)
+        file_chunk_ranges = {}  # file_path -> (start_idx, end_idx) in all_chunk_data
+        files_without_chunks = []  # Files too small to index but should still be tracked
+        
+        # Phase 1: Chunk all files (CPU-bound, relatively fast)
+        for i, (file_path, mtime, content_hash, content) in enumerate(all_files):
+            if i % 20 == 0:
+                self._print_progress(codebase.name, i, total_files, "Chunking")
+            
+            relative_path = str(file_path.relative_to(codebase_path))
+            
+            if not content.strip():
+                # Empty file - track it so file watcher doesn't keep re-checking
+                files_without_chunks.append((relative_path, mtime, content_hash))
+                continue
+            
+            chunks = self.chunking_manager.chunk_text(content, relative_path)
+            
+            start_idx = len(all_chunk_data)
+            for chunk_text, metadata in chunks:
+                if len(chunk_text.strip()) >= 50:
+                    all_chunk_data.append((file_path, mtime, content_hash, chunk_text, metadata))
+            end_idx = len(all_chunk_data)
+            
+            if end_idx > start_idx:
+                file_chunk_ranges[relative_path] = (start_idx, end_idx, file_path, mtime, content_hash)
+            else:
+                # File has content but all chunks too small - still track it
+                files_without_chunks.append((relative_path, mtime, content_hash))
+        
+        self._print_progress(codebase.name, total_files, total_files, "Chunking")
+        sys.stderr.write(f" - {len(all_chunk_data)} chunks\n")
+        sys.stderr.flush()
+        
+        if not all_chunk_data:
+            # No indexable chunks, but still track files without chunks
+            # so the file watcher doesn't keep re-checking them
+            if files_without_chunks:
+                file_index_batch = [
+                    {
+                        'file_path': relative_path,
+                        'mtime': mtime,
+                        'content_hash': content_hash,
+                        'chunk_ids': []
+                    }
+                    for relative_path, mtime, content_hash in files_without_chunks
+                ]
+                vector_store.update_file_index_batch(file_index_batch)
+                logger.info(f"[{codebase.name}] Tracked {len(files_without_chunks)} files without indexable content")
+            return
+        
+        # Phase 2: Generate embeddings in large batches (GPU-bound)
+        all_texts = [chunk_text for _, _, _, chunk_text, _ in all_chunk_data]
+        total_chunks = len(all_texts)
+        all_embeddings = []
+        
+        for batch_start in range(0, total_chunks, embedding_batch_size):
+            batch_end = min(batch_start + embedding_batch_size, total_chunks)
+            batch_texts = all_texts[batch_start:batch_end]
+            
+            self._print_progress(codebase.name, batch_start, total_chunks, "Embedding")
+            
+            # Run embedding in thread pool to not block event loop
+            loop = asyncio.get_event_loop()
+            batch_embeddings = await loop.run_in_executor(
+                None, self.embedder.generate_batch, batch_texts
+            )
+            all_embeddings.extend(batch_embeddings)
+            await asyncio.sleep(0)  # Yield control
+        
+        self._print_progress(codebase.name, total_chunks, total_chunks, "Embedding")
+        sys.stderr.write("\n")
+        sys.stderr.flush()
+        
+        # Phase 3: Store chunks in batches and update file index
+        # Batch size for ChromaDB inserts (larger = faster, but more memory)
+        chroma_batch_size = 500
+        
+        # First, prepare all MemoryChunks and track file->chunk mappings
+        all_memory_chunks = []
+        file_to_chunk_ids = {}  # relative_path -> list of chunk_ids
+        
+        self._print_progress(codebase.name, 0, len(all_chunk_data), "Preparing")
+        
+        for idx, (file_path, mtime, content_hash, chunk_text, metadata) in enumerate(all_chunk_data):
+            relative_path = str(file_path.relative_to(codebase_path))
+            
+            chunk_id = str(uuid.uuid4())
+            
+            # Track chunk IDs per file for file index update
+            if relative_path not in file_to_chunk_ids:
+                file_to_chunk_ids[relative_path] = {
+                    'chunk_ids': [],
+                    'file_path': file_path,
+                    'mtime': mtime,
+                    'content_hash': content_hash
+                }
+            file_to_chunk_ids[relative_path]['chunk_ids'].append(chunk_id)
+            
+            # Build tags
+            tags = [
+                f"file:{relative_path}",
+                f"ext:{file_path.suffix}",
+                f"codebase:{codebase.name}"
+            ]
+            if metadata.module:
+                tags.append(f"module:{metadata.module}")
+            if metadata.domain:
+                tags.append(f"domain:{metadata.domain}")
+            if metadata.parent_class:
+                tags.append(f"parent:{metadata.parent_class}")
+            tags.append(f"lines:{metadata.start_line}-{metadata.end_line}")
+            
+            memory_chunk = MemoryChunk(
+                id=chunk_id,
+                project_id=codebase.name,
+                role=RoleEnum.SYSTEM,
+                prompt="",
+                response="",
+                doc_text=chunk_text,
+                embedding_id="",
+                tags=tags,
+                pin=False,
+                relevance_score=0.0,
+                created_at=datetime.now(),
+                updated_at=datetime.now(),
+                source="codebase_indexing"
+            )
+            
+            all_memory_chunks.append(memory_chunk)
+            
+            # Add to BM25 index (this is fast, in-memory)
+            self.hybrid_searcher.add_to_index(codebase.name, memory_chunk)
+        
+        # Batch insert into ChromaDB
+        total_chunks = len(all_memory_chunks)
+        for batch_start in range(0, total_chunks, chroma_batch_size):
+            batch_end = min(batch_start + chroma_batch_size, total_chunks)
+            
+            chunk_batch = all_memory_chunks[batch_start:batch_end]
+            embedding_batch = all_embeddings[batch_start:batch_end]
+            
+            self._print_progress(codebase.name, batch_start, total_chunks, "Storing")
+            
+            vector_store.add_batch(chunk_batch, embedding_batch)
+            await asyncio.sleep(0)  # Yield control
+        
+        self._print_progress(codebase.name, total_chunks, total_chunks, "Storing")
+        sys.stderr.write("\n")
+        sys.stderr.flush()
+        
+        # Batch update file index for all files
+        import time
+        file_index_start = time.time()
+        
+        # Prepare batch data - include files with chunks
+        file_index_batch = [
+            {
+                'file_path': relative_path,
+                'mtime': file_info['mtime'],
+                'content_hash': file_info['content_hash'],
+                'chunk_ids': file_info['chunk_ids']
+            }
+            for relative_path, file_info in file_to_chunk_ids.items()
+        ]
+        
+        # Also include files without indexable chunks (empty or too small)
+        # This prevents the file watcher from repeatedly trying to re-index them
+        for relative_path, mtime, content_hash in files_without_chunks:
+            file_index_batch.append({
+                'file_path': relative_path,
+                'mtime': mtime,
+                'content_hash': content_hash,
+                'chunk_ids': []  # No chunks, but file is tracked
+            })
+        
+        # Single batch upsert
+        vector_store.update_file_index_batch(file_index_batch)
+        
+        file_index_elapsed = time.time() - file_index_start
+        logger.info(f"[{codebase.name}] File index updated for {len(file_index_batch)} files ({len(files_without_chunks)} empty/small) in {file_index_elapsed:.2f}s")
+    
+    def _get_optimal_batch_size(self) -> int:
+        """
+        Get the embedding batch size (already calculated during init).
+        
+        Returns:
+            Batch size for embedding generation
+        """
+        return self._embedding_batch_size
+
     async def _index_single_file(
         self,
         file_path: Path,
@@ -985,22 +1266,41 @@ class MemoryService:
         codebase: CodebaseConfig,
         vector_store: ChromaVectorStore
     ) -> None:
-        """Index a single file"""
+        """Index a single file (used by file watcher for incremental updates)"""
         codebase_path = Path(codebase.path)
         status = self._indexing_status[codebase.name]
         status["current_file"] = str(file_path)
+        relative_path = str(file_path.relative_to(codebase_path))
         
         if not content.strip():
+            # Empty file - still track it so we don't keep re-checking
+            vector_store.update_file_index(relative_path, mtime, content_hash, [])
             return
         
-        relative_path = str(file_path.relative_to(codebase_path))
         chunks = self.chunking_manager.chunk_text(content, relative_path)
         
-        chunk_ids = []
+        # Filter chunks and prepare texts for batch embedding
+        valid_chunks = []
+        chunk_texts = []
         for chunk_text, metadata in chunks:
             if len(chunk_text.strip()) < 50:
                 continue
-            
+            valid_chunks.append((chunk_text, metadata))
+            chunk_texts.append(chunk_text)
+        
+        if not valid_chunks:
+            # File has content but no indexable chunks - still track it
+            vector_store.update_file_index(relative_path, mtime, content_hash, [])
+            return
+        
+        # Generate embeddings in batch (run in thread pool to avoid blocking)
+        loop = asyncio.get_event_loop()
+        embeddings = await loop.run_in_executor(
+            None, self.embedder.generate_batch, chunk_texts
+        )
+        
+        chunk_ids = []
+        for (chunk_text, metadata), embedding in zip(valid_chunks, embeddings):
             chunk_id = str(uuid.uuid4())
             chunk_ids.append(chunk_id)
             
@@ -1016,6 +1316,8 @@ class MemoryService:
                 tags.append(f"module:{metadata.module}")
             if metadata.domain:
                 tags.append(f"domain:{metadata.domain}")
+            if metadata.parent_class:
+                tags.append(f"parent:{metadata.parent_class}")
             
             # Add line range for precise location
             tags.append(f"lines:{metadata.start_line}-{metadata.end_line}")
@@ -1036,7 +1338,6 @@ class MemoryService:
                 source="codebase_indexing"
             )
             
-            embedding = self.embedder.generate(chunk_text)
             vector_store.add(memory_chunk, embedding)
             
             # Also add to BM25 index for hybrid search
@@ -1046,6 +1347,81 @@ class MemoryService:
             vector_store.update_file_index(relative_path, mtime, content_hash, chunk_ids)
             logger.debug(f"[{codebase.name}] Indexed {len(chunk_ids)} chunks for: {relative_path}")
     
+    def _filter_by_tags(
+        self, 
+        chunks: List[MemoryChunk], 
+        include_tags: Optional[List[str]], 
+        exclude_tags: Optional[List[str]]
+    ) -> List[MemoryChunk]:
+        """
+        Filter chunks by tag inclusion/exclusion with prefix support.
+        
+        Tag patterns:
+        - "exact_tag" - exact match
+        - "prefix:*" - matches any tag starting with "prefix:"
+        
+        Args:
+            chunks: List of MemoryChunk objects
+            include_tags: Tags to include (must match at least one)
+            exclude_tags: Tags to exclude (must not match any)
+            
+        Returns:
+            Filtered list of chunks
+        """
+        if not include_tags and not exclude_tags:
+            return chunks
+        
+        filtered_chunks = []
+        
+        for chunk in chunks:
+            chunk_tags = set(chunk.tags)
+            
+            # Check include tags (must match at least one)
+            if include_tags:
+                include_match = False
+                for include_tag in include_tags:
+                    if self._tag_matches(include_tag, chunk_tags):
+                        include_match = True
+                        break
+                if not include_match:
+                    continue
+            
+            # Check exclude tags (must not match any)
+            if exclude_tags:
+                exclude_match = False
+                for exclude_tag in exclude_tags:
+                    if self._tag_matches(exclude_tag, chunk_tags):
+                        exclude_match = True
+                        break
+                if exclude_match:
+                    continue
+            
+            filtered_chunks.append(chunk)
+        
+        if len(filtered_chunks) < len(chunks):
+            logger.debug(f"Tag filtering: {len(chunks)} -> {len(filtered_chunks)} chunks")
+        
+        return filtered_chunks
+    
+    def _tag_matches(self, pattern: str, chunk_tags: set) -> bool:
+        """
+        Check if a tag pattern matches any chunk tags.
+        
+        Args:
+            pattern: Tag pattern (exact or prefix:*)
+            chunk_tags: Set of tags from the chunk
+            
+        Returns:
+            True if pattern matches any tag
+        """
+        if pattern.endswith("*"):
+            # Prefix match
+            prefix = pattern[:-1]
+            return any(tag.startswith(prefix) for tag in chunk_tags)
+        else:
+            # Exact match
+            return pattern in chunk_tags
+
     def _deduplicate_chunks(self, chunks: List) -> List:
         """
         Remove duplicate chunks based on content similarity.

@@ -89,9 +89,12 @@ def tool_memory_search(
     max_results: int = 10,
     project_id: str | None = None,
     codebase: str | None = None,
-    min_relevance: float = 0.1
+    min_relevance: float = 0.1,
+    domain_boosts: dict[str, float] | None = None,
+    include_tags: list[str] | None = None,
+    exclude_tags: list[str] | None = None
 ) -> dict[str, Any]:
-    """Search for relevant memories using semantic similarity."""
+    """Search for relevant memories using semantic similarity with optional boosting and filtering."""
     ensure_initialized()
     if not memory_service:
         return {"error": "Memory service not initialized", "results": []}
@@ -99,7 +102,10 @@ def tool_memory_search(
         query=query,
         codebase=codebase,
         max_results=max_results,
-        project_id=project_id
+        project_id=project_id,
+        domain_boosts=domain_boosts,
+        include_tags=include_tags,
+        exclude_tags=exclude_tags
     )
 
 
@@ -147,7 +153,7 @@ def tool_memory_prune(
 TOOLS = {
     "memory_search": {
         "function": tool_memory_search,
-        "description": "Search for relevant memories using semantic similarity.",
+        "description": "Search for relevant memories using semantic similarity with optional boosting and filtering.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -155,7 +161,22 @@ TOOLS = {
                 "max_results": {"type": "integer", "default": 10, "description": "Maximum number of results"},
                 "project_id": {"type": ["string", "null"], "description": "Optional filter by project ID"},
                 "codebase": {"type": ["string", "null"], "description": "Optional codebase name to search"},
-                "min_relevance": {"type": "number", "default": 0.1, "description": "Minimum relevance score 0-1"}
+                "min_relevance": {"type": "number", "default": 0.1, "description": "Minimum relevance score 0-1"},
+                "domain_boosts": {
+                    "type": ["object", "null"], 
+                    "description": "Per-query domain boost overrides (e.g., {'class': 1.5, 'test': 0.5})",
+                    "additionalProperties": {"type": "number"}
+                },
+                "include_tags": {
+                    "type": ["array", "null"],
+                    "items": {"type": "string"},
+                    "description": "Include only results with these tags (supports prefix:* patterns, e.g., 'domain:*', 'ext:.py')"
+                },
+                "exclude_tags": {
+                    "type": ["array", "null"],
+                    "items": {"type": "string"},
+                    "description": "Exclude results with these tags (supports prefix:* patterns, e.g., 'domain:test')"
+                }
             },
             "required": ["query"]
         }
@@ -429,6 +450,9 @@ def create_http_app():
         codebase: Optional[str] = Field(None)
         max_results: int = Field(10)
         min_relevance: float = Field(0.1)
+        domain_boosts: Optional[dict] = Field(None, description="Per-query domain boost overrides")
+        include_tags: Optional[List[str]] = Field(None, description="Include only results with these tags")
+        exclude_tags: Optional[List[str]] = Field(None, description="Exclude results with these tags")
 
     class StoreRequest(BaseModel):
         content: str = Field(...)
@@ -498,7 +522,10 @@ def create_http_app():
             query=request.query,
             codebase=request.codebase,
             max_results=request.max_results,
-            project_id=request.project_id
+            project_id=request.project_id,
+            domain_boosts=request.domain_boosts,
+            include_tags=request.include_tags,
+            exclude_tags=request.exclude_tags
         )
         if "error" in result:
             raise HTTPException(status_code=500, detail=result["error"])
@@ -545,6 +572,11 @@ async def run_http_server(host: str, port: int, log_level: str):
 
 async def main_async(config: ServerConfig, http_port: int, tcp_port: int, log_level: str):
     """Main async entry point - runs both HTTP and TCP servers"""
+    # Start file watchers in the main event loop
+    # (they couldn't be started during initialize() because that runs in a temp loop)
+    if memory_service and config.enable_file_watcher:
+        await memory_service.start_file_watchers_async()
+    
     # Create servers
     tcp_server = TCPMCPServer(host=config.host, port=tcp_port)
     
@@ -592,14 +624,27 @@ Examples:
     # Set log level
     logging.getLogger().setLevel(getattr(logging, args.log_level.upper()))
     
-    # Load configuration
-    DEFAULT_CONFIG = "memory_server_config.json"
+    # Load configuration - check multiple locations in priority order
+    DEFAULT_HOME_CONFIG = Path.home() / ".conductor-memory" / "config.json"
+    LEGACY_CONFIG = Path("memory_server_config.json")
+
     config_path = args.config
-    
+
+    # If no explicit config, check in priority order:
+    # 1. CONDUCTOR_MEMORY_CONFIG environment variable
+    # 2. ~/.conductor-memory/config.json (documented default)
+    # 3. ./memory_server_config.json (legacy/backwards compat)
     if not config_path and not args.codebase_path:
-        if Path(DEFAULT_CONFIG).exists():
-            config_path = DEFAULT_CONFIG
-            logger.info(f"Auto-detected config file: {DEFAULT_CONFIG}")
+        env_config = os.environ.get("CONDUCTOR_MEMORY_CONFIG")
+        if env_config and Path(env_config).exists():
+            config_path = env_config
+            logger.info(f"Using config from CONDUCTOR_MEMORY_CONFIG: {config_path}")
+        elif DEFAULT_HOME_CONFIG.exists():
+            config_path = str(DEFAULT_HOME_CONFIG)
+            logger.info(f"Using default config: {config_path}")
+        elif LEGACY_CONFIG.exists():
+            config_path = str(LEGACY_CONFIG)
+            logger.info(f"Using legacy config file: {config_path}")
     
     if config_path:
         try:
@@ -618,7 +663,7 @@ Examples:
         config.persist_directory = args.persist_dir
         config.host = args.host
     else:
-        logger.warning(f"No config file found. Create {DEFAULT_CONFIG} or use --codebase-path")
+        logger.warning(f"No config file found. Create {DEFAULT_HOME_CONFIG} or use --codebase-path")
         config = ServerConfig()
         config.persist_directory = args.persist_dir
         config.host = args.host

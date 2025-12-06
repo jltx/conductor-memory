@@ -18,6 +18,16 @@ Quick Start:
     results = service.search("how does authentication work")
 """
 
+# Suppress TensorFlow/Keras warnings before any imports
+import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+
+# Suppress specific TensorFlow deprecation warnings
+import warnings
+warnings.filterwarnings('ignore', category=DeprecationWarning, module='tensorflow')
+warnings.filterwarnings('ignore', category=FutureWarning, module='tensorflow')
+
 from typing import TYPE_CHECKING
 
 # Core types - lightweight, always available

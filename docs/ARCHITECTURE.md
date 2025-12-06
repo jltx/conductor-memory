@@ -74,7 +74,7 @@ Conductor Memory is a semantic memory service designed for AI agent integration.
 ### Embedding Layer (`embedding/`)
 
 **sentence_transformer.py** - SentenceTransformer implementation
-- Default model: `all-MiniLM-L6-v2` (384 dimensions)
+- Default model: `all-MiniLM-L12-v2` (384 dimensions)
 - GPU support via `device` parameter
 - Batch processing for efficiency
 

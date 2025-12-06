@@ -268,27 +268,41 @@ async def memory_delete(
 def main():
     """Main entry point for SSE MCP server"""
     global memory_service
-    
-    # Default to conductor directory for config
-    conductor_dir = Path(__file__).parent.parent
-    os.chdir(conductor_dir)
-    
+
     parser = argparse.ArgumentParser(description="MCP Memory Server (SSE/HTTP)")
-    parser.add_argument("--config", type=str, help="Config file path (default: memory_server_config.json)")
+    parser.add_argument("--config", type=str, help="Config file path")
     parser.add_argument("--host", type=str, default="127.0.0.1", help="Host to bind to")
     parser.add_argument("--port", type=int, default=9820, help="Port to listen on")
     parser.add_argument("--log-level", type=str, default="INFO", help="Log level")
-    
+
     args = parser.parse_args()
-    
+
     # Set log level
     logging.getLogger().setLevel(getattr(logging, args.log_level.upper()))
-    
-    # Load configuration
-    DEFAULT_CONFIG = "memory_server_config.json"
-    config_path = args.config or DEFAULT_CONFIG
-    
-    if Path(config_path).exists():
+
+    # Load configuration - check multiple locations in priority order
+    DEFAULT_HOME_CONFIG = Path.home() / ".conductor-memory" / "config.json"
+    LEGACY_CONFIG = Path("memory_server_config.json")
+
+    config_path = args.config
+
+    # If no explicit config, check in priority order:
+    # 1. CONDUCTOR_MEMORY_CONFIG environment variable
+    # 2. ~/.conductor-memory/config.json (documented default)
+    # 3. ./memory_server_config.json (legacy/backwards compat)
+    if not config_path:
+        env_config = os.environ.get("CONDUCTOR_MEMORY_CONFIG")
+        if env_config and Path(env_config).exists():
+            config_path = env_config
+            logger.info(f"Using config from CONDUCTOR_MEMORY_CONFIG: {config_path}")
+        elif DEFAULT_HOME_CONFIG.exists():
+            config_path = str(DEFAULT_HOME_CONFIG)
+            logger.info(f"Using default config: {config_path}")
+        elif LEGACY_CONFIG.exists():
+            config_path = str(LEGACY_CONFIG)
+            logger.info(f"Using legacy config file: {config_path}")
+
+    if config_path and Path(config_path).exists():
         try:
             config = ServerConfig.from_file(config_path)
             logger.info(f"Loaded config from: {config_path}")
@@ -297,7 +311,7 @@ def main():
             logger.error(f"Failed to load config: {e}")
             sys.exit(1)
     else:
-        logger.warning(f"No config file found at {config_path}")
+        logger.warning(f"No config file found. Create {DEFAULT_HOME_CONFIG} or use --config")
         config = ServerConfig()
     
     # Create and initialize MemoryService

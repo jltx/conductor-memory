@@ -72,6 +72,56 @@ class FileIndexMetadata:
         except Exception as e:
             logger.warning(f"Error updating file index metadata for {file_path}: {e}")
     
+    def update_file_info_batch(self, file_infos: List[Dict[str, Any]]) -> None:
+        """
+        Batch update or insert file metadata.
+        Much faster than calling update_file_info() repeatedly.
+        
+        Automatically splits into smaller batches to respect ChromaDB limits.
+        
+        Args:
+            file_infos: List of dicts with keys: file_path, mtime, content_hash, chunk_ids
+        """
+        if not file_infos:
+            return
+        
+        # ChromaDB has a max batch size (typically around 5000)
+        # Use a safe batch size to avoid hitting limits
+        BATCH_SIZE = 1000
+        indexed_at = datetime.now().isoformat()
+        total_updated = 0
+        
+        for batch_start in range(0, len(file_infos), BATCH_SIZE):
+            batch_end = min(batch_start + BATCH_SIZE, len(file_infos))
+            batch = file_infos[batch_start:batch_end]
+            
+            ids = []
+            metadatas = []
+            documents = []
+            
+            for info in batch:
+                ids.append(info['file_path'])
+                documents.append(info['file_path'])
+                metadatas.append({
+                    "mtime": info['mtime'],
+                    "content_hash": info['content_hash'],
+                    "chunk_ids": ",".join(info['chunk_ids']),
+                    "indexed_at": indexed_at
+                })
+            
+            try:
+                self.collection.upsert(
+                    ids=ids,
+                    metadatas=metadatas,
+                    documents=documents
+                )
+                total_updated += len(ids)
+            except Exception as e:
+                logger.error(f"Error batch updating file index metadata (batch {batch_start}-{batch_end}): {e}")
+                raise  # Re-raise to fail the indexing properly
+        
+        logger.debug(f"Batch updated file index for {total_updated} files")
+    
     def delete_file_info(self, file_path: str) -> List[str]:
         """Delete file metadata and return chunk IDs to remove"""
         chunk_ids = []
@@ -180,6 +230,51 @@ class ChromaVectorStore(VectorStore):
         )
 
         logger.debug(f"Added chunk {chunk.id} to vector store")
+
+    def add_batch(self, chunks: List[MemoryChunk], embeddings: List[List[float]]) -> None:
+        """
+        Add multiple memory chunks with their embeddings in a single batch.
+        Much faster than calling add() repeatedly.
+
+        Args:
+            chunks: List of memory chunks to store
+            embeddings: List of vector embeddings (same order as chunks)
+        """
+        if not chunks:
+            return
+        
+        ids = []
+        metadatas = []
+        documents = []
+        
+        for chunk in chunks:
+            ids.append(chunk.id)
+            documents.append(chunk.doc_text)
+            
+            metadata = {
+                "project_id": chunk.project_id,
+                "role": chunk.role.value if hasattr(chunk.role, 'value') else str(chunk.role),
+                "source": chunk.source,
+                "tags": ",".join(chunk.tags) if chunk.tags else "",
+                "relevance_score": chunk.relevance_score,
+                "memory_type": chunk.memory_type.value if hasattr(chunk.memory_type, 'value') else str(chunk.memory_type),
+                "created_at": chunk.created_at.isoformat() if chunk.created_at else None,
+                "updated_at": chunk.updated_at.isoformat() if chunk.updated_at else None,
+                "expires_at": chunk.expires_at.isoformat() if chunk.expires_at else None,
+            }
+            # Remove None values
+            metadata = {k: v for k, v in metadata.items() if v is not None}
+            metadatas.append(metadata)
+        
+        # Single batch insert
+        self.collection.add(
+            ids=ids,
+            embeddings=embeddings,
+            metadatas=metadatas,
+            documents=documents
+        )
+        
+        logger.debug(f"Batch added {len(chunks)} chunks to vector store")
 
     def search(self, query: List[float], top_k: int, filters: Optional[Dict[str, Any]] = None) -> List[MemoryChunk]:
         """
@@ -390,6 +485,16 @@ class ChromaVectorStore(VectorStore):
         """
         self.file_index.update_file_info(file_path, mtime, content_hash, chunk_ids)
     
+    def update_file_index_batch(self, file_infos: List[Dict[str, Any]]) -> None:
+        """
+        Batch update file index metadata after indexing.
+        Much faster than calling update_file_index() repeatedly.
+        
+        Args:
+            file_infos: List of dicts with keys: file_path, mtime, content_hash, chunk_ids
+        """
+        self.file_index.update_file_info_batch(file_infos)
+    
     def remove_file_chunks(self, file_path: str) -> int:
         """
         Remove all chunks associated with a file
@@ -422,3 +527,46 @@ class ChromaVectorStore(VectorStore):
     def compute_content_hash(content: str) -> str:
         """Compute SHA-256 hash of content"""
         return hashlib.sha256(content.encode('utf-8')).hexdigest()
+    
+    def cleanup_orphan_chunks(self, codebase_name: str) -> int:
+        """
+        Remove chunks that exist in ChromaDB but have no corresponding file index entry.
+        This handles recovery from crashes during indexing.
+        
+        Args:
+            codebase_name: Name of the codebase to clean up
+            
+        Returns:
+            Number of orphan chunks removed
+        """
+        # Get all chunk IDs tracked in file index
+        indexed_files = self.file_index.get_all_indexed_files()
+        tracked_chunk_ids = set()
+        for file_info in indexed_files.values():
+            chunk_ids_str = file_info.get("chunk_ids", "")
+            if chunk_ids_str:
+                tracked_chunk_ids.update(chunk_ids_str.split(","))
+        
+        # Get all chunk IDs in ChromaDB for this codebase
+        try:
+            result = self.collection.get(
+                where={"project_id": codebase_name},
+                include=[]  # We only need IDs
+            )
+            all_chunk_ids = set(result["ids"]) if result["ids"] else set()
+        except Exception as e:
+            logger.warning(f"Error getting chunks for cleanup: {e}")
+            return 0
+        
+        # Find orphan chunks (in ChromaDB but not in file index)
+        orphan_ids = all_chunk_ids - tracked_chunk_ids
+        
+        if orphan_ids:
+            try:
+                self.collection.delete(ids=list(orphan_ids))
+                logger.info(f"[{codebase_name}] Cleaned up {len(orphan_ids)} orphan chunks from previous incomplete indexing")
+            except Exception as e:
+                logger.warning(f"Error cleaning up orphan chunks: {e}")
+                return 0
+        
+        return len(orphan_ids)

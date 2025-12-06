@@ -33,7 +33,7 @@ export CHROMA_PERSIST_DIR=./data/chroma  # Local persistence directory
 export CHROMA_COLLECTION=memory_chunks   # Collection name
 
 # Embedding Configuration
-export EMBEDDING_MODEL=all-MiniLM-L6-v2  # Model to use
+export EMBEDDING_MODEL=all-MiniLM-L12-v2  # Model to use
 export EMBEDDING_DEVICE=cuda           # Use GPU (for RTX 4090)
 export EMBEDDING_CACHE_DIR=./cache     # Model cache directory
 ```

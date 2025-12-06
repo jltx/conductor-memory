@@ -19,7 +19,7 @@ class SentenceTransformerEmbedder(Embedder):
     """
 
     def __init__(self,
-                 model_name: str = "all-MiniLM-L6-v2",
+                 model_name: str = "all-MiniLM-L12-v2",
                  device: Optional[str] = None,
                  cache_folder: Optional[str] = None):
         """
@@ -27,21 +27,26 @@ class SentenceTransformerEmbedder(Embedder):
 
         Args:
             model_name: Name of the sentence transformer model
-            device: Device to run on ('cpu', 'cuda', 'cuda:0', etc.)
+            device: Device to run on:
+                - 'cpu': CPU only
+                - 'cuda' or 'cuda:0': NVIDIA GPU
+                - 'mps': Apple Silicon GPU (M1/M2/M3)
+                - None: Auto-detect best available
             cache_folder: Folder to cache downloaded models
         """
         self.model_name = model_name
         self.device = device
         self.cache_folder = cache_folder
 
-        logger.info(f"Loading sentence transformer model: {model_name}")
+        logger.info(f"Loading sentence transformer model: {model_name} on device: {device or 'auto'}")
         try:
             self.model = SentenceTransformer(
                 model_name,
                 device=device,
                 cache_folder=cache_folder
             )
-            logger.info(f"Model loaded successfully. Embedding dimension: {self.model.get_sentence_embedding_dimension()}")
+            actual_device = str(self.model.device)
+            logger.info(f"Model loaded on {actual_device}. Embedding dimension: {self.model.get_sentence_embedding_dimension()}")
         except Exception as e:
             logger.error(f"Failed to load model {model_name}: {e}")
             raise
@@ -70,12 +75,13 @@ class SentenceTransformerEmbedder(Embedder):
             dimension = self.model.get_sentence_embedding_dimension()
             return [0.0] * dimension
 
-    def generate_batch(self, texts: List[str]) -> List[List[float]]:
+    def generate_batch(self, texts: List[str], batch_size: Optional[int] = None) -> List[List[float]]:
         """
         Generate embeddings for a batch of texts
 
         Args:
             texts: List of texts to embed
+            batch_size: Optional batch size for GPU processing (auto-detected if None)
 
         Returns:
             List of embeddings (one per input text)
@@ -97,9 +103,16 @@ class SentenceTransformerEmbedder(Embedder):
             dimension = self.model.get_sentence_embedding_dimension()
             return [[0.0] * dimension] * len(texts)
 
+        # Use provided batch_size or auto-detect based on device
+        if batch_size is None:
+            if 'cuda' in str(self.model.device):
+                batch_size = 256  # Larger batches for GPU
+            else:
+                batch_size = 32   # Smaller for CPU
+
         try:
             # Generate embeddings for valid texts
-            embeddings = self.model.encode(valid_texts, convert_to_numpy=True, batch_size=32, show_progress_bar=False)
+            embeddings = self.model.encode(valid_texts, convert_to_numpy=True, batch_size=batch_size, show_progress_bar=False)
 
             # Reconstruct full result list with zero vectors for empty texts
             result = []

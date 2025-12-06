@@ -15,6 +15,7 @@ Usage:
 
 import argparse
 import logging
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -332,17 +333,29 @@ def main():
     
     # Set log level
     logging.getLogger().setLevel(getattr(logging, args.log_level.upper()))
-    
-    # Default config file name
-    DEFAULT_CONFIG = "memory_server_config.json"
-    
+
+    # Load configuration - check multiple locations in priority order
+    DEFAULT_HOME_CONFIG = Path.home() / ".conductor-memory" / "config.json"
+    LEGACY_CONFIG = Path("memory_server_config.json")
+
     # Determine config file path
     config_path = args.config
+
+    # If no explicit config, check in priority order:
+    # 1. CONDUCTOR_MEMORY_CONFIG environment variable
+    # 2. ~/.conductor-memory/config.json (documented default)
+    # 3. ./memory_server_config.json (legacy/backwards compat)
     if not config_path and not args.codebase_path:
-        # Auto-detect config file in current directory
-        if Path(DEFAULT_CONFIG).exists():
-            config_path = DEFAULT_CONFIG
-            logger.info(f"Auto-detected config file: {DEFAULT_CONFIG}")
+        env_config = os.environ.get("CONDUCTOR_MEMORY_CONFIG")
+        if env_config and Path(env_config).exists():
+            config_path = env_config
+            logger.info(f"Using config from CONDUCTOR_MEMORY_CONFIG: {config_path}")
+        elif DEFAULT_HOME_CONFIG.exists():
+            config_path = str(DEFAULT_HOME_CONFIG)
+            logger.info(f"Using default config: {config_path}")
+        elif LEGACY_CONFIG.exists():
+            config_path = str(LEGACY_CONFIG)
+            logger.info(f"Using legacy config file: {config_path}")
     
     # Load configuration
     if config_path:
@@ -361,7 +374,7 @@ def main():
         config.persist_directory = args.persist_dir
         logger.info(f"Single codebase mode: {args.codebase_path}")
     else:
-        logger.warning(f"No config file found. Create {DEFAULT_CONFIG} or use --codebase-path")
+        logger.warning(f"No config file found. Create {DEFAULT_HOME_CONFIG} or use --codebase-path")
         config = ServerConfig()
         config.persist_directory = args.persist_dir
     

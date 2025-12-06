@@ -45,7 +45,7 @@ Create `~/.conductor-memory/config.json`:
       "ignore_patterns": ["__pycache__", ".git", "node_modules", "venv"]
     }
   ],
-  "embedding_model": "all-MiniLM-L6-v2"
+  "embedding_model": "all-MiniLM-L12-v2"
 }
 ```
 
@@ -120,7 +120,7 @@ CHROMA_PERSIST_DIR=~/.conductor-memory/data
 CHROMA_COLLECTION=memory_chunks
 
 # Embedding model
-EMBEDDING_MODEL=all-MiniLM-L6-v2
+EMBEDDING_MODEL=all-MiniLM-L12-v2
 EMBEDDING_DEVICE=cuda  # Use GPU if available
 ```
 
