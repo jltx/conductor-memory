@@ -1,0 +1,72 @@
+{
+  "host": "127.0.0.1",
+  "port": 8000,
+  "persist_directory": "C:\\Users\\joshu\\projects\\conductor\\data\\chroma",
+  "codebases": [
+    {
+      "name": "project1",
+      "path": "C:\\path\\to\\project1",
+      "extensions": [
+        ".py",
+        ".js",
+        ".ts",
+        ".md"
+      ],
+      "ignore_patterns": [
+        "__pycache__",
+        ".git",
+        "node_modules",
+        "venv"
+      ],
+      "enabled": true,
+      "description": "Main project codebase"
+    },
+    {
+      "name": "project2",
+      "path": "C:\\path\\to\\project2",
+      "extensions": [
+        ".py",
+        ".js",
+        ".ts",
+        ".tsx",
+        ".jsx",
+        ".java",
+        ".cpp",
+        ".c",
+        ".h",
+        ".hpp",
+        ".cs",
+        ".go",
+        ".rs",
+        ".rb",
+        ".php",
+        ".md",
+        ".txt",
+        ".json",
+        ".yaml",
+        ".yml"
+      ],
+      "ignore_patterns": [
+        "__pycache__",
+        ".git",
+        "node_modules",
+        ".venv",
+        "venv",
+        "build",
+        "dist",
+        ".idea",
+        ".vscode",
+        ".pytest_cache",
+        "*.pyc",
+        "*.pyo",
+        "*.egg-info"
+      ],
+      "enabled": true,
+      "description": "Secondary project"
+    }
+  ],
+  "watch_interval": 5.0,
+  "enable_file_watcher": true,
+  "log_level": "INFO",
+  "embedding_model": "all-MiniLM-L6-v2"
+}

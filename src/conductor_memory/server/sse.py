@@ -1,0 +1,328 @@
+#!/usr/bin/env python3
+"""
+MCP Memory Server - SSE (Server-Sent Events) version for remote connections
+
+This server runs as an HTTP service that OpenCode can connect to remotely.
+No need to spawn a process - just start this server once and connect from any project.
+
+Usage:
+    # Start the server (do this once, or add to Windows startup)
+    python src/mcp_memory_sse.py
+    
+    # Then in any project's opencode.json:
+    {
+      "mcp": {
+        "conductor_memory": {
+          "type": "remote",
+          "url": "http://localhost:9820/sse"
+        }
+      }
+    }
+"""
+
+import argparse
+import logging
+import sys
+import os
+from pathlib import Path
+from typing import Any
+
+# Suppress TensorFlow warnings before any imports
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+
+# MCP SDK imports
+from mcp.server.fastmcp import FastMCP
+
+from ..config.server import ServerConfig
+from ..service.memory_service import MemoryService
+
+# Configure logging to stderr (stdout may be used by transport)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    stream=sys.stderr
+)
+logger = logging.getLogger(__name__)
+
+# Global service instance (initialized in main)
+memory_service: MemoryService | None = None
+
+# Create the MCP server with SSE settings
+mcp = FastMCP(
+    "Conductor Memory",
+    instructions="""
+    Memory tools for semantic search and context retrieval. Provides:
+    - Semantic search across multiple codebases and conversation history
+    - Storage of conversation memories and code snippets
+    - Multi-codebase support with per-codebase or cross-codebase search
+    
+    Use memory_search to find relevant code or past conversations.
+    Use memory_store to save important context for later retrieval.
+    Use memory_status to check indexing progress for all codebases.
+    """
+)
+
+
+@mcp.tool()
+async def memory_search(
+    query: str,
+    max_results: int = 10,
+    project_id: str | None = None,
+    codebase: str | None = None,
+    min_relevance: float = 0.1,
+    search_mode: str = "auto"
+) -> dict[str, Any]:
+    """
+    Search for relevant memories using semantic similarity, keyword matching, or both.
+    
+    Args:
+        query: Search query for semantic similarity
+        max_results: Maximum number of results to return (default 10)
+        project_id: Optional filter by project ID
+        codebase: Optional codebase name to search (None = search all codebases)
+        min_relevance: Minimum relevance score 0-1 (default 0.1)
+        search_mode: Search mode - "auto" (default), "semantic", "keyword", or "hybrid"
+    
+    Returns:
+        Dictionary with search results and metadata including search_mode_used
+    """
+    if not memory_service:
+        return {"error": "Memory service not initialized", "results": []}
+    
+    # Use async method directly to avoid asyncio.run() conflict
+    return await memory_service.search_async(
+        query=query,
+        codebase=codebase,
+        max_results=max_results,
+        project_id=project_id,
+        search_mode=search_mode
+    )
+
+
+@mcp.tool()
+async def memory_store(
+    content: str,
+    project_id: str = "default",
+    codebase: str | None = None,
+    role: str = "user",
+    tags: list[str] | None = None,
+    pin: bool = False,
+    source: str = "opencode"
+) -> dict[str, Any]:
+    """
+    Store a new memory chunk for later retrieval.
+    
+    Args:
+        content: The text content to store
+        project_id: Project identifier (default "default")
+        codebase: Codebase to store in (default: first configured codebase)
+        role: Role of the memory - user, assistant, system, tool (default "user")
+        tags: Optional list of tags for categorization
+        pin: Pin this memory to prevent pruning (default False)
+        source: Source of the memory (default "opencode")
+    
+    Returns:
+        Dictionary with stored memory details
+    """
+    if not memory_service:
+        return {"error": "Memory service not initialized", "success": False}
+    
+    # Use async method directly to avoid asyncio.run() conflict
+    return await memory_service.store_async(
+        content=content,
+        project_id=project_id,
+        codebase=codebase,
+        role=role,
+        tags=tags,
+        pin=pin,
+        source=source,
+        memory_type="conversation"
+    )
+
+
+@mcp.tool()
+async def memory_store_decision(
+    content: str,
+    tags: list[str] | None = None,
+    project_id: str = "default",
+    codebase: str | None = None
+) -> dict[str, Any]:
+    """
+    Store an architectural decision for later retrieval.
+    Decisions are automatically pinned and tagged as 'decision'.
+    """
+    if not memory_service:
+        return {"error": "Memory service not initialized", "success": False}
+    
+    all_tags = list(tags or [])
+    for default_tag in ["decision", "architecture"]:
+        if default_tag not in all_tags:
+            all_tags.append(default_tag)
+    
+    # Use async method directly to avoid asyncio.run() conflict
+    return await memory_service.store_async(
+        content=content,
+        project_id=project_id,
+        codebase=codebase,
+        role="assistant",
+        tags=all_tags,
+        pin=True,
+        source="opencode",
+        memory_type="decision"
+    )
+
+
+@mcp.tool()
+async def memory_store_lesson(
+    content: str,
+    tags: list[str] | None = None,
+    project_id: str = "default",
+    codebase: str | None = None
+) -> dict[str, Any]:
+    """
+    Store a debugging insight or lesson learned for later retrieval.
+    Lessons are automatically pinned and tagged as 'lesson'.
+    """
+    if not memory_service:
+        return {"error": "Memory service not initialized", "success": False}
+    
+    all_tags = list(tags or [])
+    for default_tag in ["lesson", "debugging"]:
+        if default_tag not in all_tags:
+            all_tags.append(default_tag)
+    
+    # Use async method directly to avoid asyncio.run() conflict
+    return await memory_service.store_async(
+        content=content,
+        project_id=project_id,
+        codebase=codebase,
+        role="assistant",
+        tags=all_tags,
+        pin=True,
+        source="opencode",
+        memory_type="lesson"
+    )
+
+
+@mcp.tool()
+async def memory_status() -> dict[str, Any]:
+    """
+    Get the current status of the memory system.
+    
+    Returns:
+        Dictionary with memory system status including indexing progress
+    """
+    if not memory_service:
+        return {"error": "Memory service not initialized"}
+    
+    # get_status is sync and doesn't use asyncio.run(), so it's safe
+    return memory_service.get_status()
+
+
+@mcp.tool()
+async def memory_prune(
+    project_id: str | None = None,
+    max_age_days: int = 30
+) -> dict[str, Any]:
+    """
+    Prune obsolete memories based on age and relevance.
+    """
+    if not memory_service:
+        return {"error": "Memory service not initialized", "pruned": 0, "kept": 0, "total_processed": 0}
+    
+    # Use async method directly to avoid asyncio.run() conflict
+    return await memory_service.prune_async(
+        project_id=project_id,
+        max_age_days=max_age_days
+    )
+
+
+@mcp.tool()
+async def memory_delete(
+    memory_id: str,
+    codebase: str | None = None
+) -> dict[str, Any]:
+    """
+    Delete a specific memory by ID.
+    
+    Use this to remove outdated decisions or lessons when they are superseded.
+    Unlike prune, this can delete pinned memories (decisions, lessons).
+    
+    Args:
+        memory_id: The ID of the memory to delete (returned when storing)
+        codebase: Optional codebase to delete from (searches all if not specified)
+    
+    Returns:
+        Dictionary with deletion result
+    """
+    if not memory_service:
+        return {"error": "Memory service not initialized", "success": False}
+    
+    return await memory_service.delete_async(
+        memory_id=memory_id,
+        codebase=codebase
+    )
+
+
+def main():
+    """Main entry point for SSE MCP server"""
+    global memory_service
+    
+    # Default to conductor directory for config
+    conductor_dir = Path(__file__).parent.parent
+    os.chdir(conductor_dir)
+    
+    parser = argparse.ArgumentParser(description="MCP Memory Server (SSE/HTTP)")
+    parser.add_argument("--config", type=str, help="Config file path (default: memory_server_config.json)")
+    parser.add_argument("--host", type=str, default="127.0.0.1", help="Host to bind to")
+    parser.add_argument("--port", type=int, default=9820, help="Port to listen on")
+    parser.add_argument("--log-level", type=str, default="INFO", help="Log level")
+    
+    args = parser.parse_args()
+    
+    # Set log level
+    logging.getLogger().setLevel(getattr(logging, args.log_level.upper()))
+    
+    # Load configuration
+    DEFAULT_CONFIG = "memory_server_config.json"
+    config_path = args.config or DEFAULT_CONFIG
+    
+    if Path(config_path).exists():
+        try:
+            config = ServerConfig.from_file(config_path)
+            logger.info(f"Loaded config from: {config_path}")
+            logger.info(f"Configured {len(config.codebases)} codebase(s)")
+        except Exception as e:
+            logger.error(f"Failed to load config: {e}")
+            sys.exit(1)
+    else:
+        logger.warning(f"No config file found at {config_path}")
+        config = ServerConfig()
+    
+    # Create and initialize MemoryService
+    memory_service = MemoryService(config)
+    
+    if config.get_enabled_codebases():
+        logger.info("Initializing and indexing codebases...")
+        memory_service.initialize()
+        logger.info("Indexing complete")
+    
+    # Log ready status
+    status = memory_service.get_status()
+    total_files = sum(cb.get("indexed_files_count", 0) for cb in status.get("codebases", {}).values())
+    logger.info(f"=== READY === Memory server initialized with {total_files} indexed files")
+    
+    # Configure FastMCP settings for SSE
+    mcp.settings.host = args.host
+    mcp.settings.port = args.port
+    
+    logger.info(f"Starting MCP Memory Server (SSE) on http://{args.host}:{args.port}/sse")
+    logger.info("Configure OpenCode with:")
+    logger.info(f'  "type": "remote", "url": "http://{args.host}:{args.port}/sse"')
+    
+    mcp.run(transport="sse")
+
+
+if __name__ == "__main__":
+    main()
