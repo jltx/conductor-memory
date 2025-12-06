@@ -2679,6 +2679,144 @@ Dependencies: {dependencies}"""
         
         return False
     
+    async def queue_codebase_for_summarization(
+        self, 
+        codebase_name: str,
+        only_missing: bool = True
+    ) -> Dict[str, Any]:
+        """
+        Queue all files from a specific codebase for summarization.
+        
+        This is useful when:
+        - A new codebase is added to config
+        - You want to re-summarize an existing codebase
+        - Summarization was interrupted
+        
+        Args:
+            codebase_name: Name of the codebase to queue
+            only_missing: If True, only queue files without summaries (default)
+                         If False, queue all files for re-summarization
+            
+        Returns:
+            Dict with status info: {
+                "success": bool,
+                "message": str,
+                "files_queued": int,
+                "files_skipped": int
+            }
+        """
+        if not self._summarization_stats["is_running"]:
+            return {
+                "success": False,
+                "message": "Summarization is not running. Check that summarization.enabled=true and LLM is available.",
+                "files_queued": 0,
+                "files_skipped": 0
+            }
+        
+        if not self._summarizer:
+            return {
+                "success": False,
+                "message": "Summarizer not initialized",
+                "files_queued": 0,
+                "files_skipped": 0
+            }
+        
+        # Find the codebase config
+        codebase = None
+        for cb in self.config.get_enabled_codebases():
+            if cb.name == codebase_name:
+                codebase = cb
+                break
+        
+        if not codebase:
+            return {
+                "success": False,
+                "message": f"Codebase not found: {codebase_name}",
+                "files_queued": 0,
+                "files_skipped": 0
+            }
+        
+        vector_store = self._vector_stores.get(codebase_name)
+        if not vector_store:
+            return {
+                "success": False,
+                "message": f"Vector store not initialized for: {codebase_name}",
+                "files_queued": 0,
+                "files_skipped": 0
+            }
+        
+        codebase_path = Path(codebase.path)
+        files_queued = 0
+        files_skipped = 0
+        
+        # Get existing summaries if only_missing is True
+        summarized_files = set()
+        if only_missing:
+            summarized_files = vector_store.summary_index.get_all_summarized_files()
+            logger.info(f"[Summarization] {codebase_name} already has {len(summarized_files)} summaries")
+        
+        # Try to get files by centrality first
+        priority_queue = self.get_file_centrality_scores(codebase_name, max_files=10000)
+        
+        if priority_queue:
+            logger.info(f"[Summarization] Using centrality ordering for {codebase_name}, found {len(priority_queue)} files")
+            for file_path, score in priority_queue:
+                # Skip if file matches skip pattern
+                if self._summarizer._should_skip_file(file_path):
+                    files_skipped += 1
+                    continue
+                
+                # Skip if already summarized and only_missing=True
+                if only_missing and file_path in summarized_files:
+                    files_skipped += 1
+                    continue
+                
+                await self._summary_queue.put((-score, codebase_name, file_path, str(codebase_path)))
+                files_queued += 1
+        else:
+            # Fallback: queue all indexed files with equal priority
+            indexed_files = vector_store.get_indexed_files()
+            logger.info(f"[Summarization] No import graph for {codebase_name}, using {len(indexed_files)} indexed files")
+            
+            for file_path in indexed_files.keys():
+                # Skip if file matches skip pattern
+                if self._summarizer._should_skip_file(file_path):
+                    files_skipped += 1
+                    continue
+                
+                # Skip if already summarized and only_missing=True  
+                if only_missing and file_path in summarized_files:
+                    files_skipped += 1
+                    continue
+                
+                await self._summary_queue.put((0.5, codebase_name, file_path, str(codebase_path)))
+                files_queued += 1
+        
+        # Update queue size stat
+        self._summarization_stats["files_queued"] = self._summary_queue.qsize()
+        
+        logger.info(
+            f"[Summarization] Queued {files_queued} files from {codebase_name} "
+            f"({files_skipped} skipped)"
+        )
+        
+        return {
+            "success": True,
+            "message": f"Queued {files_queued} files from {codebase_name} for summarization",
+            "files_queued": files_queued,
+            "files_skipped": files_skipped,
+            "total_queue_size": self._summary_queue.qsize()
+        }
+    
+    # Sync wrapper
+    def queue_codebase_for_summarization_sync(
+        self, 
+        codebase_name: str,
+        only_missing: bool = True
+    ) -> Dict[str, Any]:
+        """Sync wrapper for queue_codebase_for_summarization"""
+        return _run_sync(self.queue_codebase_for_summarization(codebase_name, only_missing))
+    
     # ─────────────────────────────────────────────────────────────────────────
     # Browse/List API - For Web Dashboard
     # ─────────────────────────────────────────────────────────────────────────

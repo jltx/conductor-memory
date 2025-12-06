@@ -1650,6 +1650,49 @@ async def memory_reindex_codebase(codebase: str) -> dict[str, Any]:
         return {"error": f"Failed to reindex codebase '{codebase}': {str(e)}"}
 
 
+@mcp.tool()
+async def memory_queue_codebase_summarization(
+    codebase: str, 
+    only_missing: bool = True
+) -> dict[str, Any]:
+    """
+    Queue all files from a specific codebase for LLM summarization.
+    
+    Use this when:
+    - Adding a new codebase that hasn't been summarized yet
+    - Re-summarizing an existing codebase after making changes
+    - Resuming summarization after it was interrupted
+    
+    Args:
+        codebase: Name of the codebase to queue for summarization
+        only_missing: If True (default), only queue files without summaries.
+                     If False, queue all files for re-summarization.
+    
+    Returns:
+        Dictionary with queue results:
+        - success: Whether the operation succeeded
+        - message: Human-readable status message
+        - files_queued: Number of files added to the queue
+        - files_skipped: Number of files skipped (already summarized or excluded)
+        - total_queue_size: Current total queue size
+    
+    Example:
+        # Queue new codebase for first-time summarization
+        memory_queue_codebase_summarization("my-new-project")
+        
+        # Re-summarize entire codebase
+        memory_queue_codebase_summarization("my-project", only_missing=False)
+    """
+    if not memory_service:
+        return {"error": "Memory service not initialized"}
+    
+    try:
+        result = await memory_service.queue_codebase_for_summarization(codebase, only_missing)
+        return result
+    except Exception as e:
+        return {"error": f"Failed to queue codebase '{codebase}' for summarization: {str(e)}"}
+
+
 def main():
     """Main entry point for SSE MCP server"""
     global memory_service
