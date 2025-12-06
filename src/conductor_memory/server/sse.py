@@ -71,7 +71,19 @@ async def memory_search(
     project_id: str | None = None,
     codebase: str | None = None,
     min_relevance: float = 0.1,
-    search_mode: str = "auto"
+    search_mode: str = "auto",
+    # Tag filtering
+    include_tags: list[str] | None = None,
+    exclude_tags: list[str] | None = None,
+    # Heuristic filtering (Phase 2)
+    languages: list[str] | None = None,
+    class_names: list[str] | None = None,
+    function_names: list[str] | None = None,
+    annotations: list[str] | None = None,
+    has_annotations: bool | None = None,
+    has_docstrings: bool | None = None,
+    min_class_count: int | None = None,
+    min_function_count: int | None = None
 ) -> dict[str, Any]:
     """
     Search for relevant memories using semantic similarity, keyword matching, or both.
@@ -83,6 +95,16 @@ async def memory_search(
         codebase: Optional codebase name to search (None = search all codebases)
         min_relevance: Minimum relevance score 0-1 (default 0.1)
         search_mode: Search mode - "auto" (default), "semantic", "keyword", or "hybrid"
+        include_tags: Include only results matching these tags (supports prefix:* patterns)
+        exclude_tags: Exclude results matching these tags (supports prefix:* patterns)
+        languages: Filter by programming languages (e.g., ['python', 'java'])
+        class_names: Filter by class names (e.g., ['UserService', 'TestClass'])
+        function_names: Filter by function names (e.g., ['process_data', 'validate'])
+        annotations: Filter by annotations (e.g., ['@Test', '@Component'])
+        has_annotations: Filter files that have/don't have annotations
+        has_docstrings: Filter files that have/don't have docstrings
+        min_class_count: Minimum number of classes in file
+        min_function_count: Minimum number of functions in file
     
     Returns:
         Dictionary with search results and metadata including search_mode_used
@@ -96,7 +118,17 @@ async def memory_search(
         codebase=codebase,
         max_results=max_results,
         project_id=project_id,
-        search_mode=search_mode
+        search_mode=search_mode,
+        include_tags=include_tags,
+        exclude_tags=exclude_tags,
+        languages=languages,
+        class_names=class_names,
+        function_names=function_names,
+        annotations=annotations,
+        has_annotations=has_annotations,
+        has_docstrings=has_docstrings,
+        min_class_count=min_class_count,
+        min_function_count=min_function_count
     )
 
 
@@ -263,6 +295,88 @@ async def memory_delete(
         memory_id=memory_id,
         codebase=codebase
     )
+
+
+@mcp.tool()
+async def memory_import_graph_stats(
+    codebase: str | None = None
+) -> dict[str, Any]:
+    """
+    Get import graph statistics for codebases.
+    
+    Args:
+        codebase: Optional codebase name (None = all codebases)
+    
+    Returns:
+        Dictionary with import graph statistics including file counts, edges, and centrality info
+    """
+    if not memory_service:
+        return {"error": "Memory service not initialized"}
+    
+    return memory_service.get_import_graph_stats(codebase)
+
+
+@mcp.tool()
+async def memory_file_centrality(
+    codebase: str,
+    max_files: int = 20
+) -> dict[str, Any]:
+    """
+    Get files sorted by centrality score (importance in dependency graph).
+    
+    Files with higher centrality are more "central" to the codebase and are
+    imported by many other files, making them good candidates for LLM summarization.
+    
+    Args:
+        codebase: Codebase name
+        max_files: Maximum number of files to return (default 20)
+    
+    Returns:
+        Dictionary with list of files and their centrality scores
+    """
+    if not memory_service:
+        return {"error": "Memory service not initialized"}
+    
+    try:
+        priority_queue = memory_service.get_file_centrality_scores(codebase, max_files)
+        return {
+            "codebase": codebase,
+            "files": [
+                {"file_path": file_path, "centrality_score": score}
+                for file_path, score in priority_queue
+            ],
+            "total_files": len(priority_queue)
+        }
+    except Exception as e:
+        return {"error": f"Failed to get centrality scores: {e}"}
+
+
+@mcp.tool()
+async def memory_file_dependencies(
+    codebase: str,
+    file_path: str
+) -> dict[str, Any]:
+    """
+    Get dependency information for a specific file.
+    
+    Args:
+        codebase: Codebase name
+        file_path: Path to the file
+    
+    Returns:
+        Dictionary with file dependency information including imports and imported_by lists
+    """
+    if not memory_service:
+        return {"error": "Memory service not initialized"}
+    
+    try:
+        file_stats = memory_service.get_file_dependencies(codebase, file_path)
+        if file_stats:
+            return file_stats
+        else:
+            return {"error": f"File not found in import graph: {file_path}"}
+    except Exception as e:
+        return {"error": f"Failed to get file dependencies: {e}"}
 
 
 def main():

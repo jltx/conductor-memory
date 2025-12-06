@@ -12,12 +12,14 @@ import sys
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 
 from ..config.server import ServerConfig, CodebaseConfig
 from ..storage.chroma import ChromaVectorStore
 from ..search.chunking import ChunkingManager, ChunkingStrategy
 from ..search.boosting import BoostCalculator
+from ..search.heuristics import HeuristicExtractor
+from ..search.import_graph import ImportGraph
 from ..core.models import MemoryChunk, RoleEnum, MemoryType
 from ..core.resources import detect_resources, get_optimal_device, SystemResources
 from ..embedding.sentence_transformer import SentenceTransformerEmbedder
@@ -109,6 +111,10 @@ class MemoryService:
         # Boost calculator for relevance score adjustments
         self.boost_calculator = BoostCalculator(config.boost_config)
         
+        # Phase 1: Heuristic extraction and import graph analysis
+        self.heuristic_extractor = HeuristicExtractor()
+        self._import_graphs: Dict[str, ImportGraph] = {}  # One per codebase
+        
         # Initialize vector stores for each enabled codebase
         for codebase in config.get_enabled_codebases():
             self._init_codebase(codebase)
@@ -133,6 +139,8 @@ class MemoryService:
             "current_file": None,
             "error_message": None
         }
+        # Initialize import graph for this codebase
+        self._import_graphs[codebase.name] = ImportGraph()
     
     # ─────────────────────────────────────────────────────────────────────────
     # Public API - Async versions
@@ -204,7 +212,16 @@ class MemoryService:
         domain_boosts: Optional[Dict[str, float]] = None,
         # Phase 2: Tag Filtering
         include_tags: Optional[List[str]] = None,
-        exclude_tags: Optional[List[str]] = None
+        exclude_tags: Optional[List[str]] = None,
+        # Phase 2: Heuristic Filtering
+        languages: Optional[List[str]] = None,
+        class_names: Optional[List[str]] = None,
+        function_names: Optional[List[str]] = None,
+        annotations: Optional[List[str]] = None,
+        has_annotations: Optional[bool] = None,
+        has_docstrings: Optional[bool] = None,
+        min_class_count: Optional[int] = None,
+        min_function_count: Optional[int] = None
     ) -> Dict[str, Any]:
         """
         Search for relevant memories using semantic similarity, keyword matching, or both.
@@ -218,6 +235,14 @@ class MemoryService:
             domain_boosts: Per-query domain boost overrides (e.g., {'class': 1.5, 'test': 0.5})
             include_tags: Include only results matching these tags (supports prefix:* patterns)
             exclude_tags: Exclude results matching these tags (supports prefix:* patterns)
+            languages: Filter by programming languages (e.g., ['python', 'java'])
+            class_names: Filter by class names (e.g., ['UserService', 'TestClass'])
+            function_names: Filter by function names (e.g., ['process_data', 'validate'])
+            annotations: Filter by annotations (e.g., ['@Test', '@Component'])
+            has_annotations: Filter files that have/don't have annotations
+            has_docstrings: Filter files that have/don't have docstrings
+            min_class_count: Minimum number of classes in file
+            min_function_count: Minimum number of functions in file
             
         Returns:
             Dict with results, total_found, query_time_ms, summary, and search_mode_used
@@ -310,6 +335,14 @@ class MemoryService:
             # Apply tag filtering (Phase 2)
             if include_tags or exclude_tags:
                 similar_chunks = self._filter_by_tags(similar_chunks, include_tags, exclude_tags)
+            
+            # Apply heuristic filtering (Phase 2)
+            if any([languages, class_names, function_names, annotations, has_annotations is not None, 
+                   has_docstrings is not None, min_class_count is not None, min_function_count is not None]):
+                similar_chunks = self._filter_by_heuristics(
+                    similar_chunks, languages, class_names, function_names, annotations,
+                    has_annotations, has_docstrings, min_class_count, min_function_count
+                )
             
             # Remove duplicates based on content similarity
             deduplicated_chunks = self._deduplicate_chunks(similar_chunks)
@@ -700,12 +733,22 @@ class MemoryService:
         search_mode: str = "auto",
         domain_boosts: Optional[Dict[str, float]] = None,
         include_tags: Optional[List[str]] = None,
-        exclude_tags: Optional[List[str]] = None
+        exclude_tags: Optional[List[str]] = None,
+        languages: Optional[List[str]] = None,
+        class_names: Optional[List[str]] = None,
+        function_names: Optional[List[str]] = None,
+        annotations: Optional[List[str]] = None,
+        has_annotations: Optional[bool] = None,
+        has_docstrings: Optional[bool] = None,
+        min_class_count: Optional[int] = None,
+        min_function_count: Optional[int] = None
     ) -> Dict[str, Any]:
         """Sync wrapper for search_async"""
         return _run_sync(self.search_async(
             query, codebase, max_results, project_id, search_mode, 
-            domain_boosts, include_tags, exclude_tags
+            domain_boosts, include_tags, exclude_tags,
+            languages, class_names, function_names, annotations,
+            has_annotations, has_docstrings, min_class_count, min_function_count
         ))
     
     def store(
@@ -1030,6 +1073,16 @@ class MemoryService:
             bm25_elapsed = time.time() - bm25_start
             logger.info(f"[{codebase.name}] BM25 index built in {bm25_elapsed:.2f}s")
             
+            # Calculate import graph centrality after all files are processed
+            try:
+                import_graph = self._import_graphs[codebase.name]
+                centrality_scores = import_graph.calculate_centrality()
+                if centrality_scores:
+                    logger.info(f"[{codebase.name}] Calculated centrality for {len(centrality_scores)} files")
+                    # TODO: Store centrality scores for future LLM summarization prioritization
+            except Exception as e:
+                logger.warning(f"[{codebase.name}] Failed to calculate import graph centrality: {e}")
+            
             # Final summary
             self._print_progress_complete(
                 codebase.name,
@@ -1084,10 +1137,24 @@ class MemoryService:
             
             chunks = self.chunking_manager.chunk_text(content, relative_path)
             
+            # Phase 1: Extract heuristic metadata for this file
+            heuristic_metadata = None
+            try:
+                heuristic_metadata = self.heuristic_extractor.extract_file_metadata(relative_path, content)
+                if heuristic_metadata:
+                    # Add to import graph for centrality calculation
+                    import_graph = self._import_graphs[codebase.name]
+                    import_graph.add_file(relative_path, heuristic_metadata.imports)
+            except Exception as e:
+                logger.debug(f"[{codebase.name}] Heuristic extraction failed for {relative_path}: {e}")
+            
             start_idx = len(all_chunk_data)
             for chunk_text, metadata in chunks:
                 if len(chunk_text.strip()) >= 50:
-                    all_chunk_data.append((file_path, mtime, content_hash, chunk_text, metadata))
+                    # Enhance metadata with heuristic information
+                    if heuristic_metadata:
+                        self._enhance_chunk_metadata(metadata, heuristic_metadata)
+                    all_chunk_data.append((file_path, mtime, content_hash, chunk_text, metadata, heuristic_metadata))
             end_idx = len(all_chunk_data)
             
             if end_idx > start_idx:
@@ -1118,7 +1185,7 @@ class MemoryService:
             return
         
         # Phase 2: Generate embeddings in large batches (GPU-bound)
-        all_texts = [chunk_text for _, _, _, chunk_text, _ in all_chunk_data]
+        all_texts = [chunk_text for _, _, _, chunk_text, _, _ in all_chunk_data]
         total_chunks = len(all_texts)
         all_embeddings = []
         
@@ -1150,7 +1217,7 @@ class MemoryService:
         
         self._print_progress(codebase.name, 0, len(all_chunk_data), "Preparing")
         
-        for idx, (file_path, mtime, content_hash, chunk_text, metadata) in enumerate(all_chunk_data):
+        for idx, (file_path, mtime, content_hash, chunk_text, metadata, heuristic_metadata) in enumerate(all_chunk_data):
             relative_path = str(file_path.relative_to(codebase_path))
             
             chunk_id = str(uuid.uuid4())
@@ -1178,6 +1245,39 @@ class MemoryService:
             if metadata.parent_class:
                 tags.append(f"parent:{metadata.parent_class}")
             tags.append(f"lines:{metadata.start_line}-{metadata.end_line}")
+            
+            # Add heuristic metadata tags
+            if heuristic_metadata:
+                heuristic_dict = heuristic_metadata.to_dict()
+                tags.append(f"lang:{heuristic_dict['language']}")
+                
+                # Add class names
+                for class_name in heuristic_dict.get('class_names', []):
+                    tags.append(f"class:{class_name}")
+                
+                # Add function names
+                for func_name in heuristic_dict.get('function_names', []):
+                    tags.append(f"function:{func_name}")
+                
+                # Add annotations
+                for annotation in heuristic_dict.get('annotations', []):
+                    tags.append(f"annotation:{annotation}")
+                
+                # Add import modules
+                for module in heuristic_dict.get('import_modules', []):
+                    if module:  # Skip empty modules
+                        tags.append(f"imports:{module}")
+                
+                # Add metadata counts for filtering
+                tags.append(f"class_count:{heuristic_dict.get('class_count', 0)}")
+                tags.append(f"function_count:{heuristic_dict.get('function_count', 0)}")
+                tags.append(f"method_count:{heuristic_dict.get('method_count', 0)}")
+                tags.append(f"import_count:{heuristic_dict.get('import_count', 0)}")
+                
+                if heuristic_dict.get('has_annotations', False):
+                    tags.append("has_annotations:true")
+                if heuristic_dict.get('has_docstrings', False):
+                    tags.append("has_docstrings:true")
             
             memory_chunk = MemoryChunk(
                 id=chunk_id,
@@ -1247,6 +1347,72 @@ class MemoryService:
         
         file_index_elapsed = time.time() - file_index_start
         logger.info(f"[{codebase.name}] File index updated for {len(file_index_batch)} files ({len(files_without_chunks)} empty/small) in {file_index_elapsed:.2f}s")
+    
+    def _enhance_chunk_metadata(self, chunk_metadata, heuristic_metadata):
+        """
+        Enhance chunk metadata with heuristic information.
+        
+        Args:
+            chunk_metadata: ChunkMetadata object from chunking
+            heuristic_metadata: HeuristicMetadata object from heuristic extraction
+        """
+        try:
+            # Add language information
+            if not hasattr(chunk_metadata, 'language'):
+                chunk_metadata.language = heuristic_metadata.language
+            
+            # Enhance domain detection with heuristic information
+            if chunk_metadata.domain is None:
+                # Try to infer domain from heuristic metadata
+                if heuristic_metadata.annotations:
+                    # Check for common framework annotations
+                    for annotation in heuristic_metadata.annotations:
+                        annotation_lower = annotation.lower()
+                        if any(test_ann in annotation_lower for test_ann in ['test', 'junit', 'fact']):
+                            chunk_metadata.domain = 'test'
+                            break
+                        elif any(web_ann in annotation_lower for web_ann in ['controller', 'restcontroller', 'getmapping', 'postmapping']):
+                            chunk_metadata.domain = 'web'
+                            break
+                        elif any(data_ann in annotation_lower for data_ann in ['repository', 'entity', 'table']):
+                            chunk_metadata.domain = 'data'
+                            break
+                        elif any(service_ann in annotation_lower for service_ann in ['service', 'component', 'bean']):
+                            chunk_metadata.domain = 'service'
+                            break
+                
+                # Check function/class names for domain hints
+                if chunk_metadata.domain is None:
+                    all_names = heuristic_metadata.class_names + heuristic_metadata.function_names
+                    for name in all_names:
+                        name_lower = name.lower()
+                        if any(test_name in name_lower for test_name in ['test', 'spec', 'should']):
+                            chunk_metadata.domain = 'test'
+                            break
+                        elif any(util_name in name_lower for util_name in ['util', 'helper', 'common']):
+                            chunk_metadata.domain = 'utility'
+                            break
+                        elif any(config_name in name_lower for config_name in ['config', 'setting', 'property']):
+                            chunk_metadata.domain = 'config'
+                            break
+            
+            # Add additional metadata fields for search enhancement
+            if not hasattr(chunk_metadata, 'heuristic_data'):
+                chunk_metadata.heuristic_data = {
+                    'language': heuristic_metadata.language,
+                    'class_count': len(heuristic_metadata.classes),
+                    'function_count': len(heuristic_metadata.functions),
+                    'method_count': len(heuristic_metadata.methods),
+                    'import_count': len(heuristic_metadata.imports),
+                    'has_annotations': heuristic_metadata.has_annotations,
+                    'has_docstrings': heuristic_metadata.has_docstrings,
+                    'annotations': heuristic_metadata.annotations[:5],  # Limit to first 5
+                    'class_names': heuristic_metadata.class_names[:3],  # Limit to first 3
+                    'function_names': heuristic_metadata.function_names[:5]  # Limit to first 5
+                }
+                
+        except Exception as e:
+            logger.debug(f"Failed to enhance chunk metadata: {e}")
     
     def _get_optimal_batch_size(self) -> int:
         """
@@ -1421,6 +1587,129 @@ class MemoryService:
         else:
             # Exact match
             return pattern in chunk_tags
+    
+    def _filter_by_heuristics(
+        self,
+        chunks: List[MemoryChunk],
+        languages: Optional[List[str]] = None,
+        class_names: Optional[List[str]] = None,
+        function_names: Optional[List[str]] = None,
+        annotations: Optional[List[str]] = None,
+        has_annotations: Optional[bool] = None,
+        has_docstrings: Optional[bool] = None,
+        min_class_count: Optional[int] = None,
+        min_function_count: Optional[int] = None
+    ) -> List[MemoryChunk]:
+        """
+        Filter chunks by heuristic metadata extracted during indexing.
+        
+        Args:
+            chunks: List of MemoryChunk objects
+            languages: Filter by programming languages
+            class_names: Filter by class names
+            function_names: Filter by function names  
+            annotations: Filter by annotations
+            has_annotations: Filter files that have/don't have annotations
+            has_docstrings: Filter files that have/don't have docstrings
+            min_class_count: Minimum number of classes in file
+            min_function_count: Minimum number of functions in file
+            
+        Returns:
+            Filtered list of chunks
+        """
+        if not any([languages, class_names, function_names, annotations, has_annotations is not None,
+                   has_docstrings is not None, min_class_count is not None, min_function_count is not None]):
+            return chunks
+        
+        filtered_chunks = []
+        
+        for chunk in chunks:
+            chunk_tags = set(chunk.tags)
+            
+            # Filter by language
+            if languages:
+                lang_match = False
+                for lang in languages:
+                    if f"lang:{lang}" in chunk_tags:
+                        lang_match = True
+                        break
+                if not lang_match:
+                    continue
+            
+            # Filter by class names
+            if class_names:
+                class_match = False
+                for class_name in class_names:
+                    if f"class:{class_name}" in chunk_tags:
+                        class_match = True
+                        break
+                if not class_match:
+                    continue
+            
+            # Filter by function names
+            if function_names:
+                func_match = False
+                for func_name in function_names:
+                    if f"function:{func_name}" in chunk_tags:
+                        func_match = True
+                        break
+                if not func_match:
+                    continue
+            
+            # Filter by annotations
+            if annotations:
+                annotation_match = False
+                for annotation in annotations:
+                    if f"annotation:{annotation}" in chunk_tags:
+                        annotation_match = True
+                        break
+                if not annotation_match:
+                    continue
+            
+            # Filter by has_annotations
+            if has_annotations is not None:
+                has_ann_tag = "has_annotations:true" in chunk_tags
+                if has_annotations != has_ann_tag:
+                    continue
+            
+            # Filter by has_docstrings
+            if has_docstrings is not None:
+                has_doc_tag = "has_docstrings:true" in chunk_tags
+                if has_docstrings != has_doc_tag:
+                    continue
+            
+            # Filter by minimum class count
+            if min_class_count is not None:
+                class_count = 0
+                for tag in chunk_tags:
+                    if tag.startswith("class_count:"):
+                        try:
+                            class_count = int(tag.split(":")[1])
+                            break
+                        except (ValueError, IndexError):
+                            pass
+                if class_count < min_class_count:
+                    continue
+            
+            # Filter by minimum function count
+            if min_function_count is not None:
+                func_count = 0
+                for tag in chunk_tags:
+                    if tag.startswith("function_count:"):
+                        try:
+                            func_count = int(tag.split(":")[1])
+                            break
+                        except (ValueError, IndexError):
+                            pass
+                if func_count < min_function_count:
+                    continue
+            
+            filtered_chunks.append(chunk)
+        
+        if len(filtered_chunks) < len(chunks):
+            logger.debug(f"Heuristic filtering: {len(chunks)} -> {len(filtered_chunks)} chunks")
+        
+        return filtered_chunks
 
     def _deduplicate_chunks(self, chunks: List) -> List:
         """
@@ -1565,3 +1854,79 @@ class MemoryService:
             parts.append(f"Areas: {', '.join(sorted(sources)[:5])}")
         
         return " | ".join(parts)
+    
+    # ─────────────────────────────────────────────────────────────────────────
+    # Import Graph and Heuristic Metadata API
+    # ─────────────────────────────────────────────────────────────────────────
+    
+    def get_import_graph_stats(self, codebase: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Get import graph statistics for a codebase.
+        
+        Args:
+            codebase: Codebase name (None = all codebases)
+            
+        Returns:
+            Dictionary with import graph statistics
+        """
+        if codebase:
+            if codebase in self._import_graphs:
+                return {
+                    codebase: self._import_graphs[codebase].get_graph_stats()
+                }
+            else:
+                return {codebase: {"error": "Codebase not found"}}
+        else:
+            # Return stats for all codebases
+            return {
+                name: graph.get_graph_stats() 
+                for name, graph in self._import_graphs.items()
+            }
+    
+    def get_file_centrality_scores(self, codebase: str, max_files: Optional[int] = None) -> List[Tuple[str, float]]:
+        """
+        Get files sorted by centrality score for a codebase.
+        
+        Args:
+            codebase: Codebase name
+            max_files: Maximum number of files to return
+            
+        Returns:
+            List of (file_path, centrality_score) tuples, sorted by score descending
+        """
+        if codebase not in self._import_graphs:
+            return []
+        
+        return self._import_graphs[codebase].get_priority_queue(max_files)
+    
+    def get_file_dependencies(self, codebase: str, file_path: str) -> Optional[Dict[str, Any]]:
+        """
+        Get dependency information for a specific file.
+        
+        Args:
+            codebase: Codebase name
+            file_path: Path to the file
+            
+        Returns:
+            Dictionary with file dependency stats or None if not found
+        """
+        if codebase not in self._import_graphs:
+            return None
+        
+        return self._import_graphs[codebase].get_file_stats(file_path)
+    
+    def export_import_graph(self, codebase: str, format: str = 'json') -> Optional[str]:
+        """
+        Export import graph for visualization.
+        
+        Args:
+            codebase: Codebase name
+            format: Export format ('json', 'gexf', 'graphml')
+            
+        Returns:
+            Exported graph data as string or None if export fails
+        """
+        if codebase not in self._import_graphs:
+            return None
+        
+        return self._import_graphs[codebase].export_graph(format)
