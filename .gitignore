@@ -61,3 +61,4 @@ config.json
 # OS
 .DS_Store
 Thumbs.db
+/benchmark_results.json

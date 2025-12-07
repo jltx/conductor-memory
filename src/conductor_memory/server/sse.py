@@ -745,12 +745,13 @@ async def web_dashboard(request):
                 <div class="stat"><div class="stat-value">${estRemainingText}</div><div class="stat-label">Est. Remaining</div></div>
             `;
             
-            const total = (data.files_completed || 0) + (data.files_queued || 0);
-            const pct = total > 0 ? Math.round((data.files_completed / total) * 100) : 0;
+            const total = data.files_total_queued || 0;
+            const processed = data.files_processed || 0;
+            const pct = data.progress_percentage || 0;
             
             document.getElementById('progress-section').innerHTML = data.is_running && total > 0 ? `
                 <div style="display: flex; justify-content: space-between; font-size: 13px; color: #888; margin-top: 10px;">
-                    <span>Progress (${data.files_completed}/${total})</span><span>${pct}% • ${estRemainingText} remaining</span>
+                    <span>Progress (${processed}/${total})</span><span>${Math.round(pct)}% • ${estRemainingText} remaining</span>
                 </div>
                 <div class="progress-bar"><div class="progress-fill" style="width: ${pct}%"></div></div>
             ` : '';
@@ -1773,7 +1774,7 @@ def main():
         if config.enable_file_watcher:
             await memory_service.start_file_watchers_async()
         
-        # Start background summarizer if enabled
+        # Start background summarizer (with proper callback system)
         summarization_status = memory_service.get_summarization_status()
         if summarization_status.get("enabled") and summarization_status.get("llm_enabled"):
             logger.info("[Summarization] Starting background summarizer...")

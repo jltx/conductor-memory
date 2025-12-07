@@ -126,7 +126,12 @@ class MemoryService:
         self._summarization_stats = {
             "files_summarized": 0,
             "files_queued": 0,
+            "files_total_queued": 0,        # Total files originally queued (for progress calculation)
             "files_failed": 0,
+            "files_skipped": 0,
+            "files_skipped_pattern": 0,      # Pattern match - test files, build outputs, etc.
+            "files_skipped_unchanged": 0,   # Already summarized, content hash matches
+            "files_skipped_empty": 0,       # Missing or empty files
             "current_file": None,
             "is_running": False,
             "last_error": None,
@@ -2288,6 +2293,7 @@ class MemoryService:
                     for file_path, score in priority_queue:
                         if self._summarizer._should_skip_file(file_path):
                             skipped_count += 1
+                            self._summarization_stats["files_skipped_pattern"] += 1
                             continue
                         await self._summary_queue.put((-score, codebase.name, file_path, str(codebase_path)))
                         total_queued += 1
@@ -2306,6 +2312,7 @@ class MemoryService:
                     for file_path in indexed_files.keys():
                         if self._summarizer._should_skip_file(file_path):
                             skipped_count += 1
+                            self._summarization_stats["files_skipped_pattern"] += 1
                             continue
                         await self._summary_queue.put((0.5, codebase.name, file_path, str(codebase_path)))
                         total_queued += 1
@@ -2316,6 +2323,7 @@ class MemoryService:
                 logger.info(f"[Summarization] Queued {total_queued} files from {codebase.name}")
             
             self._summarization_stats["files_queued"] = total_queued
+            self._summarization_stats["files_total_queued"] = total_queued
             
             if total_queued == 0:
                 logger.warning("[Summarization] No files queued for summarization")
@@ -2352,21 +2360,35 @@ class MemoryService:
         """
         Background task that summarizes files in priority order.
         
-        This runs continuously, processing files from the queue.
+        This runs continuously, processing files from the queue sequentially.
         It yields to active queries to avoid impacting search latency.
-        Supports parallel processing via max_concurrent_summarizations config.
         """
-        max_concurrent = self._summarization_config.max_concurrent_summarizations
-        logger.info(f"[Summarization] Background summarizer started (max_concurrent={max_concurrent})")
+        logger.info("[Summarization] Background summarizer started (sequential processing)")
         self._summarization_stats["is_running"] = True
         
-        # Semaphore to limit concurrent LLM requests
-        semaphore = asyncio.Semaphore(max_concurrent)
-        
-        async def process_with_tracking(priority, codebase_name, file_path, codebase_path):
-            """Process a single file with stats tracking and rate limiting."""
-            async with semaphore:
-                # Update current file (note: shows most recent when parallel)
+        while True:
+            # Yield to active queries - don't summarize while searches are happening
+            if self._query_active.is_set():
+                await asyncio.sleep(0.1)
+                continue
+            
+            try:
+                # Get next file from queue
+                try:
+                    file_data = await asyncio.wait_for(
+                        self._summary_queue.get(),
+                        timeout=5.0
+                    )
+                except asyncio.TimeoutError:
+                    # No files in queue
+                    if self._summary_queue.empty():
+                        logger.info("[Summarization] Queue empty, background summarizer idle")
+                        await asyncio.sleep(5.0)
+                    continue
+                
+                priority, codebase_name, file_path, codebase_path = file_data
+                
+                # Update current file
                 self._summarization_stats["current_file"] = file_path
                 
                 try:
@@ -2384,22 +2406,13 @@ class MemoryService:
                             self._summarization_stats["total_time_seconds"] / completed_count
                         )
                         
-                        # Calculate estimated time remaining
-                        # With parallel processing, effective time per file is divided by concurrency
+                        # Calculate estimated time remaining (sequential)
                         remaining_files = self._summary_queue.qsize()
-                        if max_concurrent > 1:
-                            # Parallel: files complete faster but rate limit still applies per file
-                            avg_time_per_slot = self._summarization_stats["avg_time_per_file"] / max_concurrent
-                            batches_remaining = (remaining_files + max_concurrent - 1) // max_concurrent
-                            est_time = batches_remaining * (avg_time_per_slot + self._summarization_config.rate_limit_seconds)
-                        else:
-                            # Sequential: original calculation
-                            avg_time_with_rate_limit = (
-                                self._summarization_stats["avg_time_per_file"] + 
-                                self._summarization_config.rate_limit_seconds
-                            )
-                            est_time = avg_time_with_rate_limit * remaining_files
-                        
+                        avg_time_with_rate_limit = (
+                            self._summarization_stats["avg_time_per_file"] + 
+                            self._summarization_config.rate_limit_seconds
+                        )
+                        est_time = avg_time_with_rate_limit * remaining_files
                         self._summarization_stats["estimated_time_remaining"] = est_time
                         
                         # Log progress periodically
@@ -2420,41 +2433,6 @@ class MemoryService:
                     self._summary_queue.task_done()
                     # Rate limit after each file
                     await asyncio.sleep(self._summarization_config.rate_limit_seconds)
-        
-        while True:
-            # Yield to active queries - don't summarize while searches are happening
-            if self._query_active.is_set():
-                await asyncio.sleep(0.1)
-                continue
-            
-            try:
-                # Collect a batch of files to process in parallel
-                batch = []
-                for _ in range(max_concurrent):
-                    try:
-                        file_data = await asyncio.wait_for(
-                            self._summary_queue.get(),
-                            timeout=0.1 if batch else 5.0  # Short timeout if we have files, long if empty
-                        )
-                        batch.append(file_data)
-                    except asyncio.TimeoutError:
-                        break  # No more files available right now
-                
-                if not batch:
-                    # No files in queue
-                    if self._summary_queue.empty():
-                        logger.info("[Summarization] Queue empty, background summarizer idle")
-                        await asyncio.sleep(5.0)
-                    continue
-                
-                # Process batch in parallel
-                tasks = [
-                    asyncio.create_task(process_with_tracking(*file_data))
-                    for file_data in batch
-                ]
-                
-                # Wait for all tasks in batch to complete
-                await asyncio.gather(*tasks, return_exceptions=True)
                 
             except asyncio.CancelledError:
                 logger.info("[Summarization] Background summarizer stopped")
@@ -2484,15 +2462,18 @@ class MemoryService:
         full_path = Path(codebase_path) / file_path
         if not full_path.exists():
             logger.debug(f"[Summarization] Skipping missing file: {file_path}")
+            self._summarization_stats["files_skipped_empty"] += 1
             return (False, 0.0)
         
         try:
             content = full_path.read_text(encoding='utf-8', errors='ignore')
         except Exception as e:
             logger.debug(f"[Summarization] Failed to read {file_path}: {e}")
+            self._summarization_stats["files_skipped_empty"] += 1
             return (False, 0.0)
         
         if not content.strip():
+            self._summarization_stats["files_skipped_empty"] += 1
             return (False, 0.0)
         
         # Compute content hash for incremental tracking
@@ -2503,6 +2484,7 @@ class MemoryService:
         if vector_store and not vector_store.summary_index.needs_resummarization(file_path, content_hash):
             logger.debug(f"[Summarization] Skipping (unchanged): {file_path}")
             self._summarization_stats["files_skipped"] = self._summarization_stats.get("files_skipped", 0) + 1
+            self._summarization_stats["files_skipped_unchanged"] += 1
             return (False, 0.0)
         
         # Get heuristic metadata if available
@@ -2655,15 +2637,31 @@ Dependencies: {dependencies}"""
         avg_time_with_rate_limit = avg_time_per_file + self._summarization_config.rate_limit_seconds
         estimated_time_remaining = avg_time_with_rate_limit * files_queued
         
+        # Calculate progress
+        files_completed = self._summarization_stats["files_summarized"]
+        files_failed = self._summarization_stats["files_failed"]
+        files_skipped_total = self._summarization_stats.get("files_skipped", 0)
+        files_total_queued = self._summarization_stats.get("files_total_queued", 0)
+        
+        # Progress calculation: (completed + failed + skipped) / total_originally_queued
+        files_processed = files_completed + files_failed + files_skipped_total
+        progress_percentage = (files_processed / files_total_queued * 100.0) if files_total_queued > 0 else 0.0
+        
         return {
             "enabled": self._summarization_config.enabled,
             "llm_enabled": self._summarization_config.llm_enabled,
             "model": self._summarization_config.model,
             "is_running": self._summarization_stats["is_running"],
             "files_queued": files_queued,
-            "files_completed": self._summarization_stats["files_summarized"],
-            "files_skipped": self._summarization_stats.get("files_skipped", 0),
-            "files_failed": self._summarization_stats["files_failed"],
+            "files_completed": files_completed,
+            "files_failed": files_failed,
+            "files_skipped": files_skipped_total,
+            "files_skipped_pattern": self._summarization_stats.get("files_skipped_pattern", 0),
+            "files_skipped_unchanged": self._summarization_stats.get("files_skipped_unchanged", 0),
+            "files_skipped_empty": self._summarization_stats.get("files_skipped_empty", 0),
+            "files_total_queued": files_total_queued,
+            "files_processed": files_processed,
+            "progress_percentage": progress_percentage,
             "total_summarized": total_summarized,
             "current_file": self._summarization_stats["current_file"],
             "last_error": self._summarization_stats["last_error"],
@@ -2709,6 +2707,8 @@ Dependencies: {dependencies}"""
         # Queue with negative priority (PriorityQueue uses min-first)
         await self._summary_queue.put((-priority, codebase_name, file_path, codebase_path))
         self._summarization_stats["files_queued"] = self._summary_queue.qsize()
+        # Update total queued for individual file additions
+        self._summarization_stats["files_total_queued"] += 1
         
         logger.info(f"[Summarization] Queued for re-summarization: {file_path}")
         return True
@@ -2824,6 +2824,7 @@ Dependencies: {dependencies}"""
                 # Skip if file matches skip pattern
                 if self._summarizer._should_skip_file(file_path):
                     files_skipped += 1
+                    self._summarization_stats["files_skipped_pattern"] += 1
                     continue
                 
                 # Skip if already summarized and only_missing=True
@@ -2842,6 +2843,7 @@ Dependencies: {dependencies}"""
                 # Skip if file matches skip pattern
                 if self._summarizer._should_skip_file(file_path):
                     files_skipped += 1
+                    self._summarization_stats["files_skipped_pattern"] += 1
                     continue
                 
                 # Skip if already summarized and only_missing=True  
@@ -2854,6 +2856,9 @@ Dependencies: {dependencies}"""
         
         # Update queue size stat
         self._summarization_stats["files_queued"] = self._summary_queue.qsize()
+        # Update total queued if this is adding new files
+        if files_queued > 0:
+            self._summarization_stats["files_total_queued"] += files_queued
         
         logger.info(
             f"[Summarization] Queued {files_queued} files from {codebase_name} "
