@@ -236,6 +236,45 @@ ollama pull qwen2.5-coder:1.5b
 - Change the port in config.json
 - Or kill the existing process: `lsof -ti:9820 | xargs kill`
 
+#### Segmentation fault on Apple Silicon (M1/M2/M3/M4)
+If you see `zsh: segmentation fault` when starting the server, this is caused by known PyTorch MPS (Metal Performance Shaders) issues:
+- Race conditions in the MPS backend ([pytorch#167541](https://github.com/pytorch/pytorch/pull/167541))
+- OpenMP conflicts on M4 chips ([pytorch#161865](https://github.com/pytorch/pytorch/issues/161865))
+
+**Solutions (in order of preference):**
+
+1. **Update PyTorch to 2.5+** (best fix - includes many MPS stability improvements):
+   ```bash
+   pip install --upgrade torch
+   ```
+
+2. **Force CPU mode** (reliable workaround):
+   ```bash
+   export CONDUCTOR_MEMORY_FORCE_CPU=1
+   conductor-memory-sse --port 9820
+   ```
+   
+   To make this permanent, add to your `~/.zshrc` or `~/.bashrc`:
+   ```bash
+   export CONDUCTOR_MEMORY_FORCE_CPU=1
+   ```
+
+3. **Set device to CPU in config.json**:
+   ```json
+   {
+     "device": "cpu"
+   }
+   ```
+
+4. **Use smaller batch sizes** (may help with intermittent crashes):
+   ```json
+   {
+     "embedding_batch_size": 32
+   }
+   ```
+
+**Note:** The CPU fallback is only ~20-30% slower for embedding operations since the MiniLM model is small. For most codebases, indexing will complete in a similar timeframe.
+
 ### Getting Help
 
 - **Issues**: https://github.com/jltx/conductor-memory/issues

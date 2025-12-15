@@ -175,6 +175,11 @@ class ResourceDetector:
     
     def _detect_mps_gpu(self) -> Optional[GPUInfo]:
         """Detect Apple Silicon GPU via PyTorch MPS"""
+        # Check if user wants to force CPU (common workaround for MPS segfaults)
+        if os.environ.get('CONDUCTOR_MEMORY_FORCE_CPU', '').lower() in ('1', 'true', 'yes'):
+            logger.info("CONDUCTOR_MEMORY_FORCE_CPU is set, skipping MPS detection")
+            return None
+        
         try:
             import torch
             if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
@@ -187,6 +192,20 @@ class ResourceDetector:
                     estimated_gpu_mem = total_ram * 0.6
                 except ImportError:
                     estimated_gpu_mem = 8.0  # Conservative default
+                
+                # Perform a quick stability test - MPS can segfault on some configs
+                try:
+                    test_tensor = torch.randn(10, 10, device='mps')
+                    _ = test_tensor @ test_tensor.T
+                    del test_tensor
+                    if hasattr(torch.mps, 'empty_cache'):
+                        torch.mps.empty_cache()
+                except Exception as e:
+                    logger.warning(
+                        f"MPS stability test failed: {e}. "
+                        f"Falling back to CPU. Set CONDUCTOR_MEMORY_FORCE_CPU=1 to suppress this warning."
+                    )
+                    return None
                 
                 return GPUInfo(
                     device_type=DeviceType.MPS,
@@ -229,21 +248,39 @@ class ResourceDetector:
             resources.recommended_device = resources.gpu.device_type.value
             gpu_mem = resources.gpu.memory_gb
             
-            # Embedding batch size based on GPU memory
-            # MiniLM models are small, can handle large batches
-            if gpu_mem >= 20:      # RTX 4090, A100, etc.
-                resources.recommended_embedding_batch_size = 512
-            elif gpu_mem >= 10:    # RTX 3080, etc.
-                resources.recommended_embedding_batch_size = 256
-            elif gpu_mem >= 6:     # RTX 3060, GTX 1660, etc.
-                resources.recommended_embedding_batch_size = 128
-            elif gpu_mem >= 4:     # GTX 1650, Apple M1, etc.
-                resources.recommended_embedding_batch_size = 64
+            # MPS (Apple Silicon) needs more conservative settings due to:
+            # - Race conditions in the MPS backend (pytorch/pytorch#167541)
+            # - OpenMP conflicts on newer chips (pytorch/pytorch#161865)
+            # - Threading issues with Metal Performance Shaders
+            if resources.gpu.device_type == DeviceType.MPS:
+                # Use smaller batch sizes for MPS stability
+                # Even with lots of unified memory, MPS has threading issues
+                if gpu_mem >= 16:     # M1 Max/Ultra, M2 Max/Ultra, M3 Max/Ultra, M4 Max
+                    resources.recommended_embedding_batch_size = 64
+                elif gpu_mem >= 8:    # M1 Pro, M2 Pro, M3 Pro, M4 Pro
+                    resources.recommended_embedding_batch_size = 48
+                else:                 # M1, M2, M3, M4 base
+                    resources.recommended_embedding_batch_size = 32
+                
+                # MPS index batch size - keep smaller to avoid issues
+                resources.recommended_index_batch_size = 30
             else:
-                resources.recommended_embedding_batch_size = 32
-            
-            # Index batch size (files per batch) - GPU can handle more
-            resources.recommended_index_batch_size = 50
+                # CUDA/ROCm - can use larger batches
+                # Embedding batch size based on GPU memory
+                # MiniLM models are small, can handle large batches
+                if gpu_mem >= 20:      # RTX 4090, A100, etc.
+                    resources.recommended_embedding_batch_size = 512
+                elif gpu_mem >= 10:    # RTX 3080, etc.
+                    resources.recommended_embedding_batch_size = 256
+                elif gpu_mem >= 6:     # RTX 3060, GTX 1660, etc.
+                    resources.recommended_embedding_batch_size = 128
+                elif gpu_mem >= 4:     # GTX 1650, etc.
+                    resources.recommended_embedding_batch_size = 64
+                else:
+                    resources.recommended_embedding_batch_size = 32
+                
+                # Index batch size (files per batch) - GPU can handle more
+                resources.recommended_index_batch_size = 50
         
         else:
             # CPU-only mode
