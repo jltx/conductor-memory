@@ -16,6 +16,7 @@ from .verification import (
     matches_any,
     calculate_relevance,
 )
+from .call_graph import MethodNode, MethodCallGraph, CallGraphBuilder
 
 __all__ = [
     "HybridSearcher", "BM25Index", "SearchMode", "HybridSearchResult",
@@ -24,4 +25,5 @@ __all__ = [
     "SubjectInfo", "VerificationInfo", "VerificationResult",
     "parse_verification_query", "extract_key_terms", "is_verification_query",
     "find_evidence", "matches_any", "calculate_relevance",
+    "MethodNode", "MethodCallGraph", "CallGraphBuilder",
 ]

@@ -371,19 +371,40 @@ class HybridSearcher:
         has_snake_case = bool(re.search(r'[a-z]_[a-z]', query))
         has_exact_quotes = '"' in query or "'" in query
         
+        # Check for other code patterns
+        has_dunder_methods = bool(re.search(r'__\w+__', query))  # __init__, __str__, etc.
+        has_dot_notation = '.' in query and not query.endswith('.')  # self.attr, obj.method
+        has_all_caps = query.isupper() and len(query) > 1  # RSI, API, etc.
+        
+        # Check for short technical identifiers (likely acronyms or abbreviations)
+        is_short_identifier = (len(query) <= 5 and 
+                              query.isalpha() and 
+                              query not in ['how', 'what', 'why', 'when', 'where', 'which', 'like'])
+        
+        # Check for Python/code keywords
+        code_keywords = ['def', 'class', 'import', 'from', 'if', 'else', 'elif', 'for', 'while', 
+                        'try', 'except', 'finally', 'with', 'as', 'return', 'yield', 'lambda',
+                        'self', 'cls', 'super', 'None', 'True', 'False', 'and', 'or', 'not',
+                        'in', 'is', 'async', 'await', 'global', 'nonlocal']
+        query_lower = query.lower()
+        is_code_keyword = query_lower in code_keywords
+        
         # Check for conceptual keywords
         conceptual_words = ['how', 'what', 'why', 'when', 'where', 'which', 
                           'explain', 'describe', 'pattern', 'approach', 
                           'related to', 'similar to', 'like']
-        query_lower = query.lower()
         is_conceptual = any(word in query_lower for word in conceptual_words)
         
-        # Decision logic
+        # Decision logic (prioritize exact code matching)
         if has_exact_quotes:
             return SearchMode.KEYWORD
-        elif (has_camel_case or has_snake_case) and not is_conceptual:
+        elif has_dunder_methods or is_code_keyword or has_all_caps:
             return SearchMode.KEYWORD
-        elif is_conceptual and not (has_camel_case or has_snake_case):
+        elif is_short_identifier and not is_conceptual:
+            return SearchMode.KEYWORD
+        elif (has_camel_case or has_snake_case or has_dot_notation) and not is_conceptual:
+            return SearchMode.KEYWORD
+        elif is_conceptual and not (has_camel_case or has_snake_case or has_dot_notation):
             return SearchMode.SEMANTIC
         else:
             return SearchMode.HYBRID

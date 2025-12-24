@@ -25,6 +25,7 @@ from ..core.models import MemoryChunk, RoleEnum, MemoryType
 from ..core.resources import detect_resources, get_optimal_device, SystemResources
 from ..embedding.sentence_transformer import SentenceTransformerEmbedder
 from ..search.hybrid import HybridSearcher, SearchMode
+from ..search.call_graph import MethodCallGraph, CallGraphBuilder
 from ..search.verification import (
     parse_verification_query,
     find_evidence,
@@ -127,6 +128,10 @@ class MemoryService:
         self.heuristic_extractor = HeuristicExtractor()
         self._import_graphs: Dict[str, ImportGraph] = {}  # One per codebase
         
+        # Phase 4: Method call graph for tracking method-to-method relationships
+        self._call_graphs: Dict[str, MethodCallGraph] = {}  # One per codebase
+        self._call_graph_builders: Dict[str, CallGraphBuilder] = {}  # Builders for incremental construction
+        
         # Phase 4: Background summarization
         self._summarization_config = config.summarization_config
         self._summarizer: Optional[FileSummarizer] = None
@@ -180,6 +185,10 @@ class MemoryService:
         }
         # Initialize import graph for this codebase
         self._import_graphs[codebase.name] = ImportGraph()
+        
+        # Initialize call graph and builder for this codebase
+        self._call_graphs[codebase.name] = MethodCallGraph()
+        self._call_graph_builders[codebase.name] = CallGraphBuilder(self._call_graphs[codebase.name])
     
     def _register_indexing_completion_callback(self, callback):
         """Register a callback to be called when all indexing is complete"""
@@ -990,6 +999,11 @@ class MemoryService:
         self._indexing_status[codebase_name]["files_processed"] = 0
         self._indexing_status[codebase_name]["total_files"] = 0
         
+        # Reset call graph for rebuild
+        if codebase_name in self._call_graphs:
+            self._call_graphs[codebase_name].clear()
+            self._call_graph_builders[codebase_name] = CallGraphBuilder(self._call_graphs[codebase_name])
+        
         # Start re-indexing
         await self._index_codebase(codebase)
         
@@ -1411,6 +1425,18 @@ class MemoryService:
             except Exception as e:
                 logger.warning(f"[{codebase.name}] Failed to calculate import graph centrality: {e}")
             
+            # Log call graph statistics
+            try:
+                call_graph = self._call_graphs[codebase.name]
+                call_graph_stats = call_graph.get_stats()
+                if call_graph_stats["total_methods"] > 0:
+                    logger.info(
+                        f"[{codebase.name}] Built call graph: {call_graph_stats['total_methods']} methods, "
+                        f"{call_graph_stats['total_edges']} call edges"
+                    )
+            except Exception as e:
+                logger.debug(f"[{codebase.name}] Failed to get call graph stats: {e}")
+            
             # Final summary
             self._print_progress_complete(
                 codebase.name,
@@ -1473,6 +1499,11 @@ class MemoryService:
                     # Add to import graph for centrality calculation
                     import_graph = self._import_graphs[codebase.name]
                     import_graph.add_file(relative_path, heuristic_metadata.imports)
+                    
+                    # Phase 4: Build call graph from method implementation details
+                    if heuristic_metadata.method_details:
+                        call_graph_builder = self._call_graph_builders[codebase.name]
+                        call_graph_builder.build_from_heuristics(relative_path, heuristic_metadata)
             except Exception as e:
                 logger.debug(f"[{codebase.name}] Heuristic extraction failed for {relative_path}: {e}")
             
@@ -3662,6 +3693,166 @@ Dependencies: {dependencies}"""
             return None
         
         return self._import_graphs[codebase].export_graph(format)
+    
+    # ─────────────────────────────────────────────────────────────────────────
+    # Phase 4: Method Call Graph API
+    # ─────────────────────────────────────────────────────────────────────────
+    
+    def get_call_graph(self, codebase: str) -> Optional[MethodCallGraph]:
+        """
+        Get the method call graph for a codebase.
+        
+        The call graph tracks method-to-method relationships extracted from
+        AST analysis during indexing. Use this for advanced queries like
+        finding all callers of a method or tracing call paths.
+        
+        Args:
+            codebase: Name of the codebase
+            
+        Returns:
+            MethodCallGraph if the codebase exists and has a call graph, None otherwise
+        """
+        return self._call_graphs.get(codebase)
+    
+    def get_method_callers(self, method_name: str, codebase: str) -> List[Dict[str, Any]]:
+        """
+        Get all methods that call the specified method.
+        
+        This answers "what calls X?" queries by looking up the reverse edges
+        in the call graph.
+        
+        Args:
+            method_name: The method name to find callers for. Can be:
+                - Simple name: "process_data" - matches any method with this name
+                - Qualified name: "MyClass.process_data" - matches exact qualified name
+            codebase: Name of the codebase to search in
+            
+        Returns:
+            List of dicts with caller information, each containing:
+                - qualified_name: Full qualified name (e.g., "MyClass.caller_method")
+                - method_name: Just the method name
+                - class_name: Containing class (if any)
+                - file_path: Path to source file
+                - line_number: Line where method is defined
+            
+        Example:
+            >>> callers = service.get_method_callers("fit", "my-codebase")
+            >>> for caller in callers:
+            ...     print(f"{caller['qualified_name']} in {caller['file_path']}")
+        """
+        call_graph = self._call_graphs.get(codebase)
+        if not call_graph:
+            return []
+        
+        # Find matching methods (support both simple and qualified names)
+        matching_qualified_names = []
+        
+        if '.' in method_name:
+            # Already qualified - look for exact match
+            if method_name in call_graph.nodes:
+                matching_qualified_names.append(method_name)
+        else:
+            # Simple name - find all methods with this name
+            for qname, node in call_graph.nodes.items():
+                if node.method_name == method_name:
+                    matching_qualified_names.append(qname)
+        
+        # Collect all callers for matching methods
+        all_callers: List[Dict[str, Any]] = []
+        seen_callers = set()
+        
+        for qname in matching_qualified_names:
+            callers = call_graph.get_callers(qname)
+            for caller in callers:
+                if caller.qualified_name not in seen_callers:
+                    seen_callers.add(caller.qualified_name)
+                    all_callers.append(caller.to_dict())
+        
+        return all_callers
+    
+    def get_method_callees(self, method_name: str, codebase: str) -> List[Dict[str, Any]]:
+        """
+        Get all methods called by the specified method.
+        
+        This answers "what does X call?" queries by looking up the forward edges
+        in the call graph.
+        
+        Args:
+            method_name: The method name to find callees for. Can be:
+                - Simple name: "process_data" - matches any method with this name
+                - Qualified name: "MyClass.process_data" - matches exact qualified name
+            codebase: Name of the codebase to search in
+            
+        Returns:
+            List of dicts with callee information, each containing:
+                - qualified_name: Full qualified name (e.g., "MyClass.helper_method")
+                - method_name: Just the method name
+                - class_name: Containing class (if any)
+                - file_path: Path to source file
+                - line_number: Line where method is defined
+            
+        Example:
+            >>> callees = service.get_method_callees("process_data", "my-codebase")
+            >>> for callee in callees:
+            ...     print(f"Calls {callee['qualified_name']}")
+        """
+        call_graph = self._call_graphs.get(codebase)
+        if not call_graph:
+            return []
+        
+        # Find matching methods (support both simple and qualified names)
+        matching_qualified_names = []
+        
+        if '.' in method_name:
+            # Already qualified - look for exact match
+            if method_name in call_graph.nodes:
+                matching_qualified_names.append(method_name)
+        else:
+            # Simple name - find all methods with this name
+            for qname, node in call_graph.nodes.items():
+                if node.method_name == method_name:
+                    matching_qualified_names.append(qname)
+        
+        # Collect all callees for matching methods
+        all_callees: List[Dict[str, Any]] = []
+        seen_callees = set()
+        
+        for qname in matching_qualified_names:
+            callees = call_graph.get_callees(qname)
+            for callee in callees:
+                if callee.qualified_name not in seen_callees:
+                    seen_callees.add(callee.qualified_name)
+                    all_callees.append(callee.to_dict())
+        
+        return all_callees
+    
+    def get_call_graph_stats(self, codebase: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Get call graph statistics for a codebase.
+        
+        Args:
+            codebase: Codebase name (None = all codebases)
+            
+        Returns:
+            Dictionary with call graph statistics including:
+                - total_methods: Number of method nodes
+                - total_edges: Number of call relationships
+                - methods_with_callers: Methods that are called by others
+                - methods_with_callees: Methods that call others
+                - isolated_methods: Methods with no call relationships
+        """
+        if codebase:
+            call_graph = self._call_graphs.get(codebase)
+            if call_graph:
+                return {codebase: call_graph.get_stats()}
+            else:
+                return {codebase: {"error": "Codebase not found"}}
+        else:
+            # Return stats for all codebases
+            return {
+                name: graph.get_stats() 
+                for name, graph in self._call_graphs.items()
+            }
     
     # ─────────────────────────────────────────────────────────────────────────
     # Summary Validation API

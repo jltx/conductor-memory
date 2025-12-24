@@ -6,7 +6,7 @@ This file defines how AI coding assistants should leverage the conductor-memory 
 
 | Tool | Purpose | Key Features |
 |------|---------|--------------|
-| `memory_search` | Advanced semantic/keyword search with filtering | Heuristic filtering, summary integration, relevance boosting |
+| `memory_search` | Advanced semantic/keyword search with filtering | Heuristic filtering, summary integration, relevance boosting, **verification mode** |
 | `memory_store` | Store conversation context for later retrieval | Tagging, pinning, source tracking |
 | `memory_store_decision` | Store architectural decisions (auto-pinned) | Structured decision format, permanent storage |
 | `memory_store_lesson` | Store debugging insights/lessons learned (auto-pinned) | Problem-solution format, searchable |
@@ -15,6 +15,10 @@ This file defines how AI coding assistants should leverage the conductor-memory 
 | `memory_reindex_codebase` | Force reindexing of specific codebase | Refresh metadata, update heuristics |
 | `memory_delete` | Remove outdated memories by ID | Cleanup, maintenance |
 | `memory_prune` | Clean up old unpinned memories | Bulk cleanup by age |
+| `memory_method_relationships` | **NEW:** Query method call relationships | Find callers/callees, call chains, transitive dependencies |
+| `memory_file_centrality` | Get files sorted by importance | PageRank-based centrality for prioritization |
+| `memory_file_dependencies` | Get imports/imported_by for a file | Dependency analysis |
+| `memory_import_graph_stats` | Get import graph statistics | File counts, edges, centrality info |
 
 ## Search Strategy: Tiered Approach
 
@@ -299,6 +303,60 @@ Track summarization progress with time estimates:
 memory_summarization_status()  # Returns timing estimates and queue status
 ```
 
+### Verification Search Mode (NEW)
+Use `search_mode="verify"` for "does X use pattern Y?" queries:
+```
+memory_search(
+    query="verify _generate_features uses window-relative bar_index for DataFrame access",
+    search_mode="verify"
+)
+```
+
+Returns structured verification result:
+```json
+{
+  "search_mode": "verify",
+  "subject": {"name": "_generate_features", "file": "src/strategy.py", "found": true},
+  "verification": {
+    "status": "SUPPORTED",
+    "confidence": 0.92,
+    "evidence": [{"type": "subscript_access", "detail": "df.iloc[bar_index]", "line": 631}]
+  },
+  "summary": "VERIFIED: _generate_features uses bar_index as window-relative index."
+}
+```
+
+Supported query patterns:
+- `"verify X uses Y"`, `"does X use Y"`, `"is X using Y"`
+- `"does X call Y"`, `"does X access Y"`, `"does X have Y"`
+- `"check if X ..."`, `"confirm X ..."`
+
+### Method Call Graph (NEW)
+Query method-to-method relationships using `memory_method_relationships`:
+```
+memory_method_relationships(
+    method="_generate_features",
+    codebase="options-ml-trader",
+    relationship="all"  # "callers", "callees", or "all"
+)
+```
+
+Returns:
+```json
+{
+  "method": "_generate_features",
+  "codebase": "options-ml-trader",
+  "callers": [{"name": "SwingStrategy.run", "file": "src/strategy.py", "line": 45}],
+  "callees": [{"name": "FeatureGenerator.fit", "file": "src/features.py", "line": 123}],
+  "stats": {"caller_count": 1, "callee_count": 1}
+}
+```
+
+Use cases:
+- **Find what calls a method**: `relationship="callers"`
+- **Find what a method calls**: `relationship="callees"`
+- **Understand call chains**: Combine with transitive queries
+
 ## Next Features (Roadmap)
 
 ### Conversation Memory Integration
@@ -307,11 +365,11 @@ memory_summarization_status()  # Returns timing estimates and queue status
 - **Learning Integration**: Connect debugging sessions to code improvements
 
 ### Enhanced Search Intelligence  
-- **Semantic Code Relationships**: Understand function call graphs and dependencies
+- ~~**Semantic Code Relationships**: Understand function call graphs and dependencies~~ ✅ IMPLEMENTED (Phase 4)
 - **Pattern Recognition**: Identify similar code patterns across codebases
 - **Change Impact Analysis**: Predict which files might be affected by changes
 
 ### Advanced Summarization
 - **Incremental Updates**: Smart re-summarization when files change
-- **Cross-File Context**: Summaries that understand file relationships
+- ~~**Cross-File Context**: Summaries that understand file relationships~~ ✅ IMPLEMENTED (Phase 2 - method_summaries)
 - **Custom Prompts**: Domain-specific summarization strategies

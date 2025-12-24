@@ -3388,6 +3388,145 @@ async def memory_queue_codebase_summarization(
         return {"error": f"Failed to queue codebase '{codebase}' for summarization: {str(e)}"}
 
 
+@mcp.tool()
+async def memory_method_relationships(
+    method: str,
+    codebase: str | None = None,
+    relationship: str = "all"
+) -> dict[str, Any]:
+    """
+    Query method call relationships (callers and callees) for a specific method.
+    
+    This enables "what calls X?" and "what does X call?" queries using the
+    method call graph built during indexing.
+    
+    Args:
+        method: The method name to query. Can be:
+            - Simple name: "process_data" - matches any method with this name
+            - Qualified name: "MyClass.process_data" - matches exact qualified name
+        codebase: Codebase to search in (None = uses first/default codebase)
+        relationship: Type of relationships to return:
+            - "callers": Only methods that call this method
+            - "callees": Only methods called by this method
+            - "all" (default): Both callers and callees
+    
+    Returns:
+        Dictionary with:
+        - method: The queried method name
+        - codebase: The codebase searched
+        - callers: List of calling methods (if relationship is "callers" or "all")
+        - callees: List of called methods (if relationship is "callees" or "all")
+        - stats: Summary counts (caller_count, callee_count)
+        
+        Each caller/callee entry contains:
+        - name: The qualified method name
+        - file: Path to the source file
+        - line: Line number where method is defined
+        - class_name: Containing class (if any)
+    
+    Example:
+        # Find what calls _generate_features
+        memory_method_relationships(
+            method="_generate_features",
+            codebase="options-ml-trader",
+            relationship="callers"
+        )
+        
+        # Find what process_data calls
+        memory_method_relationships(
+            method="MyClass.process_data",
+            relationship="callees"
+        )
+    """
+    if not memory_service:
+        return {"error": "Memory service not initialized"}
+    
+    # Validate relationship parameter
+    valid_relationships = {"callers", "callees", "all"}
+    if relationship not in valid_relationships:
+        return {
+            "error": f"Invalid relationship '{relationship}'. Must be one of: {', '.join(valid_relationships)}"
+        }
+    
+    # Determine codebase to use
+    target_codebase = codebase
+    if not target_codebase:
+        # Use first available codebase
+        codebases = memory_service.list_codebases()
+        if not codebases:
+            return {"error": "No codebases configured"}
+        target_codebase = codebases[0]["name"]
+    
+    # Check if codebase exists and has a call graph
+    call_graph = memory_service.get_call_graph(target_codebase)
+    if not call_graph:
+        return {
+            "error": f"No call graph available for codebase '{target_codebase}'. "
+                     "The codebase may not be indexed yet or has no method details."
+        }
+    
+    # Build the response
+    result: dict[str, Any] = {
+        "method": method,
+        "codebase": target_codebase,
+        "stats": {}
+    }
+    
+    # Get callers if requested
+    if relationship in ("callers", "all"):
+        callers_raw = memory_service.get_method_callers(method, target_codebase)
+        callers = [
+            {
+                "name": c["qualified_name"],
+                "file": c["file_path"],
+                "line": c["line_number"],
+                "class_name": c.get("class_name")
+            }
+            for c in callers_raw
+        ]
+        result["callers"] = callers
+        result["stats"]["caller_count"] = len(callers)
+    
+    # Get callees if requested
+    if relationship in ("callees", "all"):
+        callees_raw = memory_service.get_method_callees(method, target_codebase)
+        callees = [
+            {
+                "name": c["qualified_name"],
+                "file": c["file_path"],
+                "line": c["line_number"],
+                "class_name": c.get("class_name")
+            }
+            for c in callees_raw
+        ]
+        result["callees"] = callees
+        result["stats"]["callee_count"] = len(callees)
+    
+    # Check if method was found at all
+    callers_count = result["stats"].get("caller_count", 0)
+    callees_count = result["stats"].get("callee_count", 0)
+    
+    if callers_count == 0 and callees_count == 0:
+        # Method might not exist or might be isolated
+        # Check if it exists in the graph
+        method_exists = False
+        if '.' in method:
+            method_exists = call_graph.get_node(method) is not None
+        else:
+            # Check for any method with this name
+            for node in call_graph.nodes.values():
+                if node.method_name == method:
+                    method_exists = True
+                    break
+        
+        if not method_exists:
+            result["warning"] = f"Method '{method}' not found in call graph for '{target_codebase}'"
+        else:
+            result["info"] = f"Method '{method}' exists but has no recorded call relationships"
+    
+    return result
+
+
 def main():
     """Main entry point for SSE MCP server"""
     global memory_service
