@@ -163,6 +163,124 @@ The server will be available at:
 - **MCP endpoint**: http://localhost:9820/sse
 - **Health check**: http://localhost:9820/health
 
+## Windows Service Installation
+
+For production use on Windows, you can install conductor-memory as a Windows service that starts automatically on boot.
+
+### Option 1: NSSM (Recommended)
+
+NSSM (Non-Sucking Service Manager) is the most reliable way to run Python applications as Windows services.
+
+```powershell
+# Run PowerShell as Administrator
+cd path\to\conductor-memory
+
+# Install and start the service (auto-downloads NSSM if needed)
+.\scripts\install-service-nssm.ps1
+
+# Check status
+.\scripts\install-service-nssm.ps1 -Status
+
+# Stop/Start/Uninstall
+.\scripts\install-service-nssm.ps1 -Stop
+.\scripts\install-service-nssm.ps1 -Start
+.\scripts\install-service-nssm.ps1 -Uninstall
+```
+
+The script will automatically:
+- Download NSSM if not installed
+- Configure automatic restart on failure
+- Set up log rotation
+- Start the service
+
+### Option 2: pywin32 (Native)
+
+Uses Python's native Windows service support via pywin32:
+
+```cmd
+# Install pywin32
+pip install conductor-memory[windows-service]
+
+# Run post-install (required once)
+python -m pywin32_postinstall -install
+```
+
+Then install the service:
+
+```powershell
+# Run PowerShell as Administrator
+.\scripts\install-service.ps1
+```
+
+Or manually:
+
+```cmd
+# Run Command Prompt as Administrator
+conductor-memory-service install
+conductor-memory-service start
+```
+
+**Note**: pywin32 can have issues with conda environments. If the service fails to start, use NSSM instead.
+
+### Service Configuration
+
+The Windows service uses the same configuration file as the regular server:
+- `%USERPROFILE%\.conductor-memory\config.json`
+- Or set via `CONDUCTOR_MEMORY_CONFIG` environment variable
+
+### Service Details
+
+| Property | Value |
+|----------|-------|
+| Service Name | `ConductorMemory` |
+| Display Name | `Conductor Memory` |
+| Startup Type | Automatic |
+| Dashboard | `http://127.0.0.1:9820/` |
+| SSE MCP | `http://127.0.0.1:9820/sse` |
+| Log File | `%USERPROFILE%\.conductor-memory\logs\service*.log` |
+
+### Debug Mode
+
+To troubleshoot issues, run the service in foreground debug mode:
+
+```cmd
+conductor-memory-service debug
+```
+
+This runs the service interactively so you can see all output. Press Ctrl+C to stop.
+
+### Log Files
+
+The service logs to:
+- **NSSM**: `%USERPROFILE%\.conductor-memory\logs\service-stdout.log` and `service-stderr.log`
+- **pywin32**: `%USERPROFILE%\.conductor-memory\logs\service.log`
+
+View in Event Viewer:
+```cmd
+eventvwr.msc
+# Navigate to: Windows Logs > Application > Filter by Source: ConductorMemory
+```
+
+### Troubleshooting Windows Service
+
+#### "Access denied" when installing
+- Run PowerShell or Command Prompt as Administrator
+
+#### Service fails to start
+1. Check the log file: `%USERPROFILE%\.conductor-memory\logs\service.log`
+2. Run in debug mode: `conductor-memory-service debug`
+3. Verify config.json is valid JSON
+
+#### "pywin32" not found
+```cmd
+pip install pywin32
+python -m pywin32_postinstall -install
+```
+
+#### Service starts but HTTP API not responding
+- Wait 30-60 seconds for initial codebase indexing
+- Check if ports 9800/9801 are available: `netstat -an | findstr "9800"`
+
 ## Optional: LLM Integration
 
 To enable file summarization with local LLMs:

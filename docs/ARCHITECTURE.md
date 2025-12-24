@@ -11,17 +11,19 @@ Conductor Memory is a semantic memory service designed for AI agent integration.
 │                           Conductor Memory                               │
 ├─────────────────────────────────────────────────────────────────────────┤
 │                                                                          │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐    │
-│  │   HTTP API  │  │ stdio MCP   │  │  SSE MCP    │  │ TCP Bridge  │    │
-│  │  (FastAPI)  │  │  Server     │  │  Server     │  │             │    │
-│  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘    │
-│         │                │                │                │            │
-│         └────────────────┴────────────────┴────────────────┘            │
-│                                   │                                      │
-│                          ┌────────┴────────┐                            │
-│                          │  MemoryService  │                            │
-│                          │  (Orchestrator) │                            │
-│                          └────────┬────────┘                            │
+│  ┌──────────────────────────────┐  ┌─────────────┐                      │
+│  │   SSE Server (port 9820)     │  │ stdio MCP   │                      │
+│  │  - HTTP REST API             │  │  Server     │                      │
+│  │  - SSE MCP endpoint (/sse)   │  │             │                      │
+│  │  - Web Dashboard (/)         │  │             │                      │
+│  └──────────────┬───────────────┘  └──────┬──────┘                      │
+│                 │                         │                              │
+│                 └────────────┬────────────┘                              │
+│                              │                                           │
+│                     ┌────────┴────────┐                                 │
+│                     │  MemoryService  │                                 │
+│                     │  (Orchestrator) │                                 │
+│                     └────────┬────────┘                                 │
 │                                   │                                      │
 │         ┌─────────────────────────┼─────────────────────────┐           │
 │         │                         │                         │           │
@@ -119,22 +121,20 @@ Key methods:
 
 ### Server Layer (`server/`)
 
-**unified.py** - HTTP + TCP MCP server
-- FastAPI REST API on port 9800
-- TCP MCP JSON-RPC on port 9801
-- Single process, both protocols
+**sse.py** - Main SSE MCP server (port 9820)
+- HTTP REST API endpoints
+- SSE MCP endpoint at `/sse`
+- Web dashboard at `/`
+- Long-running service for production use
 
 **stdio.py** - stdio MCP server
-- For spawned process integration (OpenCode)
+- For spawned process integration
 - Uses FastMCP SDK
+- Ideal for local development
 
-**sse.py** - SSE MCP server
-- For remote HTTP connections
-- Long-running service
-
-**bridge.py** - stdio-to-TCP proxy
-- Lightweight process spawned by clients
-- Auto-starts unified server if needed
+**windows_service.py** - Windows Service wrapper
+- Runs SSE server as Windows service
+- Auto-start on boot support
 
 ### Client Layer (`client/`)
 

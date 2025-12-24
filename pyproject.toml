@@ -52,11 +52,14 @@ dev = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
 ]
+windows-service = [
+    "pywin32>=306",
+]
 
 [project.scripts]
-conductor-memory = "conductor_memory.server.unified:main"
+conductor-memory = "conductor_memory.server.sse:main"
 conductor-memory-stdio = "conductor_memory.server.stdio:main"
-conductor-memory-sse = "conductor_memory.server.sse:main"
+conductor-memory-service = "conductor_memory.server.windows_service:main"
 
 [project.urls]
 Homepage = "https://github.com/jltx/conductor-memory"

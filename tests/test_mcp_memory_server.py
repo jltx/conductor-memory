@@ -24,7 +24,7 @@ import json
 class MemoryServerTester:
     """Test suite for MCP Memory Server"""
     
-    def __init__(self, server_url: str = "http://localhost:8000"):
+    def __init__(self, server_url: str = "http://localhost:9820"):
         self.server_url = server_url
         self.server_process: Optional[subprocess.Popen] = None
         
@@ -33,8 +33,8 @@ class MemoryServerTester:
         try:
             cmd = [
                 sys.executable,
-                "-m", "conductor_memory.server.unified",
-                "--http-port", "8000",
+                "-m", "conductor_memory.server.sse",
+                "--port", "9820",
                 "--host", "127.0.0.1",
                 "--log-level", "WARNING"  # Reduce noise during testing
             ]
@@ -343,7 +343,7 @@ def main():
     
     parser = argparse.ArgumentParser(description="Test MCP Memory Server")
     parser.add_argument("--codebase", type=str, help="Path to codebase for indexing test")
-    parser.add_argument("--server-url", type=str, default="http://localhost:8000", help="Memory server URL")
+    parser.add_argument("--server-url", type=str, default="http://localhost:9820", help="Memory server URL")
     
     args = parser.parse_args()
     

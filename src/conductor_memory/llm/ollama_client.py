@@ -134,9 +134,12 @@ class OllamaClient(LLMClient):
                 raise
             raise LLMResponseError(f"Unexpected error calling Ollama: {e}")
     
-    async def health_check(self) -> bool:
+    async def health_check(self, auto_pull: bool = False) -> bool:
         """
         Check if Ollama is available and the model is accessible.
+        
+        Args:
+            auto_pull: If True, automatically pull the model if not found
         
         Returns:
             True if service is healthy and model is available
@@ -161,6 +164,12 @@ class OllamaClient(LLMClient):
                 # Check if our specific model is available
                 if self.model not in available_models:
                     logger.warning(f"Ollama model '{self.model}' not found. Available: {available_models}")
+                    
+                    if auto_pull:
+                        logger.info(f"Attempting to pull model '{self.model}'...")
+                        if await self.pull_model():
+                            return True
+                    
                     return False
                 
                 return True
@@ -168,6 +177,133 @@ class OllamaClient(LLMClient):
         except Exception as e:
             logger.debug(f"Ollama health check failed: {e}")
             return False
+    
+    async def pull_model(self, timeout: float = 600.0) -> bool:
+        """
+        Pull/download the model from Ollama registry.
+        
+        Args:
+            timeout: Maximum time to wait for model download (default 10 minutes)
+            
+        Returns:
+            True if model was pulled successfully
+        """
+        logger.info(f"Pulling Ollama model '{self.model}'... (this may take several minutes)")
+        
+        try:
+            pull_timeout = aiohttp.ClientTimeout(total=timeout)
+            async with aiohttp.ClientSession(timeout=pull_timeout) as session:
+                url = f"{self.base_url}/api/pull"
+                payload = {"name": self.model, "stream": True}
+                
+                async with session.post(url, json=payload) as response:
+                    if response.status != 200:
+                        error_text = await response.text()
+                        logger.error(f"Failed to pull model: {error_text}")
+                        return False
+                    
+                    # Stream the response to show progress
+                    last_status = ""
+                    async for line in response.content:
+                        if line:
+                            try:
+                                data = json.loads(line.decode('utf-8'))
+                                status = data.get("status", "")
+                                
+                                # Log progress updates (but not too frequently)
+                                if status != last_status:
+                                    if "pulling" in status.lower():
+                                        # Extract progress percentage if available
+                                        completed = data.get("completed", 0)
+                                        total = data.get("total", 0)
+                                        if total > 0:
+                                            pct = (completed / total) * 100
+                                            logger.info(f"  Downloading: {pct:.1f}%")
+                                    elif status:
+                                        logger.info(f"  {status}")
+                                    last_status = status
+                                
+                                # Check for completion or error
+                                if data.get("error"):
+                                    logger.error(f"Pull error: {data['error']}")
+                                    return False
+                                    
+                            except json.JSONDecodeError:
+                                continue
+                    
+                    logger.info(f"Successfully pulled model '{self.model}'")
+                    return True
+                    
+        except asyncio.TimeoutError:
+            logger.error(f"Model pull timed out after {timeout}s")
+            return False
+        except Exception as e:
+            logger.error(f"Error pulling model: {e}")
+            return False
+    
+    @staticmethod
+    def check_ollama_installed() -> tuple[bool, str]:
+        """
+        Check if Ollama is installed on the system.
+        
+        Returns:
+            Tuple of (is_installed: bool, message: str)
+        """
+        import shutil
+        import subprocess
+        
+        # Check if ollama command exists
+        ollama_path = shutil.which("ollama")
+        
+        if ollama_path:
+            # Try to get version
+            try:
+                result = subprocess.run(
+                    ["ollama", "--version"], 
+                    capture_output=True, 
+                    text=True, 
+                    timeout=5
+                )
+                version = result.stdout.strip() or result.stderr.strip()
+                return (True, f"Ollama installed: {version}")
+            except Exception:
+                return (True, f"Ollama found at: {ollama_path}")
+        
+        # Not found - provide installation instructions
+        import platform
+        system = platform.system().lower()
+        
+        if system == "windows":
+            install_msg = "Install from: https://ollama.com/download/windows"
+        elif system == "darwin":
+            install_msg = "Install with: brew install ollama  OR  https://ollama.com/download/mac"
+        else:
+            install_msg = "Install with: curl -fsSL https://ollama.com/install.sh | sh"
+        
+        return (False, f"Ollama not found. {install_msg}")
+    
+    @staticmethod
+    def check_ollama_running(base_url: str = "http://localhost:11434") -> tuple[bool, str]:
+        """
+        Check if Ollama server is running (synchronous check).
+        
+        Returns:
+            Tuple of (is_running: bool, message: str)
+        """
+        import urllib.request
+        import urllib.error
+        
+        try:
+            req = urllib.request.Request(f"{base_url}/api/tags", method="GET")
+            with urllib.request.urlopen(req, timeout=5) as response:
+                if response.status == 200:
+                    return (True, "Ollama is running")
+        except urllib.error.URLError:
+            pass
+        except Exception:
+            pass
+        
+        return (False, f"Ollama is not running. Start it with: ollama serve")
     
     async def warm_up(self, timeout: float = 120.0) -> bool:
         """

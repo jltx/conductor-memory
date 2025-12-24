@@ -7,6 +7,7 @@ Provides persistent vector storage using Chroma database with efficient similari
 import os
 import logging
 import hashlib
+import time
 from typing import List, Optional, Dict, Any
 from pathlib import Path
 from datetime import datetime
@@ -33,6 +34,11 @@ class FileIndexMetadata:
         self.client = client
         self.collection_name = collection_name
         
+        # Cache for get_all_indexed_files (invalidated on updates)
+        self._cache: Optional[Dict[str, Dict[str, Any]]] = None
+        self._cache_time: float = 0
+        self._cache_ttl: float = 5.0  # 5 second cache TTL
+        
         try:
             self.collection = self.client.get_collection(name=collection_name)
             logger.info(f"Connected to existing file index metadata collection: {collection_name}")
@@ -42,6 +48,10 @@ class FileIndexMetadata:
                 metadata={"hnsw:space": "cosine"}
             )
             logger.info(f"Created new file index metadata collection: {collection_name}")
+    
+    def _invalidate_cache(self):
+        """Invalidate the cache after updates"""
+        self._cache = None
     
     def get_file_info(self, file_path: str) -> Optional[Dict[str, Any]]:
         """Get stored metadata for a file"""
@@ -69,6 +79,7 @@ class FileIndexMetadata:
                 metadatas=[metadata],
                 documents=[file_path]  # Required by Chroma
             )
+            self._invalidate_cache()
         except Exception as e:
             logger.warning(f"Error updating file index metadata for {file_path}: {e}")
     
@@ -120,6 +131,7 @@ class FileIndexMetadata:
                 logger.error(f"Error batch updating file index metadata (batch {batch_start}-{batch_end}): {e}")
                 raise  # Re-raise to fail the indexing properly
         
+        self._invalidate_cache()
         logger.debug(f"Batch updated file index for {total_updated} files")
     
     def delete_file_info(self, file_path: str) -> List[str]:
@@ -132,18 +144,28 @@ class FileIndexMetadata:
                 if chunk_ids_str:
                     chunk_ids = chunk_ids_str.split(",")
                 self.collection.delete(ids=[file_path])
+                self._invalidate_cache()
         except Exception as e:
             logger.warning(f"Error deleting file index metadata for {file_path}: {e}")
         return chunk_ids
     
     def get_all_indexed_files(self) -> Dict[str, Dict[str, Any]]:
-        """Get all indexed file paths and their metadata"""
+        """Get all indexed file paths and their metadata (cached)"""
+        # Check cache
+        now = time.time()
+        if self._cache is not None and (now - self._cache_time) < self._cache_ttl:
+            return self._cache
+        
         indexed_files = {}
         try:
             result = self.collection.get(include=["metadatas"])
             if result["ids"]:
                 for i, file_path in enumerate(result["ids"]):
                     indexed_files[file_path] = result["metadatas"][i]
+            
+            # Update cache
+            self._cache = indexed_files
+            self._cache_time = now
         except Exception as e:
             logger.warning(f"Error getting indexed files: {e}")
         return indexed_files
@@ -163,6 +185,11 @@ class SummaryIndexMetadata:
         self.client = client
         self.collection_name = collection_name
         
+        # Cache for get_all_summarized_files (invalidated on updates)
+        self._cache: Optional[Dict[str, Dict[str, Any]]] = None
+        self._cache_time: float = 0
+        self._cache_ttl: float = 5.0  # 5 second cache TTL
+        
         try:
             self.collection = self.client.get_collection(name=collection_name)
             logger.info(f"Connected to existing summary index metadata collection: {collection_name}")
@@ -172,6 +199,10 @@ class SummaryIndexMetadata:
                 metadata={"hnsw:space": "cosine"}
             )
             logger.info(f"Created new summary index metadata collection: {collection_name}")
+    
+    def _invalidate_cache(self):
+        """Invalidate the cache after updates"""
+        self._cache = None
     
     def get_summary_info(self, file_path: str) -> Optional[Dict[str, Any]]:
         """Get stored summary metadata for a file"""
@@ -208,6 +239,7 @@ class SummaryIndexMetadata:
                 metadatas=[metadata],
                 documents=[file_path]  # Required by Chroma
             )
+            self._invalidate_cache()
         except Exception as e:
             logger.warning(f"Error updating summary index metadata for {file_path}: {e}")
     
@@ -218,6 +250,7 @@ class SummaryIndexMetadata:
             if result["ids"] and result["metadatas"]:
                 chunk_id = result["metadatas"][0].get("summary_chunk_id", "")
                 self.collection.delete(ids=[file_path])
+                self._invalidate_cache()
                 return chunk_id if chunk_id else None
         except Exception as e:
             logger.warning(f"Error deleting summary index metadata for {file_path}: {e}")
@@ -241,14 +274,75 @@ class SummaryIndexMetadata:
         stored_hash = summary_info.get("content_hash", "")
         return content_hash != stored_hash
     
+    def update_summary_metadata(self, file_path: str, metadata: Dict[str, Any]) -> None:
+        """
+        Update summary metadata for a file (e.g., validation status).
+        
+        Args:
+            file_path: Relative path to the file
+            metadata: Metadata dict to update
+        """
+        try:
+            self.collection.upsert(
+                ids=[file_path],
+                metadatas=[metadata],
+                documents=[file_path]  # Required by Chroma
+            )
+            self._invalidate_cache()
+        except Exception as e:
+            logger.warning(f"Error updating summary metadata for {file_path}: {e}")
+    
+    def store_summary(
+        self,
+        file_path: str,
+        summary_data: Dict[str, Any],
+        content_hash: str = ""
+    ) -> None:
+        """
+        Store summary data for a file.
+        
+        Args:
+            file_path: Relative path to the file
+            summary_data: Summary metadata including content, pattern, domain, etc.
+            content_hash: Hash of the file content
+        """
+        metadata = {
+            "content_hash": content_hash,
+            "model": summary_data.get("model", ""),
+            "pattern": summary_data.get("pattern", ""),
+            "domain": summary_data.get("domain", ""),
+            "exports": summary_data.get("exports", ""),
+            "summarized_at": summary_data.get("summarized_at", datetime.now().isoformat()),
+            "validation_status": summary_data.get("validation_status", "unreviewed")
+        }
+        
+        try:
+            self.collection.upsert(
+                ids=[file_path],
+                metadatas=[metadata],
+                documents=[summary_data.get("content", "")]
+            )
+            self._invalidate_cache()
+        except Exception as e:
+            logger.warning(f"Error storing summary for {file_path}: {e}")
+    
     def get_all_summarized_files(self) -> Dict[str, Dict[str, Any]]:
-        """Get all summarized file paths and their metadata"""
+        """Get all summarized file paths and their metadata (cached)"""
+        # Check cache
+        now = time.time()
+        if self._cache is not None and (now - self._cache_time) < self._cache_ttl:
+            return self._cache
+        
         summarized_files = {}
         try:
             result = self.collection.get(include=["metadatas"])
             if result["ids"]:
                 for i, file_path in enumerate(result["ids"]):
                     summarized_files[file_path] = result["metadatas"][i]
+            
+            # Update cache
+            self._cache = summarized_files
+            self._cache_time = now
         except Exception as e:
             logger.warning(f"Error getting summarized files: {e}")
         return summarized_files
@@ -318,14 +412,29 @@ class ChromaVectorStore(VectorStore):
             self.client = chromadb.PersistentClient(path=persist_dir)
             self.is_persistent = True
 
-        # Get or create collection
+        # Get or create collection with optimized HNSW settings
+        # HNSW parameters:
+        # - hnsw:space: distance metric (cosine for text embeddings)
+        # - hnsw:M: max connections per node (higher = better recall, more memory)
+        # - hnsw:construction_ef: build-time search width (higher = better index quality)
+        # - hnsw:search_ef: query-time search width (higher = better recall, slower)
+        collection_metadata = {
+            "hnsw:space": "cosine",
+            "hnsw:M": 32,  # Default is 16, higher improves recall
+            "hnsw:construction_ef": 128,  # Default is 100
+            "hnsw:search_ef": 64,  # Default is 10, we need good recall
+        }
+        
         try:
             self.collection = self.client.get_collection(name=collection_name)
             logger.info(f"Connected to existing Chroma collection: {collection_name}")
         except Exception as e:
             # Collection doesn't exist or other error, create it
             logger.info(f"Creating new Chroma collection '{collection_name}': {e}")
-            self.collection = self.client.create_collection(name=collection_name)
+            self.collection = self.client.create_collection(
+                name=collection_name,
+                metadata=collection_metadata
+            )
             logger.info(f"Created new Chroma collection: {collection_name}")
         
         # Initialize file index metadata tracker

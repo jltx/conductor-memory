@@ -306,6 +306,79 @@ pytest tests/ -v
 pytest tests/test_search_quality.py -v
 ```
 
+## Building a Standalone Executable
+
+You can build a standalone `conductor-memory.exe` that doesn't require a Python installation.
+
+### Prerequisites
+
+```bash
+# Install PyInstaller
+pip install pyinstaller
+```
+
+### Build the Executable
+
+```bash
+# From the project root directory
+pyinstaller --onefile --name conductor-memory ^
+    --hidden-import=chromadb ^
+    --hidden-import=sentence_transformers ^
+    --hidden-import=uvicorn ^
+    --hidden-import=fastapi ^
+    --hidden-import=mcp ^
+    --hidden-import=mcp.server.fastmcp ^
+    --hidden-import=starlette ^
+    --hidden-import=pydantic ^
+    --hidden-import=rank_bm25 ^
+    --hidden-import=tree_sitter ^
+    --hidden-import=tree_sitter_python ^
+    --hidden-import=tree_sitter_java ^
+    --hidden-import=tree_sitter_ruby ^
+    --hidden-import=tree_sitter_go ^
+    --hidden-import=tree_sitter_c ^
+    --hidden-import=tree_sitter_c_sharp ^
+    --hidden-import=tree_sitter_kotlin ^
+    --hidden-import=tree_sitter_swift ^
+    --hidden-import=tree_sitter_objc ^
+    --collect-data=sentence_transformers ^
+    --collect-data=chromadb ^
+    src/conductor_memory/server/sse.py
+```
+
+On Linux/macOS, use `\` instead of `^` for line continuation:
+
+```bash
+pyinstaller --onefile --name conductor-memory \
+    --hidden-import=chromadb \
+    --hidden-import=sentence_transformers \
+    # ... (same options as above)
+    src/conductor_memory/server/sse.py
+```
+
+### Output
+
+The executable will be created at:
+- **Windows**: `dist/conductor-memory.exe`
+- **Linux/macOS**: `dist/conductor-memory`
+
+### Running the Executable
+
+```bash
+# Windows
+.\dist\conductor-memory.exe --port 9820
+
+# Linux/macOS  
+./dist/conductor-memory --port 9820
+```
+
+### Notes
+
+- First run may take longer as sentence-transformers downloads the embedding model
+- The executable is self-contained but large (~500MB+) due to bundled ML dependencies
+- For smaller builds, consider using `--onedir` instead of `--onefile` (creates a folder with dependencies)
+- If you encounter missing module errors, add additional `--hidden-import` flags as needed
+
 ## License
 
 MIT License - see LICENSE file for details.

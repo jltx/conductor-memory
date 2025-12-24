@@ -135,17 +135,30 @@ async def api_search(request):
 # List indexed files API endpoint
 @mcp.custom_route("/api/files", methods=["GET"])
 async def api_list_files(request):
-    """List indexed files with pagination."""
+    """List indexed files with pagination and filtering."""
     if not memory_service:
         return JSONResponse({"error": "Service not initialized"}, status_code=503)
     
     try:
         params = request.query_params
+        
+        # Parse has_summary filter
+        has_summary = None
+        has_summary_param = params.get("has_summary")
+        if has_summary_param == "yes":
+            has_summary = True
+        elif has_summary_param == "no":
+            has_summary = False
+        
         result = await memory_service.list_indexed_files_async(
             codebase=params.get("codebase"),
             limit=int(params.get("limit", 50)),
             offset=int(params.get("offset", 0)),
-            search_filter=params.get("filter")
+            search_filter=params.get("filter"),
+            has_summary=has_summary,
+            pattern=params.get("pattern") or None,
+            domain=params.get("domain") or None,
+            language=params.get("language") or None
         )
         return JSONResponse(result)
     except Exception as e:
@@ -226,6 +239,123 @@ async def api_list_codebases(request):
         return JSONResponse({"error": str(e)}, status_code=400)
 
 
+# Validation queue API endpoint
+@mcp.custom_route("/api/validation-queue", methods=["GET"])
+async def api_validation_queue(request):
+    """Get files for summary validation with pagination and filtering."""
+    if not memory_service:
+        return JSONResponse({"error": "Service not initialized"}, status_code=503)
+    
+    try:
+        params = request.query_params
+        codebase = params.get("codebase")
+        status = params.get("status", "unreviewed")
+        pattern = params.get("pattern", "")
+        domain = params.get("domain", "")
+        offset = int(params.get("offset", 0))
+        limit = int(params.get("limit", 20))
+        
+        if not codebase:
+            return JSONResponse({"error": "codebase is required"}, status_code=400)
+        
+        result = await memory_service.get_validation_queue_async(
+            codebase=codebase,
+            status=status,
+            pattern=pattern,
+            domain=domain,
+            offset=offset,
+            limit=limit
+        )
+        return JSONResponse(result)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+
+# File content API endpoint (for validation)
+@mcp.custom_route("/api/file-content", methods=["GET"])
+async def api_file_content(request):
+    """Get raw file content for validation."""
+    if not memory_service:
+        return JSONResponse({"error": "Service not initialized"}, status_code=503)
+    
+    try:
+        params = request.query_params
+        codebase = params.get("codebase")
+        file_path = params.get("path")
+        
+        if not codebase or not file_path:
+            return JSONResponse({"error": "codebase and path are required"}, status_code=400)
+        
+        result = await memory_service.get_file_content_async(codebase, file_path)
+        return JSONResponse(result)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+
+# Summary-only API endpoint (lightweight, for validation)
+@mcp.custom_route("/api/file-summary", methods=["GET"])
+async def api_file_summary(request):
+    """Get just the summary for a file (fast, no chunks)."""
+    if not memory_service:
+        return JSONResponse({"error": "Service not initialized"}, status_code=503)
+    
+    try:
+        params = request.query_params
+        codebase = params.get("codebase")
+        file_path = params.get("path")
+        
+        if not codebase or not file_path:
+            return JSONResponse({"error": "codebase and path are required"}, status_code=400)
+        
+        result = await memory_service.get_file_summary_async(codebase, file_path)
+        return JSONResponse(result)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+
+# Summary validation API endpoint
+@mcp.custom_route("/api/summary/validate", methods=["POST"])
+async def api_validate_summary(request):
+    """Validate (approve/reject) a summary."""
+    if not memory_service:
+        return JSONResponse({"error": "Service not initialized"}, status_code=503)
+    
+    try:
+        body = await request.json()
+        codebase = body.get("codebase")
+        file_path = body.get("file_path")
+        status = body.get("status")  # "approved" or "rejected"
+        
+        if not all([codebase, file_path, status]):
+            return JSONResponse({"error": "codebase, file_path, and status are required"}, status_code=400)
+        
+        result = await memory_service.validate_summary_async(codebase, file_path, status)
+        return JSONResponse(result)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+
+# Summary regeneration API endpoint
+@mcp.custom_route("/api/summary/regenerate", methods=["POST"])
+async def api_regenerate_summary(request):
+    """Regenerate a summary for a file."""
+    if not memory_service:
+        return JSONResponse({"error": "Service not initialized"}, status_code=503)
+    
+    try:
+        body = await request.json()
+        codebase = body.get("codebase")
+        file_path = body.get("file_path")
+        
+        if not codebase or not file_path:
+            return JSONResponse({"error": "codebase and file_path are required"}, status_code=400)
+        
+        result = await memory_service.regenerate_summary_async(codebase, file_path)
+        return JSONResponse(result)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+
 # Web Dashboard with Search and Browse
 @mcp.custom_route("/", methods=["GET"])
 async def web_dashboard(request):
@@ -277,7 +407,7 @@ async def web_dashboard(request):
         .tab.active { background: #0f3460; color: #00d4ff; border-color: #00d4ff; }
         
         /* Main content */
-        .container { max-width: 1200px; margin: 0 auto; padding: 20px; }
+        .container { max-width: 1600px; margin: 0 auto; padding: 20px 40px; }
         .tab-content { display: none; }
         .tab-content.active { display: block; }
         
@@ -373,24 +503,95 @@ async def web_dashboard(request):
         .checkbox-group { display: flex; align-items: center; gap: 6px; }
         .checkbox-group input { width: auto; }
         
+        /* Search type filters */
+        .search-type-filters {
+            display: flex; gap: 10px; align-items: center;
+            margin-bottom: 12px; padding: 10px 0;
+            border-bottom: 1px solid #0f3460;
+        }
+        .type-filter-label {
+            font-size: 13px; color: #888; margin-right: 5px;
+        }
+        .type-checkbox {
+            cursor: pointer; display: flex; align-items: center;
+        }
+        .type-checkbox input {
+            display: none;
+        }
+        .type-checkbox .type-badge {
+            padding: 4px 10px; border-radius: 12px; font-size: 12px;
+            border: 1px solid transparent; transition: all 0.2s;
+        }
+        .type-checkbox input:checked + .type-badge {
+            border-color: currentColor;
+        }
+        .type-checkbox input:not(:checked) + .type-badge {
+            opacity: 0.4;
+        }
+        .type-code .type-badge { background: rgba(0, 255, 136, 0.15); color: #00ff88; }
+        .type-decision .type-badge { background: rgba(0, 136, 255, 0.15); color: #0088ff; }
+        .type-lesson .type-badge { background: rgba(255, 170, 0, 0.15); color: #ffaa00; }
+        .type-conversation .type-badge { background: rgba(136, 136, 136, 0.15); color: #888; }
+        
         /* Search results */
         .results-header { 
             display: flex; justify-content: space-between; align-items: center;
             margin-bottom: 10px; color: #888; font-size: 13px;
         }
         .result-item {
-            background: #0f3460; border-radius: 6px; padding: 12px; margin-bottom: 10px;
-            border-left: 3px solid #00d4ff;
+            background: #16213e; border-radius: 8px; padding: 0; margin-bottom: 12px;
+            border: 1px solid #0f3460; overflow: hidden;
         }
-        .result-header { display: flex; justify-content: space-between; margin-bottom: 8px; }
-        .result-file { font-family: monospace; color: #00d4ff; font-size: 13px; }
-        .result-score { 
-            background: #16213e; padding: 2px 8px; border-radius: 10px;
-            font-size: 12px; color: #00ff88;
+        .result-item-header {
+            display: flex; justify-content: space-between; align-items: center;
+            padding: 10px 12px; border-bottom: 1px solid #0f3460;
+        }
+        .result-type-badge {
+            display: flex; align-items: center; gap: 8px;
+        }
+        .result-type-icon {
+            width: 10px; height: 10px; border-radius: 50%;
+        }
+        .result-type-icon.code { background: #00ff88; }
+        .result-type-icon.decision { background: #0088ff; }
+        .result-type-icon.lesson { background: #ffaa00; }
+        .result-type-icon.conversation { background: #888; }
+        .result-type-label {
+            font-size: 11px; text-transform: uppercase; font-weight: bold;
+            letter-spacing: 0.5px;
+        }
+        .result-type-label.code { color: #00ff88; }
+        .result-type-label.decision { color: #0088ff; }
+        .result-type-label.lesson { color: #ffaa00; }
+        .result-type-label.conversation { color: #888; }
+        .result-pinned {
+            font-size: 10px; color: #555; margin-left: 5px;
+        }
+        .result-score-bar {
+            display: flex; align-items: center; gap: 8px;
+        }
+        .score-segments {
+            display: flex; gap: 2px;
+        }
+        .score-segment {
+            width: 8px; height: 12px; border-radius: 2px;
+            background: #0f3460;
+        }
+        .score-segment.filled { background: #00d4ff; }
+        .score-segment.high { background: #00ff88; }
+        .score-value {
+            font-size: 12px; color: #888; font-family: monospace;
+        }
+        .result-file { 
+            font-family: monospace; color: #00d4ff; font-size: 13px;
+            padding: 8px 12px; background: #0f3460;
+        }
+        .result-body {
+            padding: 12px;
         }
         .result-tags { display: flex; gap: 5px; flex-wrap: wrap; margin-bottom: 8px; }
         .tag { 
-            background: #16213e; padding: 2px 8px; border-radius: 10px;
+            background: #0f3460; padding: 2px 8px; border-radius: 10px;
             font-size: 11px; color: #888;
         }
         .result-content {
@@ -399,14 +600,28 @@ async def web_dashboard(request):
             max-height: 80px; position: relative;
         }
         .result-content.expanded { max-height: none; }
+        .result-actions {
+            display: flex; justify-content: space-between; align-items: center;
+            margin-top: 10px;
+        }
         .expand-btn {
             color: #00d4ff; cursor: pointer; font-size: 12px;
-            margin-top: 5px; display: inline-block;
+        }
+        .copy-btn {
+            padding: 4px 10px; background: #0f3460; border: 1px solid #1a3a6e;
+            border-radius: 4px; color: #888; cursor: pointer; font-size: 11px;
+            transition: all 0.2s;
+        }
+        .copy-btn:hover {
+            border-color: #00d4ff; color: #00d4ff;
+        }
+        .copy-btn.copied {
+            border-color: #00ff88; color: #00ff88;
         }
         
         /* Browse tab styles */
         .browse-controls { 
-            display: flex; gap: 15px; margin-bottom: 15px; flex-wrap: wrap; align-items: center;
+            display: flex; gap: 15px; margin-bottom: 10px; flex-wrap: wrap; align-items: center;
         }
         .browse-controls select {
             padding: 8px 12px; background: #0f3460; border: 1px solid #1a3a6e;
@@ -415,6 +630,195 @@ async def web_dashboard(request):
         .filter-input {
             padding: 8px 12px; background: #0f3460; border: 1px solid #1a3a6e;
             border-radius: 4px; color: #eee; font-size: 14px; width: 200px;
+        }
+        
+        /* Quick Filters */
+        .browse-quick-filters {
+            display: flex; gap: 12px; margin-bottom: 15px; flex-wrap: wrap; 
+            align-items: center; padding: 10px 15px;
+            background: #0f3460; border-radius: 6px;
+        }
+        .browse-quick-filters label {
+            font-size: 12px; color: #888;
+            display: flex; align-items: center; gap: 6px;
+        }
+        .browse-quick-filters select {
+            padding: 5px 8px; background: #16213e; border: 1px solid #1a3a6e;
+            border-radius: 4px; color: #eee; font-size: 12px;
+        }
+        .browse-quick-filters select:focus {
+            outline: none; border-color: #00d4ff;
+        }
+        .browse-quick-filters select.filter-active {
+            border-color: #00d4ff;
+            background: rgba(0, 212, 255, 0.1);
+        }
+        .filter-reset-btn {
+            color: #ff6b6b; cursor: pointer; font-size: 12px;
+            padding: 4px 8px; border-radius: 4px;
+            transition: background 0.2s;
+        }
+        .filter-reset-btn:hover {
+            background: rgba(255, 107, 107, 0.1);
+        }
+        
+        /* Master-Detail Split Layout */
+        .browse-split-container {
+            display: grid;
+            grid-template-columns: 30% 70%;
+            gap: 20px;
+            min-height: 500px;
+        }
+        .browse-list-panel {
+            background: #16213e;
+            border-radius: 8px;
+            border: 1px solid #0f3460;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+        .browse-list-header {
+            padding: 12px 15px;
+            border-bottom: 1px solid #0f3460;
+            font-size: 13px;
+            color: #888;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .browse-list-content {
+            flex: 1;
+            overflow-y: auto;
+            min-height: 0;
+        }
+        .browse-detail-panel {
+            background: #16213e;
+            border-radius: 8px;
+            border: 1px solid #0f3460;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+        .browse-detail-header {
+            padding: 12px 15px;
+            border-bottom: 1px solid #0f3460;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .browse-detail-title {
+            font-family: monospace;
+            color: #00d4ff;
+            font-size: 14px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .browse-detail-content {
+            flex: 1;
+            overflow-y: auto;
+            padding: 15px;
+            min-height: 0;
+        }
+        .browse-detail-empty {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            height: 100%;
+            color: #555;
+            font-size: 14px;
+        }
+        
+        /* File list items */
+        .file-list-item {
+            padding: 10px 15px;
+            border-bottom: 1px solid #0f3460;
+            cursor: pointer;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            transition: background 0.15s;
+        }
+        .file-list-item:hover {
+            background: rgba(0, 212, 255, 0.05);
+        }
+        .file-list-item.selected {
+            background: rgba(0, 212, 255, 0.15);
+            border-left: 3px solid #00d4ff;
+            padding-left: 12px;
+        }
+        .file-list-item:focus {
+            outline: none;
+            background: rgba(0, 212, 255, 0.1);
+        }
+        .file-item-path {
+            font-family: monospace;
+            font-size: 13px;
+            color: #ccc;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            flex: 1;
+        }
+        .file-list-item.selected .file-item-path {
+            color: #00d4ff;
+        }
+        .file-item-meta {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+            flex-shrink: 0;
+            margin-left: 10px;
+        }
+        .file-item-chunks {
+            background: #0f3460;
+            padding: 2px 8px;
+            border-radius: 10px;
+            font-size: 11px;
+            color: #888;
+        }
+        .file-item-summary-indicator {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #4a2d2d;
+        }
+        .file-item-summary-indicator.has-summary {
+            background: #00ff88;
+        }
+        
+        /* Detail panel sections */
+        .detail-meta-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 10px;
+            margin-bottom: 15px;
+        }
+        .detail-meta-item {
+            background: #0f3460;
+            padding: 10px;
+            border-radius: 6px;
+        }
+        .detail-meta-label {
+            font-size: 11px;
+            color: #888;
+            text-transform: uppercase;
+            margin-bottom: 4px;
+        }
+        .detail-meta-value {
+            font-family: monospace;
+            font-size: 13px;
+            color: #eee;
+            word-break: break-all;
+        }
+        
+        /* Pagination for split view */
+        .browse-list-footer {
+            padding: 10px 15px;
+            border-top: 1px solid #0f3460;
+            display: flex;
+            justify-content: center;
+            gap: 5px;
         }
         
         /* Table styles */
@@ -449,26 +853,249 @@ async def web_dashboard(request):
         .page-btn.active { background: #00d4ff; color: #1a1a2e; border-color: #00d4ff; }
         .page-btn:disabled { opacity: 0.5; cursor: not-allowed; }
         
-        /* Details panel */
-        .details-panel {
-            background: #16213e; border-radius: 8px; padding: 20px;
-            margin-top: 15px; border: 1px solid #0f3460; display: none;
+        /* Legacy details panel (kept for backwards compat, unused in new layout) */
+        .details-panel { display: none; }
+        .details-panel.open { display: none; }
+        
+        /* Validate Tab Styles - 3-column layout */
+        .validate-filter-bar {
+            display: flex;
+            gap: 15px;
+            padding: 12px 15px;
+            background: #16213e;
+            border-radius: 8px;
+            margin-bottom: 15px;
+            flex-wrap: wrap;
+            align-items: center;
         }
-        .details-panel.open { display: block; }
-        .details-header { 
-            display: flex; justify-content: space-between; align-items: center;
-            margin-bottom: 15px; padding-bottom: 10px; border-bottom: 1px solid #0f3460;
+        .validate-filter-bar label {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 13px;
+            color: #888;
         }
-        .details-title { font-family: monospace; color: #00d4ff; }
-        .close-btn { 
-            background: none; border: none; color: #888; cursor: pointer;
-            font-size: 20px; line-height: 1;
+        .validate-filter-bar select {
+            padding: 6px 10px;
+            background: #0f3460;
+            border: 1px solid #1a3a6e;
+            border-radius: 4px;
+            color: #eee;
+            font-size: 13px;
         }
-        .close-btn:hover { color: #ff6b6b; }
-        .details-meta { display: flex; gap: 20px; margin-bottom: 15px; flex-wrap: wrap; }
-        .meta-item { font-size: 13px; }
-        .meta-label { color: #888; }
-        .meta-value { color: #eee; font-family: monospace; }
+        .validate-filter-bar select:hover {
+            border-color: #00d4ff;
+        }
+        .validate-progress {
+            margin-left: auto;
+            padding: 6px 12px;
+            background: #0f3460;
+            border-radius: 4px;
+            font-size: 13px;
+            color: #00d4ff;
+        }
+        .validate-filter-reset {
+            color: #ff6b6b;
+            cursor: pointer;
+            font-size: 12px;
+        }
+        .validate-filter-reset:hover {
+            color: #ff8888;
+        }
+        
+        .validate-split-container {
+            display: grid;
+            grid-template-columns: 25% 1fr 1fr;
+            gap: 15px;
+            min-height: 500px;
+            margin-bottom: 15px;
+        }
+        
+        /* File list panel (left) */
+        .validate-file-list {
+            background: #16213e;
+            border-radius: 8px;
+            border: 1px solid #0f3460;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+        .validate-file-list-header {
+            padding: 10px 12px;
+            border-bottom: 1px solid #0f3460;
+            font-size: 11px;
+            color: #888;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .validate-file-list-content {
+            flex: 1;
+            overflow-y: auto;
+            min-height: 0;
+        }
+        .validate-file-list-footer {
+            padding: 8px;
+            border-top: 1px solid #0f3460;
+            display: flex;
+            justify-content: center;
+            gap: 3px;
+            flex-wrap: wrap;
+        }
+        .validate-file-list-footer .page-btn {
+            padding: 4px 8px;
+            font-size: 11px;
+        }
+        
+        /* File list items */
+        .validate-file-item {
+            padding: 8px 12px;
+            border-bottom: 1px solid #0f3460;
+            cursor: pointer;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-size: 12px;
+            transition: background 0.15s;
+        }
+        .validate-file-item:hover {
+            background: rgba(0, 212, 255, 0.05);
+        }
+        .validate-file-item.selected {
+            background: rgba(0, 212, 255, 0.15);
+            border-left: 3px solid #00d4ff;
+            padding-left: 9px;
+        }
+        .validate-file-item-path {
+            font-family: monospace;
+            color: #ccc;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            flex: 1;
+        }
+        .validate-file-item.selected .validate-file-item-path {
+            color: #00d4ff;
+        }
+        
+        /* Status icons */
+        .validate-status-icon {
+            margin-left: 8px;
+            font-size: 11px;
+            flex-shrink: 0;
+        }
+        .validate-status-icon.approved { color: #00ff88; }
+        .validate-status-icon.rejected { color: #ff6b6b; }
+        .validate-status-icon.unreviewed { color: #555; }
+        
+        /* Content panels (middle and right) */
+        .validate-panel {
+            background: #16213e;
+            border-radius: 8px;
+            border: 1px solid #0f3460;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+        .validate-panel-header {
+            padding: 10px 15px;
+            border-bottom: 1px solid #0f3460;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .validate-panel-title {
+            font-size: 12px;
+            color: #888;
+            text-transform: uppercase;
+        }
+        .validate-file-path {
+            font-family: monospace;
+            font-size: 11px;
+            color: #00d4ff;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            max-width: 300px;
+        }
+        .validate-model {
+            font-size: 11px;
+            color: #555;
+        }
+        .validate-panel-content {
+            flex: 1;
+            overflow-y: auto;
+            padding: 15px;
+            font-family: monospace;
+            font-size: 12px;
+            white-space: pre-wrap;
+            color: #ccc;
+            min-height: 0;
+        }
+        .validate-source .validate-panel-content {
+            background: #0f3460;
+            color: #aaa;
+        }
+        
+        /* Action bar */
+        .validate-actions {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 12px 15px;
+            background: #16213e;
+            border-radius: 8px;
+            border: 1px solid #0f3460;
+        }
+        .validate-action-group {
+            display: flex;
+            gap: 10px;
+        }
+        .validate-btn {
+            padding: 8px 16px;
+            border: 1px solid #1a3a6e;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 13px;
+            transition: all 0.2s;
+            background: #0f3460;
+            color: #888;
+        }
+        .validate-btn:hover:not(:disabled) {
+            border-color: #00d4ff;
+            color: #eee;
+        }
+        .validate-btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+        .validate-btn-approve {
+            background: rgba(0, 255, 136, 0.1);
+            border-color: rgba(0, 255, 136, 0.3);
+            color: #00ff88;
+        }
+        .validate-btn-approve:hover:not(:disabled) {
+            background: rgba(0, 255, 136, 0.2);
+            border-color: #00ff88;
+        }
+        .validate-btn-reject {
+            background: rgba(255, 107, 107, 0.1);
+            border-color: rgba(255, 107, 107, 0.3);
+            color: #ff6b6b;
+        }
+        .validate-btn-reject:hover:not(:disabled) {
+            background: rgba(255, 107, 107, 0.2);
+            border-color: #ff6b6b;
+        }
+        .validate-btn-regenerate {
+            background: rgba(0, 212, 255, 0.1);
+            border-color: rgba(0, 212, 255, 0.3);
+            color: #00d4ff;
+        }
+        .validate-btn-regenerate:hover:not(:disabled) {
+            background: rgba(0, 212, 255, 0.2);
+            border-color: #00d4ff;
+        }
         .chunk-list { max-height: 400px; overflow-y: auto; }
         .chunk-item {
             background: #0f3460; border-radius: 4px; padding: 10px; margin-bottom: 8px;
@@ -497,6 +1124,96 @@ async def web_dashboard(request):
         
         /* Refresh note */
         .refresh-note { text-align: center; color: #555; font-size: 12px; margin-top: 20px; }
+        
+        /* Responsive Design */
+        @media (max-width: 1200px) {
+            .container { padding: 20px; }
+            .browse-split-container {
+                grid-template-columns: 35% 65%;
+            }
+            .validate-split-container {
+                grid-template-columns: 30% 1fr 1fr;
+            }
+        }
+        @media (max-width: 900px) {
+            .browse-split-container {
+                grid-template-columns: 1fr;
+                min-height: auto;
+            }
+            .validate-split-container {
+                grid-template-columns: 1fr;
+                grid-template-rows: auto 1fr 1fr;
+                min-height: auto;
+            }
+            .browse-list-panel,
+            .browse-detail-panel {
+                min-height: 300px;
+            }
+            .validate-file-list {
+                max-height: 200px;
+            }
+            .validate-panel {
+                min-height: 250px;
+            }
+            .validate-actions {
+                flex-wrap: wrap;
+                gap: 10px;
+            }
+            .validate-action-group {
+                width: 100%;
+                justify-content: center;
+            }
+        }
+        @media (max-width: 600px) {
+            .header {
+                flex-direction: column;
+                align-items: flex-start;
+                gap: 10px;
+            }
+            .tabs {
+                width: 100%;
+                justify-content: space-between;
+            }
+            .tab {
+                padding: 6px 10px;
+                font-size: 12px;
+            }
+            .browse-controls,
+            .browse-quick-filters,
+            .validate-filter-bar {
+                flex-direction: column;
+                align-items: stretch;
+            }
+            .browse-controls label,
+            .browse-quick-filters label,
+            .validate-controls label {
+                width: 100%;
+            }
+            .browse-controls select,
+            .browse-quick-filters select,
+            .validate-controls select,
+            .filter-input {
+                width: 100%;
+            }
+            .search-type-filters {
+                flex-wrap: wrap;
+            }
+            .result-item-header {
+                flex-direction: column;
+                align-items: flex-start;
+                gap: 8px;
+            }
+        }
+        
+        /* Keyboard shortcut hints */
+        .keyboard-hint {
+            font-size: 10px;
+            color: #555;
+            background: #0f3460;
+            padding: 2px 6px;
+            border-radius: 3px;
+            margin-left: 5px;
+        }
     </style>
 </head>
 <body>
@@ -506,6 +1223,7 @@ async def web_dashboard(request):
             <button class="tab active" data-tab="status">Status</button>
             <button class="tab" data-tab="search">Search</button>
             <button class="tab" data-tab="browse">Browse</button>
+            <button class="tab" data-tab="validate">Validate</button>
         </div>
     </div>
     
@@ -542,6 +1260,27 @@ async def web_dashboard(request):
                     <button id="search-btn" class="search-btn">Search</button>
                 </div>
                 
+                <!-- Memory Type Filters (Always Visible) -->
+                <div class="search-type-filters">
+                    <span class="type-filter-label">Types:</span>
+                    <label class="type-checkbox type-code">
+                        <input type="checkbox" id="filter-type-code" checked />
+                        <span class="type-badge">Code</span>
+                    </label>
+                    <label class="type-checkbox type-decision">
+                        <input type="checkbox" id="filter-type-decision" checked />
+                        <span class="type-badge">Decisions</span>
+                    </label>
+                    <label class="type-checkbox type-lesson">
+                        <input type="checkbox" id="filter-type-lesson" checked />
+                        <span class="type-badge">Lessons</span>
+                    </label>
+                    <label class="type-checkbox type-conversation">
+                        <input type="checkbox" id="filter-type-conversation" />
+                        <span class="type-badge">Conversations</span>
+                    </label>
+                </div>
+                
                 <div class="search-options">
                     <label>Codebase:
                         <select id="search-codebase">
@@ -565,7 +1304,7 @@ async def web_dashboard(request):
                         </select>
                     </label>
                     <span class="advanced-toggle" onclick="toggleAdvanced()">
-                        <span id="advanced-arrow">&#9654;</span> Advanced Filters
+                        <span id="advanced-arrow">&#9654;</span> More Filters
                     </span>
                 </div>
                 
@@ -577,7 +1316,7 @@ async def web_dashboard(request):
                         </div>
                         <div class="filter-group">
                             <label>Include Tags</label>
-                            <input type="text" id="filter-include-tags" placeholder="decision, lesson" />
+                            <input type="text" id="filter-include-tags" placeholder="api, core" />
                         </div>
                         <div class="filter-group">
                             <label>Exclude Tags</label>
@@ -633,19 +1372,170 @@ async def web_dashboard(request):
                 <input type="text" id="browse-filter" class="filter-input" placeholder="Filter by path..." />
             </div>
             
-            <div class="card">
-                <div id="browse-content">
-                    <div class="loading">Loading...</div>
-                </div>
-                <div id="browse-pagination" class="pagination"></div>
+            <!-- Quick Filters (visible only for files view) -->
+            <div class="browse-quick-filters" id="browse-quick-filters">
+                <label>Summary:
+                    <select id="filter-has-summary">
+                        <option value="">All</option>
+                        <option value="yes">Has Summary</option>
+                        <option value="no">No Summary</option>
+                    </select>
+                </label>
+                <label>Pattern:
+                    <select id="filter-pattern">
+                        <option value="">All Patterns</option>
+                        <option value="service">service</option>
+                        <option value="utility">utility</option>
+                        <option value="model">model</option>
+                        <option value="config">config</option>
+                        <option value="controller">controller</option>
+                        <option value="repository">repository</option>
+                        <option value="test">test</option>
+                    </select>
+                </label>
+                <label>Domain:
+                    <select id="filter-domain">
+                        <option value="">All Domains</option>
+                        <option value="api">api</option>
+                        <option value="database">database</option>
+                        <option value="auth">auth</option>
+                        <option value="search">search</option>
+                        <option value="config">config</option>
+                        <option value="core">core</option>
+                        <option value="ui">ui</option>
+                    </select>
+                </label>
+                <label>Language:
+                    <select id="filter-language">
+                        <option value="">All Languages</option>
+                        <option value="python">Python</option>
+                        <option value="kotlin">Kotlin</option>
+                        <option value="java">Java</option>
+                        <option value="typescript">TypeScript</option>
+                        <option value="javascript">JavaScript</option>
+                    </select>
+                </label>
+                <span class="filter-reset-btn" id="filter-reset-btn" onclick="resetQuickFilters()" style="display: none;">✕ Clear filters</span>
             </div>
             
-            <div id="details-panel" class="details-panel">
-                <div class="details-header">
-                    <span class="details-title" id="details-title">File Details</span>
-                    <button class="close-btn" onclick="closeDetails()">&times;</button>
+            <!-- Master-Detail Split Layout -->
+            <div class="browse-split-container">
+                <!-- Left Panel: File List -->
+                <div class="browse-list-panel">
+                    <div class="browse-list-header">
+                        <span id="browse-list-count">Loading...</span>
+                        <span style="font-size: 11px; color: #555;">↑↓ to navigate, Enter to select</span>
+                    </div>
+                    <div class="browse-list-content" id="browse-list-content" tabindex="0">
+                        <div class="loading" style="padding: 40px; text-align: center;">Loading...</div>
+                    </div>
+                    <div class="browse-list-footer" id="browse-pagination"></div>
                 </div>
-                <div id="details-content"></div>
+                
+                <!-- Right Panel: Details -->
+                <div class="browse-detail-panel">
+                    <div class="browse-detail-header">
+                        <span class="browse-detail-title" id="detail-title">Select a file to view details</span>
+                    </div>
+                    <div class="browse-detail-content" id="detail-content">
+                        <div class="browse-detail-empty">
+                            <span>← Select an item from the list</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- VALIDATE TAB -->
+        <div id="validate-tab" class="tab-content">
+            <h2>Summary Validation</h2>
+            
+            <!-- Filter Bar -->
+            <div class="validate-filter-bar">
+                <label>Codebase:
+                    <select id="validate-codebase"></select>
+                </label>
+                <label>Status:
+                    <select id="validate-status">
+                        <option value="unreviewed">Unreviewed</option>
+                        <option value="all">All</option>
+                        <option value="approved">Approved</option>
+                        <option value="rejected">Rejected</option>
+                    </select>
+                </label>
+                <label>Pattern:
+                    <select id="validate-pattern">
+                        <option value="">All Patterns</option>
+                    </select>
+                </label>
+                <label>Domain:
+                    <select id="validate-domain">
+                        <option value="">All Domains</option>
+                    </select>
+                </label>
+                <label>Per page:
+                    <select id="validate-page-size">
+                        <option value="20">20</option>
+                        <option value="30">30</option>
+                        <option value="40">40</option>
+                        <option value="50">50</option>
+                    </select>
+                </label>
+                <span class="validate-filter-reset" id="validate-filter-reset" style="display: none;">✕ Clear filters</span>
+                <span class="validate-progress" id="validate-progress">Loading...</span>
+            </div>
+            
+            <!-- 3-Column Layout -->
+            <div class="validate-split-container">
+                <!-- Left: File List -->
+                <div class="validate-file-list">
+                    <div class="validate-file-list-header">
+                        <span id="validate-list-count">Loading...</span>
+                        <span>↑↓ nav</span>
+                    </div>
+                    <div class="validate-file-list-content" id="validate-list-content" tabindex="0">
+                        <div class="loading" style="padding: 20px;">Loading...</div>
+                    </div>
+                    <div class="validate-file-list-footer" id="validate-pagination"></div>
+                </div>
+                
+                <!-- Middle: Original File Content -->
+                <div class="validate-panel validate-source">
+                    <div class="validate-panel-header">
+                        <span class="validate-panel-title">Original File</span>
+                        <span class="validate-file-path" id="validate-file-path">Select a file...</span>
+                    </div>
+                    <div class="validate-panel-content" id="validate-source-content">
+                        <div class="browse-detail-empty">
+                            <span>Select a file from the list</span>
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- Right: LLM Summary -->
+                <div class="validate-panel validate-summary">
+                    <div class="validate-panel-header">
+                        <span class="validate-panel-title">LLM Summary</span>
+                        <span class="validate-model" id="validate-model"></span>
+                    </div>
+                    <div class="validate-panel-content" id="validate-summary-content">
+                        <div class="browse-detail-empty">
+                            <span>Summary will appear here</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Action Bar -->
+            <div class="validate-actions">
+                <button class="validate-btn validate-btn-prev" id="validate-prev" onclick="validatePrev()">← Prev <span class="keyboard-hint">←</span></button>
+                <div class="validate-action-group">
+                    <button class="validate-btn validate-btn-approve" onclick="validateApprove()">✓ Approve <span class="keyboard-hint">A</span></button>
+                    <button class="validate-btn validate-btn-reject" onclick="validateReject()">✗ Reject <span class="keyboard-hint">R</span></button>
+                    <button class="validate-btn validate-btn-regenerate" onclick="validateRegenerate()">↻ Regenerate</button>
+                    <button class="validate-btn validate-btn-skip" onclick="validateSkip()">Skip <span class="keyboard-hint">S</span></button>
+                </div>
+                <button class="validate-btn validate-btn-next" id="validate-next" onclick="validateNext()">Next → <span class="keyboard-hint">→</span></button>
             </div>
         </div>
     </div>
@@ -654,7 +1544,7 @@ async def web_dashboard(request):
         // =========== State ===========
         let codebases = [];
         let currentBrowseOffset = 0;
-        const BROWSE_LIMIT = 50;
+        const BROWSE_LIMIT = 20;
         let statusInterval = null;
         
         // =========== Tab Management ===========
@@ -675,6 +1565,11 @@ async def web_dashboard(request):
                 // Load data for browse tab
                 if (tab.dataset.tab === 'browse') {
                     loadBrowseData();
+                }
+                
+                // Load data for validate tab
+                if (tab.dataset.tab === 'validate') {
+                    loadValidationQueue();
                 }
             });
         });
@@ -812,16 +1707,22 @@ async def web_dashboard(request):
                 // Populate dropdowns
                 const searchSelect = document.getElementById('search-codebase');
                 const browseSelect = document.getElementById('browse-codebase');
+                const validateSelect = document.getElementById('validate-codebase');
                 
                 searchSelect.innerHTML = '<option value="">All</option>';
                 browseSelect.innerHTML = '';
+                validateSelect.innerHTML = '';
                 
                 codebases.forEach(cb => {
                     searchSelect.innerHTML += `<option value="${cb.name}">${cb.name}</option>`;
                     browseSelect.innerHTML += `<option value="${cb.name}">${cb.name}</option>`;
+                    validateSelect.innerHTML += `<option value="${cb.name}">${cb.name}</option>`;
                 });
+                
+                return codebases;
             } catch (err) {
                 console.error('Failed to load codebases:', err);
+                return [];
             }
         }
         
@@ -847,10 +1748,16 @@ async def web_dashboard(request):
             // Gather filter values
             const parseList = (val) => val ? val.split(',').map(s => s.trim()).filter(s => s) : null;
             
+            // Get type filters
+            const includeCode = document.getElementById('filter-type-code').checked;
+            const includeDecision = document.getElementById('filter-type-decision').checked;
+            const includeLesson = document.getElementById('filter-type-lesson').checked;
+            const includeConversation = document.getElementById('filter-type-conversation').checked;
+            
             const body = {
                 query,
                 codebase: document.getElementById('search-codebase').value || null,
-                max_results: parseInt(document.getElementById('search-limit').value),
+                max_results: parseInt(document.getElementById('search-limit').value) * 2,  // Request more to account for filtering
                 search_mode: document.getElementById('search-mode').value,
                 languages: parseList(document.getElementById('filter-languages').value),
                 include_tags: parseList(document.getElementById('filter-include-tags').value),
@@ -876,6 +1783,22 @@ async def web_dashboard(request):
                 if (data.error) {
                     resultsDiv.innerHTML = `<div class="error-msg">${data.error}</div>`;
                 } else {
+                    // Apply type filtering client-side
+                    const results = data.results || [];
+                    const filteredResults = results.filter(r => {
+                        const memoryType = r.memory_type || 'code';
+                        if (memoryType === 'code' || memoryType === 'file_chunk') return includeCode;
+                        if (memoryType === 'decision') return includeDecision;
+                        if (memoryType === 'lesson') return includeLesson;
+                        if (memoryType === 'conversation') return includeConversation;
+                        return includeCode;  // Default to code for unknown types
+                    });
+                    
+                    // Limit to requested amount
+                    const limit = parseInt(document.getElementById('search-limit').value);
+                    data.results = filteredResults.slice(0, limit);
+                    data.total_found = filteredResults.length;
+                    
                     renderSearchResults(data);
                 }
             } catch (err) {
@@ -891,12 +1814,20 @@ async def web_dashboard(request):
             const results = data.results || [];
             
             if (results.length === 0) {
-                resultsDiv.innerHTML = '<div class="empty-state">No results found</div>';
+                resultsDiv.innerHTML = '<div class="empty-state">No results found. Try different search terms or adjust filters.</div>';
                 return;
             }
             
+            // Build active filters summary
+            let activeFilters = [];
+            if (!document.getElementById('filter-type-code').checked) activeFilters.push('-Code');
+            if (!document.getElementById('filter-type-decision').checked) activeFilters.push('-Decisions');
+            if (!document.getElementById('filter-type-lesson').checked) activeFilters.push('-Lessons');
+            if (!document.getElementById('filter-type-conversation').checked) activeFilters.push('-Conversations');
+            const filterNote = activeFilters.length > 0 ? ` | Filters: ${activeFilters.join(', ')}` : '';
+            
             let html = `<div class="results-header">
-                <span>Found ${data.total_found || results.length} results (${data.query_time_ms}ms) - Mode: ${data.search_mode_used}</span>
+                <span>Found ${data.total_found || results.length} results (${data.query_time_ms}ms) • Mode: ${data.search_mode_used}${filterNote}</span>
             </div>`;
             
             results.forEach((r, idx) => {
@@ -905,20 +1836,64 @@ async def web_dashboard(request):
                 const preview = content.length > 300 ? content.substring(0, 300) : content;
                 const hasMore = content.length > 300;
                 
+                // Determine result type
+                const memoryType = r.memory_type || 'code';
+                const typeClass = memoryType === 'decision' ? 'decision' : 
+                                 memoryType === 'lesson' ? 'lesson' :
+                                 memoryType === 'conversation' ? 'conversation' : 'code';
+                const typeLabel = memoryType === 'code' || memoryType === 'file_chunk' ? 'CODE' : memoryType.toUpperCase();
+                const isPinned = r.pinned || memoryType === 'decision' || memoryType === 'lesson';
+                
+                // Calculate score segments (5 segments max)
+                const score = r.relevance_score || 0;
+                const filledSegments = Math.round(score * 5);
+                const isHighScore = score >= 0.8;
+                let scoreSegments = '';
+                for (let i = 0; i < 5; i++) {
+                    const filled = i < filledSegments;
+                    const segClass = filled ? (isHighScore ? 'filled high' : 'filled') : '';
+                    scoreSegments += `<div class="score-segment ${segClass}"></div>`;
+                }
+                
                 html += `
                     <div class="result-item">
-                        <div class="result-header">
-                            <span class="result-file">${r.source || 'unknown'}</span>
-                            <span class="result-score">${(r.relevance_score || 0).toFixed(3)}</span>
+                        <div class="result-item-header">
+                            <div class="result-type-badge">
+                                <span class="result-type-icon ${typeClass}"></span>
+                                <span class="result-type-label ${typeClass}">${typeLabel}</span>
+                                ${isPinned ? '<span class="result-pinned">(pinned)</span>' : ''}
+                            </div>
+                            <div class="result-score-bar">
+                                <div class="score-segments">${scoreSegments}</div>
+                                <span class="score-value">${score.toFixed(2)}</span>
+                            </div>
                         </div>
-                        ${tags ? `<div class="result-tags">${tags}</div>` : ''}
-                        <div class="result-content" id="result-content-${idx}">${preview}${hasMore ? '...' : ''}</div>
-                        ${hasMore ? `<span class="expand-btn" onclick="toggleResultExpand(${idx}, \`${escapeJs(content)}\`)">Show more</span>` : ''}
+                        ${r.source ? `<div class="result-file">${r.source}</div>` : ''}
+                        <div class="result-body">
+                            ${tags ? `<div class="result-tags">${tags}</div>` : ''}
+                            <div class="result-content" id="result-content-${idx}">${preview}${hasMore ? '...' : ''}</div>
+                            <div class="result-actions">
+                                ${hasMore ? `<span class="expand-btn" onclick="toggleResultExpand(${idx}, \`${escapeJs(content)}\`)">Show more</span>` : '<span></span>'}
+                                <button class="copy-btn" onclick="copyResult(${idx}, \`${escapeJs(content)}\`)">Copy</button>
+                            </div>
+                        </div>
                     </div>
                 `;
             });
             
             resultsDiv.innerHTML = html;
+        }
+        
+        function copyResult(idx, content) {
+            navigator.clipboard.writeText(content).then(() => {
+                const btn = document.querySelectorAll('.copy-btn')[idx];
+                btn.textContent = 'Copied!';
+                btn.classList.add('copied');
+                setTimeout(() => {
+                    btn.textContent = 'Copy';
+                    btn.classList.remove('copied');
+                }, 2000);
+            });
         }
         
         function toggleResultExpand(idx, fullContent) {
@@ -942,14 +1917,64 @@ async def web_dashboard(request):
         });
         
         // =========== Browse Tab ===========
+        let browseData = { files: [], memories: [], summaries: [] };
+        let selectedIndex = -1;
+        
+        function updateQuickFiltersVisibility() {
+            const view = document.getElementById('browse-view').value;
+            const quickFilters = document.getElementById('browse-quick-filters');
+            quickFilters.style.display = view === 'files' ? 'flex' : 'none';
+        }
+        
+        function getActiveFiltersCount() {
+            let count = 0;
+            if (document.getElementById('filter-has-summary').value) count++;
+            if (document.getElementById('filter-pattern').value) count++;
+            if (document.getElementById('filter-domain').value) count++;
+            if (document.getElementById('filter-language').value) count++;
+            return count;
+        }
+        
+        function updateFilterIndicators() {
+            const resetBtn = document.getElementById('filter-reset-btn');
+            const activeCount = getActiveFiltersCount();
+            resetBtn.style.display = activeCount > 0 ? 'inline' : 'none';
+            
+            // Highlight active filters
+            ['filter-has-summary', 'filter-pattern', 'filter-domain', 'filter-language'].forEach(id => {
+                const el = document.getElementById(id);
+                if (el.value) {
+                    el.classList.add('filter-active');
+                } else {
+                    el.classList.remove('filter-active');
+                }
+            });
+        }
+        
+        function resetQuickFilters() {
+            document.getElementById('filter-has-summary').value = '';
+            document.getElementById('filter-pattern').value = '';
+            document.getElementById('filter-domain').value = '';
+            document.getElementById('filter-language').value = '';
+            updateFilterIndicators();
+            currentBrowseOffset = 0;
+            loadBrowseData();
+        }
+        
         async function loadBrowseData() {
             const view = document.getElementById('browse-view').value;
             const codebase = document.getElementById('browse-codebase').value;
             const filter = document.getElementById('browse-filter').value;
             
-            const contentDiv = document.getElementById('browse-content');
-            contentDiv.innerHTML = '<div class="loading">Loading...</div>';
-            closeDetails();
+            // Update quick filters visibility
+            updateQuickFiltersVisibility();
+            
+            const listContent = document.getElementById('browse-list-content');
+            const countSpan = document.getElementById('browse-list-count');
+            listContent.innerHTML = '<div class="loading" style="padding: 40px; text-align: center;">Loading...</div>';
+            countSpan.textContent = 'Loading...';
+            selectedIndex = -1;
+            clearDetailPanel();
             
             try {
                 let url, data;
@@ -957,140 +1982,347 @@ async def web_dashboard(request):
                 if (view === 'files') {
                     url = `/api/files?codebase=${codebase}&limit=${BROWSE_LIMIT}&offset=${currentBrowseOffset}`;
                     if (filter) url += `&filter=${encodeURIComponent(filter)}`;
+                    
+                    // Add quick filter params
+                    const hasSummary = document.getElementById('filter-has-summary').value;
+                    const pattern = document.getElementById('filter-pattern').value;
+                    const domain = document.getElementById('filter-domain').value;
+                    const language = document.getElementById('filter-language').value;
+                    
+                    if (hasSummary) url += `&has_summary=${hasSummary}`;
+                    if (pattern) url += `&pattern=${encodeURIComponent(pattern)}`;
+                    if (domain) url += `&domain=${encodeURIComponent(domain)}`;
+                    if (language) url += `&language=${encodeURIComponent(language)}`;
+                    
                     const res = await fetch(url);
                     data = await res.json();
-                    renderFilesTable(data);
+                    browseData.files = data.files || [];
+                    browseData.currentView = 'files';
+                    browseData.codebase = data.codebase;
+                    renderFilesList(data);
                 } else if (view === 'memories') {
                     url = `/api/memories?limit=${BROWSE_LIMIT}&offset=${currentBrowseOffset}`;
                     if (codebase) url += `&codebase=${codebase}`;
                     const res = await fetch(url);
                     data = await res.json();
-                    renderMemoriesTable(data);
+                    browseData.memories = data.memories || [];
+                    browseData.currentView = 'memories';
+                    renderMemoriesList(data);
                 } else if (view === 'summaries') {
                     url = `/api/summaries?codebase=${codebase}&limit=${BROWSE_LIMIT}&offset=${currentBrowseOffset}`;
                     const res = await fetch(url);
                     data = await res.json();
-                    renderSummariesTable(data);
+                    browseData.summaries = data.summaries || [];
+                    browseData.currentView = 'summaries';
+                    renderSummariesList(data);
                 }
             } catch (err) {
-                contentDiv.innerHTML = `<div class="error-msg">Error: ${err.message}</div>`;
+                listContent.innerHTML = `<div class="error-msg" style="margin: 20px;">Error: ${err.message}</div>`;
             }
         }
         
-        function renderFilesTable(data) {
-            const contentDiv = document.getElementById('browse-content');
+        function clearDetailPanel() {
+            document.getElementById('detail-title').textContent = 'Select a file to view details';
+            document.getElementById('detail-content').innerHTML = `
+                <div class="browse-detail-empty">
+                    <span>← Select an item from the list</span>
+                </div>
+            `;
+        }
+        
+        function renderFilesList(data) {
+            const listContent = document.getElementById('browse-list-content');
+            const countSpan = document.getElementById('browse-list-count');
             const files = data.files || [];
             
+            // Show active filters count
+            const activeFilters = getActiveFiltersCount();
+            const filterNote = activeFilters > 0 ? ` (${activeFilters} filter${activeFilters > 1 ? 's' : ''})` : '';
+            
             if (files.length === 0) {
-                contentDiv.innerHTML = '<div class="empty-state">No files found</div>';
+                listContent.innerHTML = `<div class="empty-state" style="padding: 40px;">No files found${filterNote ? ' - try clearing filters' : ''}</div>`;
+                countSpan.textContent = `0 files${filterNote}`;
                 renderPagination(0, 0);
                 return;
             }
             
-            let html = `<table class="data-table">
-                <thead><tr>
-                    <th>Path</th>
-                    <th>Chunks</th>
-                    <th>Summary</th>
-                    <th>Indexed At</th>
-                </tr></thead>
-                <tbody>`;
+            countSpan.textContent = `${data.offset + 1}-${data.offset + files.length} of ${data.total} files${filterNote}`;
             
-            files.forEach(f => {
-                const indexedAt = f.indexed_at ? new Date(f.indexed_at).toLocaleString() : '-';
+            let html = '';
+            files.forEach((f, idx) => {
+                const patternTag = f.pattern ? `<span class="tag" style="font-size: 10px;">${f.pattern}</span>` : '';
                 html += `
-                    <tr class="clickable" onclick="loadFileDetails('${data.codebase}', '${escapeJs(f.path)}')">
-                        <td style="font-family: monospace; color: #00d4ff;">${f.path}</td>
-                        <td>${f.chunk_count}</td>
-                        <td><span class="badge ${f.has_summary ? 'badge-yes' : 'badge-no'}">${f.has_summary ? 'Yes' : 'No'}</span></td>
-                        <td style="color: #888;">${indexedAt}</td>
-                    </tr>
+                    <div class="file-list-item" data-index="${idx}" onclick="selectFileItem(${idx})" tabindex="-1">
+                        <span class="file-item-path" title="${escapeHtml(f.path)}">${escapeHtml(f.path)}</span>
+                        <div class="file-item-meta">
+                            ${patternTag}
+                            <span class="file-item-chunks">${f.chunk_count}</span>
+                            <span class="file-item-summary-indicator ${f.has_summary ? 'has-summary' : ''}" title="${f.has_summary ? 'Has summary' : 'No summary'}"></span>
+                        </div>
+                    </div>
                 `;
             });
             
-            html += '</tbody></table>';
-            contentDiv.innerHTML = html;
+            listContent.innerHTML = html;
             renderPagination(data.total, data.offset);
         }
         
-        function renderMemoriesTable(data) {
-            const contentDiv = document.getElementById('browse-content');
+        function selectFileItem(idx) {
+            const view = browseData.currentView;
+            
+            // Update selection UI
+            document.querySelectorAll('.file-list-item').forEach((el, i) => {
+                el.classList.toggle('selected', i === idx);
+            });
+            selectedIndex = idx;
+            
+            // Load details based on view type
+            if (view === 'files') {
+                const file = browseData.files[idx];
+                if (file) {
+                    loadFileDetailsPanel(browseData.codebase, file.path);
+                }
+            } else if (view === 'memories') {
+                const memory = browseData.memories[idx];
+                if (memory) {
+                    showMemoryDetailsPanel(memory);
+                }
+            } else if (view === 'summaries') {
+                const summary = browseData.summaries[idx];
+                if (summary) {
+                    showSummaryDetailsPanel(summary);
+                }
+            }
+        }
+        
+        async function loadFileDetailsPanel(codebase, filePath) {
+            const titleEl = document.getElementById('detail-title');
+            const contentEl = document.getElementById('detail-content');
+            
+            titleEl.textContent = filePath;
+            contentEl.innerHTML = '<div class="loading" style="padding: 20px; text-align: center;">Loading...</div>';
+            
+            try {
+                const res = await fetch(`/api/file-details?codebase=${codebase}&path=${encodeURIComponent(filePath)}`);
+                const data = await res.json();
+                
+                if (data.error) {
+                    contentEl.innerHTML = `<div class="error-msg">${data.error}</div>`;
+                    return;
+                }
+                
+                let html = `<div class="detail-meta-grid">
+                    <div class="detail-meta-item">
+                        <div class="detail-meta-label">Codebase</div>
+                        <div class="detail-meta-value">${data.codebase}</div>
+                    </div>
+                    <div class="detail-meta-item">
+                        <div class="detail-meta-label">Chunks</div>
+                        <div class="detail-meta-value">${data.chunk_count}</div>
+                    </div>
+                    <div class="detail-meta-item">
+                        <div class="detail-meta-label">Indexed</div>
+                        <div class="detail-meta-value">${data.indexed_at ? new Date(data.indexed_at).toLocaleString() : '-'}</div>
+                    </div>
+                    <div class="detail-meta-item">
+                        <div class="detail-meta-label">Hash</div>
+                        <div class="detail-meta-value">${(data.content_hash || '').substring(0, 12)}...</div>
+                    </div>
+                </div>`;
+                
+                if (data.summary) {
+                    html += `<div class="summary-section">
+                        <div class="summary-title">Summary (${data.summary.model || 'unknown'} - ${data.summary.pattern || 'unknown'})</div>
+                        <div class="summary-content">${escapeHtml(data.summary.content)}</div>
+                    </div>`;
+                }
+                
+                html += '<h3 style="color: #888; font-size: 13px; margin: 15px 0 10px;">Chunks</h3><div class="chunk-list">';
+                
+                (data.chunks || []).forEach((chunk, idx) => {
+                    const chunkContent = escapeHtml(chunk.content || '');
+                    const preview = chunkContent.length > 200 ? chunkContent.substring(0, 200) + '...' : chunkContent;
+                    
+                    html += `
+                        <div class="chunk-item">
+                            <div class="chunk-header">
+                                <span>Chunk ${idx + 1}</span>
+                                <span>${chunk.memory_type || ''}</span>
+                            </div>
+                            <div class="chunk-content" id="detail-chunk-${idx}">${preview}</div>
+                            ${chunkContent.length > 200 ? `<span class="expand-btn" onclick="toggleDetailChunk(${idx}, \`${escapeJs(chunkContent)}\`)">Show more</span>` : ''}
+                        </div>
+                    `;
+                });
+                
+                html += '</div>';
+                contentEl.innerHTML = html;
+            } catch (err) {
+                contentEl.innerHTML = `<div class="error-msg">Error: ${err.message}</div>`;
+            }
+        }
+        
+        function toggleDetailChunk(idx, fullContent) {
+            const el = document.getElementById(`detail-chunk-${idx}`);
+            const btn = el.nextElementSibling;
+            if (el.classList.contains('expanded')) {
+                el.classList.remove('expanded');
+                el.innerHTML = fullContent.substring(0, 200) + '...';
+                btn.textContent = 'Show more';
+            } else {
+                el.classList.add('expanded');
+                el.innerHTML = fullContent;
+                btn.textContent = 'Show less';
+            }
+        }
+        
+        // Legacy function for backward compatibility
+        function renderFilesTable(data) {
+            renderFilesList(data);
+        }
+        
+        function renderMemoriesList(data) {
+            const listContent = document.getElementById('browse-list-content');
+            const countSpan = document.getElementById('browse-list-count');
             const memories = data.memories || [];
             
             if (memories.length === 0) {
-                contentDiv.innerHTML = '<div class="empty-state">No memories found</div>';
+                listContent.innerHTML = '<div class="empty-state" style="padding: 40px;">No memories found</div>';
+                countSpan.textContent = '0 memories';
                 renderPagination(0, 0);
                 return;
             }
             
-            let html = `<table class="data-table">
-                <thead><tr>
-                    <th>Type</th>
-                    <th>Content</th>
-                    <th>Tags</th>
-                    <th>Codebase</th>
-                    <th>Created</th>
-                </tr></thead>
-                <tbody>`;
+            countSpan.textContent = `${data.offset + 1}-${data.offset + memories.length} of ${data.total} memories`;
             
-            memories.forEach(m => {
+            let html = '';
+            memories.forEach((m, idx) => {
                 const badgeClass = m.type === 'decision' ? 'badge-decision' : 
                                    m.type === 'lesson' ? 'badge-lesson' : 'badge-conversation';
-                const tags = (m.tags || []).slice(0, 3).map(t => `<span class="tag">${t}</span>`).join('');
-                const created = m.created_at ? new Date(m.created_at).toLocaleString() : '-';
-                
                 html += `
-                    <tr class="clickable" onclick="showMemoryDetails(${JSON.stringify(m).replace(/"/g, '&quot;')})">
-                        <td><span class="badge ${badgeClass}">${m.type}</span></td>
-                        <td>${m.content_preview}</td>
-                        <td>${tags}</td>
-                        <td>${m.codebase}</td>
-                        <td style="color: #888;">${created}</td>
-                    </tr>
+                    <div class="file-list-item" data-index="${idx}" onclick="selectFileItem(${idx})" tabindex="-1">
+                        <div style="display: flex; align-items: center; gap: 10px; overflow: hidden; flex: 1;">
+                            <span class="badge ${badgeClass}">${m.type}</span>
+                            <span class="file-item-path" title="${escapeHtml(m.content_preview)}">${escapeHtml(m.content_preview)}</span>
+                        </div>
+                        <div class="file-item-meta">
+                            <span style="font-size: 11px; color: #555;">${m.codebase}</span>
+                        </div>
+                    </div>
                 `;
             });
             
-            html += '</tbody></table>';
-            contentDiv.innerHTML = html;
+            listContent.innerHTML = html;
             renderPagination(data.total, data.offset);
         }
         
-        function renderSummariesTable(data) {
-            const contentDiv = document.getElementById('browse-content');
+        function showMemoryDetailsPanel(memory) {
+            const titleEl = document.getElementById('detail-title');
+            const contentEl = document.getElementById('detail-content');
+            
+            titleEl.textContent = `Memory: ${memory.type}`;
+            
+            const tags = (memory.tags || []).map(t => `<span class="tag">${t}</span>`).join(' ');
+            const created = memory.created_at ? new Date(memory.created_at).toLocaleString() : '-';
+            
+            contentEl.innerHTML = `
+                <div class="detail-meta-grid">
+                    <div class="detail-meta-item">
+                        <div class="detail-meta-label">ID</div>
+                        <div class="detail-meta-value">${memory.id}</div>
+                    </div>
+                    <div class="detail-meta-item">
+                        <div class="detail-meta-label">Type</div>
+                        <div class="detail-meta-value">${memory.type}</div>
+                    </div>
+                    <div class="detail-meta-item">
+                        <div class="detail-meta-label">Codebase</div>
+                        <div class="detail-meta-value">${memory.codebase}</div>
+                    </div>
+                    <div class="detail-meta-item">
+                        <div class="detail-meta-label">Source</div>
+                        <div class="detail-meta-value">${memory.source}</div>
+                    </div>
+                    <div class="detail-meta-item">
+                        <div class="detail-meta-label">Created</div>
+                        <div class="detail-meta-value">${created}</div>
+                    </div>
+                </div>
+                ${tags ? `<div style="margin-bottom: 15px;">${tags}</div>` : ''}
+                <div style="background: #0f3460; padding: 15px; border-radius: 6px; font-family: monospace; font-size: 13px; white-space: pre-wrap; max-height: 300px; overflow-y: auto;">${escapeHtml(memory.content)}</div>
+            `;
+        }
+        
+        function renderSummariesList(data) {
+            const listContent = document.getElementById('browse-list-content');
+            const countSpan = document.getElementById('browse-list-count');
             const summaries = data.summaries || [];
             
             if (summaries.length === 0) {
-                contentDiv.innerHTML = '<div class="empty-state">No summaries found</div>';
+                listContent.innerHTML = '<div class="empty-state" style="padding: 40px;">No summaries found</div>';
+                countSpan.textContent = '0 summaries';
                 renderPagination(0, 0);
                 return;
             }
             
-            let html = `<table class="data-table">
-                <thead><tr>
-                    <th>File</th>
-                    <th>Pattern</th>
-                    <th>Domain</th>
-                    <th>Model</th>
-                    <th>Summarized At</th>
-                </tr></thead>
-                <tbody>`;
+            countSpan.textContent = `${data.offset + 1}-${data.offset + summaries.length} of ${data.total} summaries`;
             
-            summaries.forEach(s => {
-                const summarizedAt = s.summarized_at ? new Date(s.summarized_at).toLocaleString() : '-';
+            let html = '';
+            summaries.forEach((s, idx) => {
                 html += `
-                    <tr class="clickable" onclick="showSummaryDetails(${JSON.stringify(s).replace(/"/g, '&quot;')})">
-                        <td style="font-family: monospace; color: #00d4ff;">${s.file_path}</td>
-                        <td><span class="tag">${s.pattern || '-'}</span></td>
-                        <td><span class="tag">${s.domain || '-'}</span></td>
-                        <td style="color: #888;">${s.model || '-'}</td>
-                        <td style="color: #888;">${summarizedAt}</td>
-                    </tr>
+                    <div class="file-list-item" data-index="${idx}" onclick="selectFileItem(${idx})" tabindex="-1">
+                        <span class="file-item-path" title="${escapeHtml(s.file_path)}">${escapeHtml(s.file_path)}</span>
+                        <div class="file-item-meta">
+                            <span class="tag">${s.pattern || '-'}</span>
+                            <span class="tag">${s.domain || '-'}</span>
+                        </div>
+                    </div>
                 `;
             });
             
-            html += '</tbody></table>';
-            contentDiv.innerHTML = html;
+            listContent.innerHTML = html;
             renderPagination(data.total, data.offset);
+        }
+        
+        function showSummaryDetailsPanel(summary) {
+            const titleEl = document.getElementById('detail-title');
+            const contentEl = document.getElementById('detail-content');
+            
+            titleEl.textContent = summary.file_path;
+            const summarizedAt = summary.summarized_at ? new Date(summary.summarized_at).toLocaleString() : '-';
+            
+            contentEl.innerHTML = `
+                <div class="detail-meta-grid">
+                    <div class="detail-meta-item">
+                        <div class="detail-meta-label">Pattern</div>
+                        <div class="detail-meta-value">${summary.pattern || '-'}</div>
+                    </div>
+                    <div class="detail-meta-item">
+                        <div class="detail-meta-label">Domain</div>
+                        <div class="detail-meta-value">${summary.domain || '-'}</div>
+                    </div>
+                    <div class="detail-meta-item">
+                        <div class="detail-meta-label">Model</div>
+                        <div class="detail-meta-value">${summary.model || '-'}</div>
+                    </div>
+                    <div class="detail-meta-item">
+                        <div class="detail-meta-label">Summarized</div>
+                        <div class="detail-meta-value">${summarizedAt}</div>
+                    </div>
+                </div>
+                <div class="summary-section">
+                    <div class="summary-content">${escapeHtml(summary.content)}</div>
+                </div>
+            `;
+        }
+        
+        // Legacy functions for backward compatibility
+        function renderMemoriesTable(data) {
+            renderMemoriesList(data);
+        }
+        
+        function renderSummariesTable(data) {
+            renderSummariesList(data);
         }
         
         function renderPagination(total, offset) {
@@ -1123,121 +2355,47 @@ async def web_dashboard(request):
             loadBrowseData();
         }
         
-        // Details panels
-        async function loadFileDetails(codebase, filePath) {
-            const panel = document.getElementById('details-panel');
-            const content = document.getElementById('details-content');
+        // Keyboard navigation for browse list
+        document.getElementById('browse-list-content').addEventListener('keydown', function(e) {
+            const items = document.querySelectorAll('.file-list-item');
+            if (items.length === 0) return;
             
-            panel.classList.add('open');
-            document.getElementById('details-title').textContent = filePath;
-            content.innerHTML = '<div class="loading">Loading...</div>';
-            
-            try {
-                const res = await fetch(`/api/file-details?codebase=${codebase}&path=${encodeURIComponent(filePath)}`);
-                const data = await res.json();
-                
-                if (data.error) {
-                    content.innerHTML = `<div class="error-msg">${data.error}</div>`;
-                    return;
-                }
-                
-                let html = `<div class="details-meta">
-                    <div class="meta-item"><span class="meta-label">Codebase:</span> <span class="meta-value">${data.codebase}</span></div>
-                    <div class="meta-item"><span class="meta-label">Chunks:</span> <span class="meta-value">${data.chunk_count}</span></div>
-                    <div class="meta-item"><span class="meta-label">Indexed:</span> <span class="meta-value">${data.indexed_at ? new Date(data.indexed_at).toLocaleString() : '-'}</span></div>
-                    <div class="meta-item"><span class="meta-label">Hash:</span> <span class="meta-value">${(data.content_hash || '').substring(0, 16)}...</span></div>
-                </div>`;
-                
-                if (data.summary) {
-                    html += `<div class="summary-section">
-                        <div class="summary-title">LLM Summary (${data.summary.model} - ${data.summary.pattern})</div>
-                        <div class="summary-content">${escapeHtml(data.summary.content)}</div>
-                    </div>`;
-                }
-                
-                html += '<h3 style="color: #888; font-size: 13px; margin-bottom: 10px;">Chunks</h3><div class="chunk-list">';
-                
-                (data.chunks || []).forEach((chunk, idx) => {
-                    const chunkContent = escapeHtml(chunk.content || '');
-                    const preview = chunkContent.length > 200 ? chunkContent.substring(0, 200) + '...' : chunkContent;
-                    
-                    html += `
-                        <div class="chunk-item">
-                            <div class="chunk-header">
-                                <span>Chunk ${idx + 1}</span>
-                                <span>${chunk.memory_type}</span>
-                            </div>
-                            <div class="chunk-content" id="chunk-${idx}">${preview}</div>
-                            ${chunkContent.length > 200 ? `<span class="expand-btn" onclick="toggleChunkExpand(${idx}, \`${escapeJs(chunkContent)}\`)">Show more</span>` : ''}
-                        </div>
-                    `;
-                });
-                
-                html += '</div>';
-                content.innerHTML = html;
-            } catch (err) {
-                content.innerHTML = `<div class="error-msg">Error: ${err.message}</div>`;
+            if (e.key === 'ArrowDown') {
+                e.preventDefault();
+                const newIndex = selectedIndex < items.length - 1 ? selectedIndex + 1 : 0;
+                selectFileItem(newIndex);
+                items[newIndex].scrollIntoView({ block: 'nearest' });
+            } else if (e.key === 'ArrowUp') {
+                e.preventDefault();
+                const newIndex = selectedIndex > 0 ? selectedIndex - 1 : items.length - 1;
+                selectFileItem(newIndex);
+                items[newIndex].scrollIntoView({ block: 'nearest' });
+            } else if (e.key === 'Enter' && selectedIndex >= 0) {
+                e.preventDefault();
+                // Already selected, just ensure it's loaded
+                selectFileItem(selectedIndex);
             }
+        });
+        
+        // Legacy compatibility - redirect old functions to new ones
+        async function loadFileDetails(codebase, filePath) {
+            await loadFileDetailsPanel(codebase, filePath);
         }
         
         function showMemoryDetails(memory) {
-            const panel = document.getElementById('details-panel');
-            const content = document.getElementById('details-content');
-            
-            panel.classList.add('open');
-            document.getElementById('details-title').textContent = `Memory: ${memory.type}`;
-            
-            const tags = (memory.tags || []).map(t => `<span class="tag">${t}</span>`).join(' ');
-            
-            content.innerHTML = `
-                <div class="details-meta">
-                    <div class="meta-item"><span class="meta-label">ID:</span> <span class="meta-value">${memory.id}</span></div>
-                    <div class="meta-item"><span class="meta-label">Type:</span> <span class="meta-value">${memory.type}</span></div>
-                    <div class="meta-item"><span class="meta-label">Codebase:</span> <span class="meta-value">${memory.codebase}</span></div>
-                    <div class="meta-item"><span class="meta-label">Source:</span> <span class="meta-value">${memory.source}</span></div>
-                    <div class="meta-item"><span class="meta-label">Created:</span> <span class="meta-value">${memory.created_at ? new Date(memory.created_at).toLocaleString() : '-'}</span></div>
-                </div>
-                ${tags ? `<div style="margin-bottom: 15px;">${tags}</div>` : ''}
-                <div style="background: #0f3460; padding: 15px; border-radius: 6px; font-family: monospace; font-size: 13px; white-space: pre-wrap;">${escapeHtml(memory.content)}</div>
-            `;
+            showMemoryDetailsPanel(memory);
         }
         
         function showSummaryDetails(summary) {
-            const panel = document.getElementById('details-panel');
-            const content = document.getElementById('details-content');
-            
-            panel.classList.add('open');
-            document.getElementById('details-title').textContent = summary.file_path;
-            
-            content.innerHTML = `
-                <div class="details-meta">
-                    <div class="meta-item"><span class="meta-label">Pattern:</span> <span class="meta-value">${summary.pattern || '-'}</span></div>
-                    <div class="meta-item"><span class="meta-label">Domain:</span> <span class="meta-value">${summary.domain || '-'}</span></div>
-                    <div class="meta-item"><span class="meta-label">Model:</span> <span class="meta-value">${summary.model || '-'}</span></div>
-                    <div class="meta-item"><span class="meta-label">Summarized:</span> <span class="meta-value">${summary.summarized_at ? new Date(summary.summarized_at).toLocaleString() : '-'}</span></div>
-                </div>
-                <div class="summary-section">
-                    <div class="summary-content">${escapeHtml(summary.content)}</div>
-                </div>
-            `;
+            showSummaryDetailsPanel(summary);
         }
         
         function toggleChunkExpand(idx, fullContent) {
-            const el = document.getElementById(`chunk-${idx}`);
-            const btn = el.nextElementSibling;
-            if (el.classList.contains('expanded')) {
-                el.classList.remove('expanded');
-                el.innerHTML = fullContent.substring(0, 200) + '...';
-                btn.textContent = 'Show more';
-            } else {
-                el.classList.add('expanded');
-                el.innerHTML = fullContent;
-                btn.textContent = 'Show less';
-            }
+            toggleDetailChunk(idx, fullContent);
         }
         
         function closeDetails() {
-            document.getElementById('details-panel').classList.remove('open');
+            clearDetailPanel();
         }
         
         // Browse event listeners
@@ -1253,6 +2411,15 @@ async def web_dashboard(request):
             currentBrowseOffset = 0;
             loadBrowseData();
         }, 300));
+        
+        // Quick filter event listeners
+        ['filter-has-summary', 'filter-pattern', 'filter-domain', 'filter-language'].forEach(id => {
+            document.getElementById(id).addEventListener('change', () => {
+                currentBrowseOffset = 0;
+                updateFilterIndicators();
+                loadBrowseData();
+            });
+        });
         
         // =========== Utilities ===========
         function escapeHtml(str) {
@@ -1275,8 +2442,522 @@ async def web_dashboard(request):
             };
         }
         
+        // =========== Validate Tab ===========
+        let validateFiles = [];         // Current page of files
+        let validateTotal = 0;          // Total matching filters
+        let validateOffset = 0;         // Current pagination offset
+        let validateSelectedIndex = -1; // Selected index in current page
+        
+        function getValidatePageSize() {
+            return parseInt(document.getElementById('validate-page-size').value) || 20;
+        }
+        
+        async function loadValidationQueue() {
+            const codebase = document.getElementById('validate-codebase').value;
+            const status = document.getElementById('validate-status').value;
+            const pattern = document.getElementById('validate-pattern').value;
+            const domain = document.getElementById('validate-domain').value;
+            const limit = getValidatePageSize();
+            
+            if (!codebase) {
+                document.getElementById('validate-progress').textContent = 'Select a codebase';
+                return;
+            }
+            
+            document.getElementById('validate-list-content').innerHTML = '<div class="loading" style="padding: 20px;">Loading...</div>';
+            
+            try {
+                const params = new URLSearchParams({
+                    codebase,
+                    status,
+                    offset: validateOffset,
+                    limit
+                });
+                if (pattern) params.append('pattern', pattern);
+                if (domain) params.append('domain', domain);
+                
+                const res = await fetch(`/api/validation-queue?${params}`);
+                const data = await res.json();
+                
+                if (data.error) {
+                    document.getElementById('validate-progress').textContent = 'Error: ' + data.error;
+                    return;
+                }
+                
+                validateFiles = data.files || [];
+                validateTotal = data.total || 0;
+                
+                // Populate filter dropdowns with available options
+                if (data.pattern_options) {
+                    populateValidateFilterDropdown('validate-pattern', data.pattern_options, 'All Patterns');
+                }
+                if (data.domain_options) {
+                    populateValidateFilterDropdown('validate-domain', data.domain_options, 'All Domains');
+                }
+                
+                // Update progress
+                const reviewed = data.reviewed_count || 0;
+                document.getElementById('validate-progress').textContent = 
+                    `${reviewed} reviewed / ${validateTotal} total`;
+                
+                // Render file list
+                renderValidateFileList();
+                
+                // Auto-select first file if available and none selected
+                if (validateFiles.length > 0 && validateSelectedIndex < 0) {
+                    selectValidateFile(0);
+                } else if (validateFiles.length === 0) {
+                    clearValidatePanels();
+                }
+                
+                // Update filter indicator
+                updateValidateFilterIndicators();
+                
+            } catch (err) {
+                document.getElementById('validate-progress').textContent = 'Error loading queue';
+                console.error('Validation queue error:', err);
+            }
+        }
+        
+        function populateValidateFilterDropdown(selectId, options, defaultLabel) {
+            const select = document.getElementById(selectId);
+            const currentValue = select.value;
+            select.innerHTML = `<option value="">${defaultLabel}</option>`;
+            options.forEach(opt => {
+                if (opt) {
+                    select.innerHTML += `<option value="${opt}">${opt}</option>`;
+                }
+            });
+            // Restore previous selection if still valid
+            if (currentValue && options.includes(currentValue)) {
+                select.value = currentValue;
+            }
+        }
+        
+        function renderValidateFileList() {
+            const listContent = document.getElementById('validate-list-content');
+            const countSpan = document.getElementById('validate-list-count');
+            
+            if (validateFiles.length === 0) {
+                listContent.innerHTML = '<div class="empty-state" style="padding: 20px;">No files match filters</div>';
+                countSpan.textContent = '0 files';
+                renderValidatePagination();
+                return;
+            }
+            
+            const start = validateOffset + 1;
+            const end = validateOffset + validateFiles.length;
+            countSpan.textContent = `${start}-${end} of ${validateTotal}`;
+            
+            let html = '';
+            validateFiles.forEach((file, idx) => {
+                const statusIcon = file.status === 'approved' ? '✓' :
+                                  file.status === 'rejected' ? '✗' : '●';
+                const statusClass = file.status || 'unreviewed';
+                const selected = idx === validateSelectedIndex ? 'selected' : '';
+                
+                html += `
+                    <div class="validate-file-item ${selected}" data-index="${idx}" onclick="selectValidateFile(${idx})" tabindex="-1">
+                        <span class="validate-file-item-path" title="${escapeHtml(file.path)}">${escapeHtml(file.path)}</span>
+                        <span class="validate-status-icon ${statusClass}">${statusIcon}</span>
+                    </div>
+                `;
+            });
+            
+            listContent.innerHTML = html;
+            renderValidatePagination();
+        }
+        
+        function renderValidatePagination() {
+            const container = document.getElementById('validate-pagination');
+            const limit = getValidatePageSize();
+            const totalPages = Math.ceil(validateTotal / limit);
+            const currentPage = Math.floor(validateOffset / limit) + 1;
+            
+            if (totalPages <= 1) {
+                container.innerHTML = '';
+                return;
+            }
+            
+            let html = '';
+            
+            // Previous button
+            if (currentPage > 1) {
+                html += `<button class="page-btn" onclick="validateGoToPage(${currentPage - 1})">‹</button>`;
+            }
+            
+            // Page numbers (show max 5 pages with ellipsis for compact display)
+            const maxVisible = 5;
+            let startPage = Math.max(1, currentPage - 2);
+            let endPage = Math.min(totalPages, startPage + maxVisible - 1);
+            startPage = Math.max(1, endPage - maxVisible + 1);
+            
+            if (startPage > 1) {
+                html += `<button class="page-btn" onclick="validateGoToPage(1)">1</button>`;
+                if (startPage > 2) html += '<span style="color:#555;padding:0 2px;">…</span>';
+            }
+            
+            for (let p = startPage; p <= endPage; p++) {
+                const active = p === currentPage ? 'active' : '';
+                html += `<button class="page-btn ${active}" onclick="validateGoToPage(${p})">${p}</button>`;
+            }
+            
+            if (endPage < totalPages) {
+                if (endPage < totalPages - 1) html += '<span style="color:#555;padding:0 2px;">…</span>';
+                html += `<button class="page-btn" onclick="validateGoToPage(${totalPages})">${totalPages}</button>`;
+            }
+            
+            // Next button
+            if (currentPage < totalPages) {
+                html += `<button class="page-btn" onclick="validateGoToPage(${currentPage + 1})">›</button>`;
+            }
+            
+            container.innerHTML = html;
+        }
+        
+        function validateGoToPage(page) {
+            const limit = getValidatePageSize();
+            validateOffset = (page - 1) * limit;
+            validateSelectedIndex = -1;
+            loadValidationQueue();
+        }
+        
+        function selectValidateFile(idx) {
+            if (idx < 0 || idx >= validateFiles.length) return;
+            
+            validateSelectedIndex = idx;
+            
+            // Update selection UI
+            document.querySelectorAll('.validate-file-item').forEach((el, i) => {
+                el.classList.toggle('selected', i === idx);
+            });
+            
+            // Load file content
+            loadValidationFileContent(validateFiles[idx]);
+        }
+        
+        async function loadValidationFileContent(file) {
+            const codebase = document.getElementById('validate-codebase').value;
+            
+            document.getElementById('validate-file-path').textContent = file.path;
+            document.getElementById('validate-source-content').innerHTML = '<div class="loading">Loading...</div>';
+            document.getElementById('validate-summary-content').innerHTML = '<div class="loading">Loading...</div>';
+            
+            try {
+                const [fileRes, summaryRes] = await Promise.all([
+                    fetch(`/api/file-content?codebase=${codebase}&path=${encodeURIComponent(file.path)}`),
+                    fetch(`/api/file-summary?codebase=${codebase}&path=${encodeURIComponent(file.path)}`)
+                ]);
+                
+                const fileData = await fileRes.json();
+                const summaryData = await summaryRes.json();
+                
+                // Display file content
+                if (fileData.content) {
+                    document.getElementById('validate-source-content').textContent = fileData.content;
+                } else {
+                    document.getElementById('validate-source-content').innerHTML = 
+                        `<div class="error-msg">${fileData.error || 'Could not load file'}</div>`;
+                }
+                
+                // Display summary
+                if (summaryData.summary) {
+                    const summary = summaryData.summary;
+                    document.getElementById('validate-model').textContent = 
+                        `${summary.model || 'unknown'} • ${summary.pattern || 'unknown'}`;
+                    document.getElementById('validate-summary-content').innerHTML = `
+                        <div style="margin-bottom: 15px;">
+                            <div style="color: #888; font-size: 11px; margin-bottom: 4px;">PURPOSE</div>
+                            <div style="color: #eee; font-family: sans-serif;">${escapeHtml(summary.purpose || summary.content)}</div>
+                        </div>
+                        ${summary.pattern ? `<div style="margin-bottom: 10px;"><span class="tag">Pattern: ${summary.pattern}</span></div>` : ''}
+                        ${summary.domain ? `<div style="margin-bottom: 10px;"><span class="tag">Domain: ${summary.domain}</span></div>` : ''}
+                        ${summary.exports ? `
+                            <div style="margin-top: 15px;">
+                                <div style="color: #888; font-size: 11px; margin-bottom: 4px;">EXPORTS</div>
+                                <div style="color: #ccc;">${escapeHtml(summary.exports)}</div>
+                            </div>
+                        ` : ''}
+                    `;
+                } else {
+                    document.getElementById('validate-model').textContent = '';
+                    document.getElementById('validate-summary-content').innerHTML = 
+                        '<div class="error-msg">No summary available</div>';
+                }
+                
+                updateValidateNavigation();
+            } catch (err) {
+                document.getElementById('validate-source-content').innerHTML = 
+                    `<div class="error-msg">Error: ${err.message}</div>`;
+            }
+        }
+        
+        function clearValidatePanels() {
+            document.getElementById('validate-file-path').textContent = 'No files match filters';
+            document.getElementById('validate-source-content').innerHTML = 
+                '<div class="browse-detail-empty"><span>No files to display</span></div>';
+            document.getElementById('validate-summary-content').innerHTML = 
+                '<div class="browse-detail-empty"><span>No summaries to review</span></div>';
+            document.getElementById('validate-model').textContent = '';
+            updateValidateNavigation();
+        }
+        
+        function updateValidateNavigation() {
+            // Can go prev if not on first item of first page
+            const canPrev = validateOffset > 0 || validateSelectedIndex > 0;
+            // Can go next if not on last item of last page
+            const canNext = validateFiles.length > 0 && 
+                           (validateOffset + validateSelectedIndex) < (validateTotal - 1);
+            
+            document.getElementById('validate-prev').disabled = !canPrev;
+            document.getElementById('validate-next').disabled = !canNext;
+        }
+        
+        function validatePrev() {
+            if (validateSelectedIndex > 0) {
+                // Move to previous in current page
+                selectValidateFile(validateSelectedIndex - 1);
+            } else if (validateOffset > 0) {
+                // Go to previous page, select last item
+                const limit = getValidatePageSize();
+                validateOffset = Math.max(0, validateOffset - limit);
+                loadValidationQueue().then(() => {
+                    // Select last item after load
+                    if (validateFiles.length > 0) {
+                        selectValidateFile(validateFiles.length - 1);
+                    }
+                });
+            }
+        }
+        
+        function validateNext() {
+            if (validateSelectedIndex < validateFiles.length - 1) {
+                // Move to next in current page
+                selectValidateFile(validateSelectedIndex + 1);
+            } else if (validateOffset + validateFiles.length < validateTotal) {
+                // Go to next page, select first item
+                const limit = getValidatePageSize();
+                validateOffset += limit;
+                validateSelectedIndex = -1;
+                loadValidationQueue().then(() => {
+                    if (validateFiles.length > 0) {
+                        selectValidateFile(0);
+                    }
+                });
+            }
+        }
+        
+        function validateSkip() {
+            validateNext();
+        }
+        
+        async function validateApprove() {
+            await submitValidation('approved');
+        }
+        
+        async function validateReject() {
+            await submitValidation('rejected');
+        }
+        
+        async function submitValidation(newStatus) {
+            if (validateFiles.length === 0 || validateSelectedIndex < 0) return;
+            
+            const file = validateFiles[validateSelectedIndex];
+            const codebase = document.getElementById('validate-codebase').value;
+            const currentStatusFilter = document.getElementById('validate-status').value;
+            
+            try {
+                const res = await fetch('/api/summary/validate', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        codebase: codebase,
+                        file_path: file.path,
+                        status: newStatus
+                    })
+                });
+                
+                const data = await res.json();
+                if (data.success) {
+                    // If viewing "unreviewed" and we just approved/rejected, remove from list
+                    if (currentStatusFilter === 'unreviewed') {
+                        // Remove the file from the local array
+                        validateFiles.splice(validateSelectedIndex, 1);
+                        validateTotal--;
+                        
+                        // If there are more files, select the next one (or previous if at end)
+                        if (validateFiles.length > 0) {
+                            if (validateSelectedIndex >= validateFiles.length) {
+                                validateSelectedIndex = validateFiles.length - 1;
+                            }
+                            renderValidateFileList();
+                            selectValidateFile(validateSelectedIndex);
+                        } else if (validateTotal > 0) {
+                            // Current page is empty but there are more pages
+                            // Go to previous page if possible
+                            if (validateOffset > 0) {
+                                validateOffset = Math.max(0, validateOffset - getValidatePageSize());
+                            }
+                            validateSelectedIndex = -1;
+                            loadValidationQueue();
+                        } else {
+                            // No more files
+                            renderValidateFileList();
+                            clearValidatePanels();
+                        }
+                    } else {
+                        // Just update the status icon and move to next
+                        file.status = newStatus;
+                        renderValidateFileList();
+                        validateNext();
+                    }
+                }
+            } catch (err) {
+                console.error('Validation error:', err);
+            }
+        }
+        
+        async function validateRegenerate() {
+            if (validateFiles.length === 0 || validateSelectedIndex < 0) return;
+            
+            const file = validateFiles[validateSelectedIndex];
+            const codebase = document.getElementById('validate-codebase').value;
+            
+            document.getElementById('validate-summary-content').innerHTML = '<div class="loading">Regenerating...</div>';
+            
+            try {
+                const res = await fetch('/api/summary/regenerate', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        codebase: codebase,
+                        file_path: file.path
+                    })
+                });
+                
+                const data = await res.json();
+                if (data.success) {
+                    loadValidationFileContent(file);
+                } else {
+                    document.getElementById('validate-summary-content').innerHTML = 
+                        `<div class="error-msg">${data.error || 'Failed to regenerate'}</div>`;
+                }
+            } catch (err) {
+                document.getElementById('validate-summary-content').innerHTML = 
+                    `<div class="error-msg">Error: ${err.message}</div>`;
+            }
+        }
+        
+        function updateValidateFilterIndicators() {
+            const pattern = document.getElementById('validate-pattern').value;
+            const domain = document.getElementById('validate-domain').value;
+            const hasFilters = pattern || domain;
+            
+            document.getElementById('validate-filter-reset').style.display = hasFilters ? 'inline' : 'none';
+        }
+        
+        function resetValidateFilters() {
+            document.getElementById('validate-pattern').value = '';
+            document.getElementById('validate-domain').value = '';
+            validateOffset = 0;
+            validateSelectedIndex = -1;
+            updateValidateFilterIndicators();
+            loadValidationQueue();
+        }
+        
+        // Keyboard navigation for validate file list
+        document.getElementById('validate-list-content').addEventListener('keydown', function(e) {
+            if (e.key === 'ArrowDown') {
+                e.preventDefault();
+                if (validateSelectedIndex < validateFiles.length - 1) {
+                    selectValidateFile(validateSelectedIndex + 1);
+                }
+            } else if (e.key === 'ArrowUp') {
+                e.preventDefault();
+                if (validateSelectedIndex > 0) {
+                    selectValidateFile(validateSelectedIndex - 1);
+                }
+            }
+        });
+        
+        // Validate tab filter event listeners
+        ['validate-codebase', 'validate-status', 'validate-pattern', 'validate-domain', 'validate-page-size'].forEach(id => {
+            document.getElementById(id).addEventListener('change', () => {
+                validateOffset = 0;
+                validateSelectedIndex = -1;
+                loadValidationQueue();
+            });
+        });
+        
+        // Clear filters button
+        document.getElementById('validate-filter-reset').addEventListener('click', resetValidateFilters);
+        
+        // Populate validate codebase dropdown when codebases are loaded
+        function populateValidateCodebase() {
+            const select = document.getElementById('validate-codebase');
+            select.innerHTML = '';
+            codebases.forEach(cb => {
+                select.innerHTML += `<option value="${cb.name}">${cb.name}</option>`;
+            });
+        }
+        
+        // =========== Global Keyboard Shortcuts ===========
+        document.addEventListener('keydown', function(e) {
+            // Don't trigger if typing in an input
+            if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.tagName === 'SELECT') {
+                return;
+            }
+            
+            // Get active tab
+            const activeTab = document.querySelector('.tab.active');
+            const tabName = activeTab ? activeTab.dataset.tab : '';
+            
+            // Global shortcuts
+            if (e.key === '/' || (e.ctrlKey && e.key === 'k')) {
+                e.preventDefault();
+                // Switch to search tab and focus input
+                document.querySelector('[data-tab="search"]').click();
+                setTimeout(() => document.getElementById('search-query').focus(), 100);
+                return;
+            }
+            
+            // Tab-specific shortcuts
+            if (tabName === 'search') {
+                // No additional shortcuts needed, Enter already works
+            } else if (tabName === 'browse') {
+                // Already has arrow key navigation via the list content
+            } else if (tabName === 'validate') {
+                if (e.key === 'ArrowLeft') {
+                    e.preventDefault();
+                    validatePrev();
+                } else if (e.key === 'ArrowRight') {
+                    e.preventDefault();
+                    validateNext();
+                } else if (e.key === 'ArrowUp') {
+                    e.preventDefault();
+                    if (validateSelectedIndex > 0) {
+                        selectValidateFile(validateSelectedIndex - 1);
+                    }
+                } else if (e.key === 'ArrowDown') {
+                    e.preventDefault();
+                    if (validateSelectedIndex < validateFiles.length - 1) {
+                        selectValidateFile(validateSelectedIndex + 1);
+                    }
+                } else if (e.key === 'a' || e.key === 'A') {
+                    e.preventDefault();
+                    validateApprove();
+                } else if (e.key === 'r' || e.key === 'R') {
+                    e.preventDefault();
+                    validateReject();
+                } else if (e.key === 's' || e.key === 'S') {
+                    e.preventDefault();
+                    validateSkip();
+                }
+            }
+        });
+        
         // =========== Init ===========
-        loadCodebases();
+        loadCodebases().then(populateValidateCodebase);
         startStatusRefresh();
     </script>
 </body>

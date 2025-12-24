@@ -2241,6 +2241,22 @@ class MemoryService:
         try:
             from ..llm.ollama_client import OllamaClient
             
+            # Step 1: Check if Ollama is installed
+            is_installed, install_msg = OllamaClient.check_ollama_installed()
+            if not is_installed:
+                logger.warning(f"[Summarization] {install_msg}")
+                logger.warning("[Summarization] Background summarization will not start.")
+                return
+            else:
+                logger.info(f"[Summarization] {install_msg}")
+            
+            # Step 2: Check if Ollama is running
+            is_running, running_msg = OllamaClient.check_ollama_running(self._summarization_config.ollama_url)
+            if not is_running:
+                logger.warning(f"[Summarization] {running_msg}")
+                logger.warning("[Summarization] Background summarization will not start.")
+                return
+            
             # Create LLM client
             llm_client = OllamaClient(
                 base_url=self._summarization_config.ollama_url,
@@ -2248,12 +2264,12 @@ class MemoryService:
                 timeout=self._summarization_config.timeout_seconds
             )
             
-            # Health check - ensure Ollama is running
-            if not await llm_client.health_check():
+            # Step 3: Health check with auto-pull if model is missing
+            if not await llm_client.health_check(auto_pull=True):
                 logger.warning(
-                    f"[Summarization] Ollama not available at {self._summarization_config.ollama_url}. "
-                    f"Background summarization will not start. "
-                    f"Run 'ollama serve' and 'ollama pull {self._summarization_config.model}' to enable."
+                    f"[Summarization] Ollama health check failed. "
+                    f"Model '{self._summarization_config.model}' may not be available. "
+                    f"Background summarization will not start."
                 )
                 await llm_client.close()
                 return
@@ -2891,16 +2907,24 @@ Dependencies: {dependencies}"""
         codebase: Optional[str] = None,
         limit: int = 50,
         offset: int = 0,
-        search_filter: Optional[str] = None
+        search_filter: Optional[str] = None,
+        has_summary: Optional[bool] = None,
+        pattern: Optional[str] = None,
+        domain: Optional[str] = None,
+        language: Optional[str] = None
     ) -> Dict[str, Any]:
         """
-        List indexed files with pagination support.
+        List indexed files with pagination and filtering support.
         
         Args:
             codebase: Codebase name (None = first available)
             limit: Maximum number of results
             offset: Offset for pagination
             search_filter: Optional filename filter (substring match)
+            has_summary: Filter by summary presence (True/False/None)
+            pattern: Filter by pattern from summary (e.g., "service", "utility")
+            domain: Filter by domain from summary (e.g., "api", "database")
+            language: Filter by programming language
             
         Returns:
             Dict with files list, total count, and pagination info
@@ -2922,7 +2946,7 @@ Dependencies: {dependencies}"""
             # Get all indexed files
             indexed_files = vector_store.file_index.get_all_indexed_files()
             
-            # Get all summarized files for has_summary flag
+            # Get all summarized files with their data for filtering
             summarized_files = vector_store.summary_index.get_all_summarized_files()
             
             # Build file list with metadata
@@ -2931,6 +2955,44 @@ Dependencies: {dependencies}"""
                 # Apply search filter if provided
                 if search_filter and search_filter.lower() not in file_path.lower():
                     continue
+                
+                file_has_summary = file_path in summarized_files
+                summary_data = summarized_files.get(file_path, {}) if file_has_summary else {}
+                
+                # Apply has_summary filter
+                if has_summary is not None:
+                    if has_summary and not file_has_summary:
+                        continue
+                    if not has_summary and file_has_summary:
+                        continue
+                
+                # Apply pattern filter (from summary)
+                if pattern:
+                    file_pattern = summary_data.get("pattern", "")
+                    if pattern.lower() != file_pattern.lower():
+                        continue
+                
+                # Apply domain filter (from summary)
+                if domain:
+                    file_domain = summary_data.get("domain", "")
+                    if domain.lower() != file_domain.lower():
+                        continue
+                
+                # Apply language filter (from file extension)
+                if language:
+                    ext_to_lang = {
+                        ".py": "python",
+                        ".kt": "kotlin",
+                        ".java": "java",
+                        ".ts": "typescript",
+                        ".tsx": "typescript",
+                        ".js": "javascript",
+                        ".jsx": "javascript",
+                    }
+                    file_ext = "." + file_path.rsplit(".", 1)[-1].lower() if "." in file_path else ""
+                    file_language = ext_to_lang.get(file_ext, "")
+                    if language.lower() != file_language:
+                        continue
                 
                 chunk_ids_str = metadata.get("chunk_ids", "")
                 chunk_count = len(chunk_ids_str.split(",")) if chunk_ids_str else 0
@@ -2941,7 +3003,9 @@ Dependencies: {dependencies}"""
                     "content_hash": metadata.get("content_hash", "")[:12] + "...",  # Truncate hash
                     "chunk_count": chunk_count,
                     "indexed_at": metadata.get("indexed_at"),
-                    "has_summary": file_path in summarized_files
+                    "has_summary": file_has_summary,
+                    "pattern": summary_data.get("pattern"),
+                    "domain": summary_data.get("domain")
                 })
             
             # Sort by path
@@ -3304,3 +3368,338 @@ Dependencies: {dependencies}"""
             return None
         
         return self._import_graphs[codebase].export_graph(format)
+    
+    # ─────────────────────────────────────────────────────────────────────────
+    # Summary Validation API
+    # ─────────────────────────────────────────────────────────────────────────
+    
+    async def get_validation_queue_async(
+        self,
+        codebase: str,
+        status: str = "unreviewed",
+        pattern: str = "",
+        domain: str = "",
+        offset: int = 0,
+        limit: int = 20
+    ) -> Dict[str, Any]:
+        """
+        Get files for summary validation with pagination and filtering.
+        
+        Args:
+            codebase: Codebase name
+            status: Filter by validation status: "unreviewed", "approved", "rejected", "all"
+            pattern: Filter by code pattern (e.g., "service", "utility")
+            domain: Filter by domain (e.g., "api", "database")
+            offset: Pagination offset
+            limit: Page size (max 50)
+            
+        Returns:
+            Dict with paginated files list, counts, and filter options
+        """
+        vector_store = self._vector_stores.get(codebase)
+        if not vector_store:
+            return {"error": f"Codebase not found: {codebase}", "files": []}
+        
+        # Clamp limit
+        limit = min(max(1, limit), 50)
+        
+        try:
+            # Get all summarized files (cached)
+            summarized_files = vector_store.summary_index.get_all_summarized_files()
+            
+            files = []
+            reviewed_count = 0
+            all_patterns = set()
+            all_domains = set()
+            
+            for file_path, info in summarized_files.items():
+                validation_status = info.get("validation_status", "unreviewed")
+                file_pattern = info.get("pattern", "")
+                file_domain = info.get("domain", "")
+                
+                # Collect all patterns/domains for filter dropdowns
+                if file_pattern:
+                    all_patterns.add(file_pattern)
+                if file_domain:
+                    all_domains.add(file_domain)
+                
+                # Count reviewed files (before any filtering)
+                if validation_status in ["approved", "rejected"]:
+                    reviewed_count += 1
+                
+                # Apply status filter
+                status_match = (
+                    status == "all" or
+                    (status == "unreviewed" and validation_status == "unreviewed") or
+                    status == validation_status
+                )
+                if not status_match:
+                    continue
+                
+                # Apply pattern filter
+                if pattern and file_pattern != pattern:
+                    continue
+                
+                # Apply domain filter
+                if domain and file_domain != domain:
+                    continue
+                
+                files.append({
+                    "path": file_path,
+                    "status": validation_status,
+                    "pattern": file_pattern,
+                    "domain": file_domain
+                })
+            
+            # Sort by path
+            files.sort(key=lambda f: f["path"])
+            
+            # Total before pagination
+            total = len(files)
+            
+            # Apply pagination
+            paginated_files = files[offset:offset + limit]
+            
+            return {
+                "codebase": codebase,
+                "files": paginated_files,
+                "total": total,
+                "offset": offset,
+                "limit": limit,
+                "reviewed_count": reviewed_count,
+                "pattern_options": sorted(all_patterns),
+                "domain_options": sorted(all_domains)
+            }
+            
+        except Exception as e:
+            logger.error(f"Error getting validation queue: {e}")
+            return {"error": str(e), "files": []}
+    
+    async def get_file_summary_async(
+        self,
+        codebase: str,
+        file_path: str
+    ) -> Dict[str, Any]:
+        """
+        Get just the summary for a file (lightweight, no chunks).
+        
+        Args:
+            codebase: Codebase name
+            file_path: Relative path to file
+            
+        Returns:
+            Dict with summary only
+        """
+        vector_store = self._vector_stores.get(codebase)
+        if not vector_store:
+            return {"error": f"Codebase not found: {codebase}"}
+        
+        try:
+            summary_info = vector_store.summary_index.get_summary_info(file_path)
+            if not summary_info:
+                return {"codebase": codebase, "file_path": file_path, "summary": None}
+            
+            # Get summary content from the MAIN collection using summary_chunk_id
+            summary_content = ""
+            summary_chunk_id = summary_info.get("summary_chunk_id")
+            if summary_chunk_id:
+                try:
+                    result = vector_store.collection.get(
+                        ids=[summary_chunk_id],
+                        include=["documents"]
+                    )
+                    if result["ids"] and result["documents"]:
+                        summary_content = result["documents"][0]
+                except Exception as e:
+                    logger.debug(f"Error fetching summary content: {e}")
+            
+            return {
+                "codebase": codebase,
+                "file_path": file_path,
+                "summary": {
+                    "content": summary_content,
+                    "purpose": summary_content,  # Alias for compatibility
+                    "model": summary_info.get("model", ""),
+                    "pattern": summary_info.get("pattern", ""),
+                    "domain": summary_info.get("domain", ""),
+                    "exports": summary_info.get("exports", ""),
+                    "summarized_at": summary_info.get("summarized_at", ""),
+                    "validation_status": summary_info.get("validation_status", "unreviewed")
+                }
+            }
+        except Exception as e:
+            logger.error(f"Error getting file summary: {e}")
+            return {"error": str(e)}
+    
+    async def get_file_content_async(
+        self,
+        codebase: str,
+        file_path: str
+    ) -> Dict[str, Any]:
+        """
+        Get raw file content for validation.
+        
+        Args:
+            codebase: Codebase name
+            file_path: Relative path to file
+            
+        Returns:
+            Dict with file content
+        """
+        # Find the codebase config to get the base path
+        codebase_config = None
+        for cb in self.config.codebases:
+            if cb.name == codebase:
+                codebase_config = cb
+                break
+        
+        if not codebase_config:
+            return {"error": f"Codebase not found: {codebase}"}
+        
+        try:
+            from pathlib import Path
+            full_path = Path(codebase_config.path) / file_path
+            
+            if not full_path.exists():
+                return {"error": f"File not found: {file_path}"}
+            
+            # Read file with error handling for encoding
+            try:
+                content = full_path.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                content = full_path.read_text(encoding="latin-1")
+            
+            # Limit content size for display
+            max_size = 50000
+            if len(content) > max_size:
+                content = content[:max_size] + f"\n\n... (truncated, {len(content)} total characters)"
+            
+            return {
+                "codebase": codebase,
+                "file_path": file_path,
+                "content": content
+            }
+            
+        except Exception as e:
+            logger.error(f"Error reading file content: {e}")
+            return {"error": str(e)}
+    
+    async def validate_summary_async(
+        self,
+        codebase: str,
+        file_path: str,
+        status: str
+    ) -> Dict[str, Any]:
+        """
+        Validate (approve/reject) a summary.
+        
+        Args:
+            codebase: Codebase name
+            file_path: File path
+            status: "approved" or "rejected"
+            
+        Returns:
+            Dict with success status
+        """
+        vector_store = self._vector_stores.get(codebase)
+        if not vector_store:
+            return {"error": f"Codebase not found: {codebase}", "success": False}
+        
+        try:
+            # Update the summary index with validation status
+            from datetime import datetime
+            
+            # Get current summary info
+            summary_info = vector_store.summary_index.get_summary_info(file_path)
+            if not summary_info:
+                return {"error": "Summary not found", "success": False}
+            
+            # Update with validation status
+            summary_info["validation_status"] = status
+            summary_info["validated_at"] = datetime.now().isoformat()
+            
+            # Store updated info back
+            vector_store.summary_index.update_summary_metadata(file_path, summary_info)
+            
+            return {"success": True, "status": status}
+            
+        except Exception as e:
+            logger.error(f"Error validating summary: {e}")
+            return {"error": str(e), "success": False}
+    
+    async def regenerate_summary_async(
+        self,
+        codebase: str,
+        file_path: str
+    ) -> Dict[str, Any]:
+        """
+        Regenerate a summary for a file.
+        
+        Args:
+            codebase: Codebase name
+            file_path: File path
+            
+        Returns:
+            Dict with success status and new summary
+        """
+        if not self._summarizer:
+            # Provide detailed diagnostics
+            from ..llm.ollama_client import OllamaClient
+            
+            is_installed, install_msg = OllamaClient.check_ollama_installed()
+            if not is_installed:
+                return {"error": f"Summarization not available: {install_msg}", "success": False}
+            
+            is_running, running_msg = OllamaClient.check_ollama_running(self._summarization_config.ollama_url)
+            if not is_running:
+                return {"error": f"Summarization not available: {running_msg}", "success": False}
+            
+            return {"error": "Summarizer not initialized. The server may need to be restarted after starting Ollama.", "success": False}
+        
+        vector_store = self._vector_stores.get(codebase)
+        if not vector_store:
+            return {"error": f"Codebase not found: {codebase}", "success": False}
+        
+        try:
+            # Get the file content
+            content_result = await self.get_file_content_async(codebase, file_path)
+            if "error" in content_result:
+                return content_result
+            
+            content = content_result["content"]
+            
+            # Get heuristic metadata if available
+            heuristic_metadata = None
+            try:
+                heuristic_metadata = self.heuristic_extractor.extract_file_metadata(file_path, content)
+            except Exception:
+                pass  # Heuristics are optional
+            
+            # Generate new summary using the correct method signature
+            summary = await self._summarizer.summarize_file(file_path, content, heuristic_metadata)
+            
+            if summary.error:
+                return {"error": f"Summarization failed: {summary.error}", "success": False}
+            
+            # Compute content hash
+            content_hash = ChromaVectorStore.compute_content_hash(content)
+            
+            # Store the new summary
+            await self._store_summary(codebase, file_path, summary, content_hash)
+            
+            return {
+                "success": True,
+                "summary": {
+                    "purpose": summary.purpose,
+                    "pattern": summary.pattern,
+                    "domain": summary.domain,
+                    "exports": ", ".join(summary.key_exports) if summary.key_exports else "",
+                    "model": summary.model_used
+                }
+            }
+            
+        except Exception as e:
+            logger.error(f"Error regenerating summary: {e}")
+            return {"error": str(e), "success": False}
+    
+
