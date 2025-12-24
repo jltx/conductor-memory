@@ -24,6 +24,7 @@ tree-sitter-c-sharp>=0.23.0
 tree-sitter-kotlin>=1.0.0
 tree-sitter-swift>=0.0.1
 tree-sitter-objc>=3.0.0
+tree-sitter-typescript>=0.23.0
 
 # Client dependencies
 requests>=2.28.0

@@ -256,6 +256,22 @@ memory_search(
 )
 ```
 
+### Implementation Signal Filtering
+Filter by method calls, attribute access, and subscript patterns extracted from AST analysis:
+```
+memory_search(
+    query="sliding window indexing",
+    calls=["fit", "iloc"],        # Methods that call these functions
+    accesses=["bar_index"],       # Methods that access these attributes
+    subscripts=["iloc"],          # Methods with subscript patterns (e.g., df.iloc[x])
+)
+```
+
+Use cases:
+- **Find callers**: `calls=["fit"]` → methods that call `fit()`
+- **Find data access**: `accesses=["_cache"]` → methods that read `self._cache`
+- **Find indexing patterns**: `subscripts=["iloc"]` → methods using `df.iloc[...]`
+
 ### Summary Integration
 Include LLM-generated file summaries for better context:
 ```

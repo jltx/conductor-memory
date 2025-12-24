@@ -5,9 +5,12 @@ Chunking Strategy and Memory Refresh Mechanism for the Hybrid Local/Cloud LLM Or
 import ast
 import logging
 import warnings
-from typing import List, Tuple, Optional
-from dataclasses import dataclass
+from typing import List, Tuple, Optional, TYPE_CHECKING
+from dataclasses import dataclass, field
 from enum import Enum
+
+if TYPE_CHECKING:
+    from .heuristics import MethodImplementationDetail
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +34,89 @@ class ChunkMetadata:
     domain: Optional[str] = None
     module: Optional[str] = None
     parent_class: Optional[str] = None  # For nested classes and methods in split classes
+    # Implementation details for verification queries (Phase 1 enhancement)
+    implementation_details: Optional[List['MethodImplementationDetail']] = field(default=None)
+    
+    def get_searchable_signals(self) -> str:
+        """
+        Return formatted implementation signals text for search indexing.
+        
+        Combines the searchable text from all implementation details,
+        making method calls, attribute access, and subscripts searchable.
+        
+        Returns:
+            Formatted string with all implementation signals, or empty string if none.
+        """
+        if not self.implementation_details:
+            return ""
+        
+        signals_parts = []
+        for detail in self.implementation_details:
+            text = detail.to_searchable_text()
+            if text and text != "[Implementation Signals]":
+                signals_parts.append(text)
+        
+        return "\n\n".join(signals_parts)
+    
+    def get_signal_tags(self) -> List[str]:
+        """
+        Generate searchable tags from implementation signals.
+        
+        Creates tags in formats like:
+        - calls:method_name (for internal and external calls)
+        - subscript:iloc (for subscript access patterns)
+        - reads:self._attr (for attribute reads)
+        - writes:self._attr (for attribute writes)
+        - param:name (for parameter usage)
+        
+        Returns:
+            List of tag strings for filtering and search.
+        """
+        if not self.implementation_details:
+            return []
+        
+        tags = []
+        for detail in self.implementation_details:
+            # Add call tags (both internal and external)
+            for call in detail.internal_calls:
+                tags.append(f"calls:{call}")
+            for call in detail.external_calls:
+                tags.append(f"calls:{call}")
+            
+            # Add attribute read tags
+            for attr in detail.attribute_reads:
+                tags.append(f"reads:{attr}")
+            
+            # Add attribute write tags
+            for attr in detail.attribute_writes:
+                tags.append(f"writes:{attr}")
+            
+            # Add subscript tags - extract the access pattern (e.g., "iloc" from "df.iloc[x]")
+            for subscript in detail.subscript_access:
+                # Extract the key part for the tag (e.g., "iloc" from "df.iloc[bar_index]")
+                if '.' in subscript:
+                    # Get the last attribute before the bracket
+                    parts = subscript.split('[')[0].split('.')
+                    if len(parts) >= 2:
+                        tags.append(f"subscript:{parts[-1]}")
+                    else:
+                        tags.append(f"subscript:{subscript.split('[')[0]}")
+                else:
+                    tags.append(f"subscript:{subscript.split('[')[0]}")
+            
+            # Add parameter usage tags
+            for param in detail.parameters_used:
+                tags.append(f"param:{param}")
+        
+        # Deduplicate while preserving order
+        seen = set()
+        unique_tags = []
+        for tag in tags:
+            if tag not in seen:
+                seen.add(tag)
+                unique_tags.append(tag)
+        
+        return unique_tags
 
 class ChunkingManager:
     """Manages chunking strategies for memory management"""
@@ -38,6 +124,7 @@ class ChunkingManager:
     def __init__(self, strategy: ChunkingStrategy = ChunkingStrategy.FUNCTION_CLASS):
         self.strategy = strategy
         self._tree_sitter_parser = None  # Lazy initialization
+        self._heuristic_extractor = None  # Lazy initialization for implementation signal extraction
     
     @property
     def tree_sitter_parser(self):
@@ -51,16 +138,33 @@ class ChunkingManager:
                 self._tree_sitter_parser = False  # Mark as unavailable
         return self._tree_sitter_parser if self._tree_sitter_parser is not False else None
     
+    @property
+    def heuristic_extractor(self):
+        """Get or create heuristic extractor for implementation signal extraction."""
+        if self._heuristic_extractor is None:
+            try:
+                from .heuristics import HeuristicExtractor
+                self._heuristic_extractor = HeuristicExtractor()
+            except ImportError as e:
+                logger.warning(f"HeuristicExtractor not available: {e}")
+                self._heuristic_extractor = False  # Mark as unavailable
+        return self._heuristic_extractor if self._heuristic_extractor is not False else None
+    
     def chunk_text(self, text: str, file_path: str, commit_hash: Optional[str] = None) -> List[Tuple[str, ChunkMetadata]]:
         """
-        Split text into chunks based on the configured strategy
+        Split text into chunks based on the configured strategy.
+        
+        After chunking, enhances each chunk with implementation signals
+        (method calls, attribute access, subscripts) for better searchability.
         
         Returns list of (chunk_text, metadata) tuples
         """
         # Try tree-sitter first for supported languages
         if self.tree_sitter_parser and self.tree_sitter_parser.supports(file_path):
             try:
-                return self.tree_sitter_parser.parse(text, file_path, commit_hash)
+                chunks = self.tree_sitter_parser.parse(text, file_path, commit_hash)
+                # Enhance chunks with implementation signals
+                return self._enhance_chunks_with_signals(chunks, text, file_path)
             except Exception as e:
                 logger.warning(f"Tree-sitter parsing failed for {file_path}: {e}, falling back to legacy chunking")
         
@@ -68,23 +172,126 @@ class ChunkingManager:
         is_python = file_path.endswith('.py')
         
         if self.strategy == ChunkingStrategy.AST_PYTHON and is_python:
-            return self._chunk_by_ast_python(text, file_path, commit_hash)
+            chunks = self._chunk_by_ast_python(text, file_path, commit_hash)
         elif self.strategy == ChunkingStrategy.FUNCTION_CLASS:
             # Use AST for Python files, fallback to naive for others
             if is_python:
-                return self._chunk_by_ast_python(text, file_path, commit_hash)
-            return self._chunk_by_function_class(text, file_path, commit_hash)
+                chunks = self._chunk_by_ast_python(text, file_path, commit_hash)
+            else:
+                chunks = self._chunk_by_function_class(text, file_path, commit_hash)
         elif self.strategy == ChunkingStrategy.PARAGRAPH:
-            return self._chunk_by_paragraph(text, file_path, commit_hash)
+            chunks = self._chunk_by_paragraph(text, file_path, commit_hash)
         elif self.strategy == ChunkingStrategy.SENTENCE:
-            return self._chunk_by_sentence(text, file_path, commit_hash)
+            chunks = self._chunk_by_sentence(text, file_path, commit_hash)
         elif self.strategy == ChunkingStrategy.TOKEN_WINDOW:
-            return self._chunk_by_token_window(text, file_path, commit_hash)
+            chunks = self._chunk_by_token_window(text, file_path, commit_hash)
         else:
             # Default: use AST for Python, naive function/class for others
             if is_python:
-                return self._chunk_by_ast_python(text, file_path, commit_hash)
-            return self._chunk_by_function_class(text, file_path, commit_hash)
+                chunks = self._chunk_by_ast_python(text, file_path, commit_hash)
+            else:
+                chunks = self._chunk_by_function_class(text, file_path, commit_hash)
+        
+        # Enhance chunks with implementation signals
+        return self._enhance_chunks_with_signals(chunks, text, file_path)
+    
+    def _enhance_chunks_with_signals(
+        self, 
+        chunks: List[Tuple[str, ChunkMetadata]], 
+        file_content: str, 
+        file_path: str
+    ) -> List[Tuple[str, ChunkMetadata]]:
+        """
+        Enhance all chunks in a file with implementation signals.
+        
+        Extracts file metadata once and distributes signals to matching chunks.
+        This is more efficient than extracting per-chunk.
+        
+        Args:
+            chunks: List of (chunk_text, metadata) tuples
+            file_content: Full file content
+            file_path: Path to the file
+            
+        Returns:
+            List of enhanced (chunk_text, metadata) tuples
+        """
+        if not self.heuristic_extractor or not chunks:
+            return chunks
+        
+        try:
+            # Extract file metadata once for all chunks
+            file_metadata = self.heuristic_extractor.extract_file_metadata(file_path, file_content)
+            
+            if not file_metadata or not file_metadata.method_details:
+                return chunks
+            
+            # Enhance each chunk
+            enhanced_chunks = []
+            for chunk_text, metadata in chunks:
+                enhanced_text = self._match_and_enhance_chunk(
+                    chunk_text, metadata, file_metadata.method_details
+                )
+                enhanced_chunks.append((enhanced_text, metadata))
+            
+            return enhanced_chunks
+            
+        except Exception as e:
+            logger.debug(f"Batch implementation signal extraction failed for {file_path}: {e}")
+            return chunks
+    
+    def _match_and_enhance_chunk(
+        self,
+        chunk_text: str,
+        metadata: ChunkMetadata,
+        all_method_details: List['MethodImplementationDetail']
+    ) -> str:
+        """
+        Match method details to a specific chunk and enhance its content.
+        
+        Args:
+            chunk_text: Original chunk content
+            metadata: ChunkMetadata for this chunk (will be modified)
+            all_method_details: All extracted method details from the file
+            
+        Returns:
+            Enhanced chunk content with appended signals
+        """
+        from .heuristics import MethodImplementationDetail
+        
+        # Filter method details to those within this chunk
+        chunk_details: List[MethodImplementationDetail] = []
+        
+        for detail in all_method_details:
+            # Check if the method definition appears in this chunk
+            # Look for common definition patterns
+            def_patterns = [
+                f"def {detail.name}(",       # Python function
+                f"def {detail.name} (",      # Python with space
+                f"async def {detail.name}(", # Python async function
+                f"async def {detail.name} (",
+                f"func {detail.name}(",      # Go function
+                f"func ({detail.name}",      # Go method receiver (partial match)
+                f"function {detail.name}(",  # JavaScript/TypeScript function
+                f"fun {detail.name}(",       # Kotlin function
+            ]
+            
+            if any(pattern in chunk_text for pattern in def_patterns):
+                chunk_details.append(detail)
+        
+        if not chunk_details:
+            return chunk_text
+        
+        # Store implementation details in metadata
+        metadata.implementation_details = chunk_details
+        
+        # Get formatted signals text
+        signals_text = metadata.get_searchable_signals()
+        
+        if not signals_text:
+            return chunk_text
+        
+        # Append signals to chunk content
+        return f"{chunk_text}\n\n{signals_text}"
     
     def _chunk_by_function_class(self, text: str, file_path: str, commit_hash: Optional[str]) -> List[Tuple[str, ChunkMetadata]]:
         """Chunk by functions and classes - naive implementation for non-Python files"""

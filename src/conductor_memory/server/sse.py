@@ -124,6 +124,9 @@ async def api_search(request):
             has_docstrings=body.get("has_docstrings"),
             min_class_count=body.get("min_class_count"),
             min_function_count=body.get("min_function_count"),
+            calls=body.get("calls"),
+            accesses=body.get("accesses"),
+            subscripts=body.get("subscripts"),
             include_summaries=body.get("include_summaries", False),
             boost_summarized=body.get("boost_summarized", True)
         )
@@ -2986,6 +2989,10 @@ async def memory_search(
     has_docstrings: bool | None = None,
     min_class_count: int | None = None,
     min_function_count: int | None = None,
+    # Phase 1: Implementation Signal Filtering
+    calls: list[str] | None = None,
+    accesses: list[str] | None = None,
+    subscripts: list[str] | None = None,
     # Phase 5: Summary Integration
     include_summaries: bool = False,
     boost_summarized: bool = True
@@ -3010,6 +3017,9 @@ async def memory_search(
         has_docstrings: Filter files that have/don't have docstrings
         min_class_count: Minimum number of classes in file
         min_function_count: Minimum number of functions in file
+        calls: Filter by method calls (matches calls:* tags, e.g., ['iloc', 'fit'])
+        accesses: Filter by attribute access (matches reads:* tags, e.g., ['bar_index'])
+        subscripts: Filter by subscript patterns (matches subscript:* tags, e.g., ['iloc'])
         include_summaries: Include file summary data in results (Phase 5)
         boost_summarized: Apply relevance boost to files with summaries (Phase 5)
     
@@ -3036,6 +3046,9 @@ async def memory_search(
         has_docstrings=has_docstrings,
         min_class_count=min_class_count,
         min_function_count=min_function_count,
+        calls=calls,
+        accesses=accesses,
+        subscripts=subscripts,
         include_summaries=include_summaries,
         boost_summarized=boost_summarized
     )

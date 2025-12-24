@@ -307,6 +307,10 @@ class MemoryService:
         has_docstrings: Optional[bool] = None,
         min_class_count: Optional[int] = None,
         min_function_count: Optional[int] = None,
+        # Phase 1: Implementation Signal Filtering
+        calls: Optional[List[str]] = None,
+        accesses: Optional[List[str]] = None,
+        subscripts: Optional[List[str]] = None,
         # Phase 5: Summary integration
         include_summaries: bool = False,
         boost_summarized: bool = True
@@ -331,6 +335,9 @@ class MemoryService:
             has_docstrings: Filter files that have/don't have docstrings
             min_class_count: Minimum number of classes in file
             min_function_count: Minimum number of functions in file
+            calls: Filter by method calls (matches calls:* tags, e.g., ['iloc', 'fit'])
+            accesses: Filter by attribute access (matches reads:* tags, e.g., ['bar_index'])
+            subscripts: Filter by subscript patterns (matches subscript:* tags, e.g., ['iloc'])
             include_summaries: Include LLM-generated summaries with results (default False)
             boost_summarized: Apply boost to results that have LLM summaries (default True)
             
@@ -435,6 +442,12 @@ class MemoryService:
                 similar_chunks = self._filter_by_heuristics(
                     similar_chunks, languages, class_names, function_names, annotations,
                     has_annotations, has_docstrings, min_class_count, min_function_count
+                )
+            
+            # Apply implementation signal filtering (Phase 1)
+            if any([calls, accesses, subscripts]):
+                similar_chunks = self._filter_by_implementation_signals(
+                    similar_chunks, calls, accesses, subscripts
                 )
             
             # Remove duplicates based on content similarity
@@ -872,6 +885,9 @@ class MemoryService:
         has_docstrings: Optional[bool] = None,
         min_class_count: Optional[int] = None,
         min_function_count: Optional[int] = None,
+        calls: Optional[List[str]] = None,
+        accesses: Optional[List[str]] = None,
+        subscripts: Optional[List[str]] = None,
         include_summaries: bool = False,
         boost_summarized: bool = True
     ) -> Dict[str, Any]:
@@ -881,6 +897,7 @@ class MemoryService:
             domain_boosts, include_tags, exclude_tags,
             languages, class_names, function_names, annotations,
             has_annotations, has_docstrings, min_class_count, min_function_count,
+            calls, accesses, subscripts,
             include_summaries, boost_summarized
         ))
     
@@ -1414,6 +1431,12 @@ class MemoryService:
                 if heuristic_dict.get('has_docstrings', False):
                     tags.append("has_docstrings:true")
             
+            # Phase 1 Enhancement: Add implementation signal tags from chunk metadata
+            # These enable filtering by method calls, attribute access, subscripts, and parameter usage
+            signal_tags = metadata.get_signal_tags()
+            if signal_tags:
+                tags.extend(signal_tags)
+            
             memory_chunk = MemoryChunk(
                 id=chunk_id,
                 project_id=codebase.name,
@@ -1622,6 +1645,12 @@ class MemoryService:
             
             # Add line range for precise location
             tags.append(f"lines:{metadata.start_line}-{metadata.end_line}")
+            
+            # Phase 1 Enhancement: Add implementation signal tags from chunk metadata
+            # These enable filtering by method calls, attribute access, subscripts, and parameter usage
+            signal_tags = metadata.get_signal_tags()
+            if signal_tags:
+                tags.extend(signal_tags)
             
             memory_chunk = MemoryChunk(
                 id=chunk_id,
@@ -1843,6 +1872,95 @@ class MemoryService:
         
         if len(filtered_chunks) < len(chunks):
             logger.debug(f"Heuristic filtering: {len(chunks)} -> {len(filtered_chunks)} chunks")
+        
+        return filtered_chunks
+    
+    def _filter_by_implementation_signals(
+        self,
+        chunks: List[MemoryChunk],
+        calls: Optional[List[str]] = None,
+        accesses: Optional[List[str]] = None,
+        subscripts: Optional[List[str]] = None
+    ) -> List[MemoryChunk]:
+        """
+        Filter chunks by implementation signals extracted during indexing.
+        
+        These signals are generated from AST analysis during Phase 1 indexing
+        and stored as tags on chunks. This enables queries like:
+        - "Find methods that call 'iloc'" -> calls=["iloc"]
+        - "Find methods that access 'bar_index'" -> accesses=["bar_index"]
+        - "Find methods with subscript patterns on 'iloc'" -> subscripts=["iloc"]
+        
+        Args:
+            chunks: List of MemoryChunk objects
+            calls: Filter by method calls (matches calls:* tags)
+            accesses: Filter by attribute access (matches reads:* tags)
+            subscripts: Filter by subscript patterns (matches subscript:* tags)
+            
+        Returns:
+            Filtered list of chunks
+        """
+        if not any([calls, accesses, subscripts]):
+            return chunks
+        
+        filtered_chunks = []
+        
+        for chunk in chunks:
+            chunk_tags = set(chunk.tags)
+            
+            # Filter by method calls (calls:method_name)
+            if calls:
+                call_match = False
+                for call_name in calls:
+                    # Check for exact match or partial match
+                    for tag in chunk_tags:
+                        if tag.startswith("calls:"):
+                            tag_value = tag[6:]  # Remove "calls:" prefix
+                            # Match if the call name appears in the tag value
+                            if call_name in tag_value or tag_value.endswith(f".{call_name}"):
+                                call_match = True
+                                break
+                    if call_match:
+                        break
+                if not call_match:
+                    continue
+            
+            # Filter by attribute access (reads:attribute_name)
+            if accesses:
+                access_match = False
+                for access_name in accesses:
+                    for tag in chunk_tags:
+                        if tag.startswith("reads:"):
+                            tag_value = tag[6:]  # Remove "reads:" prefix
+                            # Match if the access name appears in the tag value
+                            if access_name in tag_value:
+                                access_match = True
+                                break
+                    if access_match:
+                        break
+                if not access_match:
+                    continue
+            
+            # Filter by subscript patterns (subscript:pattern)
+            if subscripts:
+                subscript_match = False
+                for subscript_pattern in subscripts:
+                    for tag in chunk_tags:
+                        if tag.startswith("subscript:"):
+                            tag_value = tag[10:]  # Remove "subscript:" prefix
+                            # Match if the subscript pattern appears in the tag value
+                            if subscript_pattern in tag_value:
+                                subscript_match = True
+                                break
+                    if subscript_match:
+                        break
+                if not subscript_match:
+                    continue
+            
+            filtered_chunks.append(chunk)
+        
+        if len(filtered_chunks) < len(chunks):
+            logger.debug(f"Implementation signal filtering: {len(chunks)} -> {len(filtered_chunks)} chunks")
         
         return filtered_chunks
 
