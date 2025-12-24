@@ -3006,7 +3006,7 @@ async def memory_search(
         project_id: Optional filter by project ID
         codebase: Optional codebase name to search (None = search all codebases)
         min_relevance: Minimum relevance score 0-1 (default 0.1)
-        search_mode: Search mode - "auto" (default), "semantic", "keyword", or "hybrid"
+        search_mode: Search mode - "auto" (default), "semantic", "keyword", "hybrid", or "verify"
         include_tags: Include only results matching these tags (supports prefix:* patterns)
         exclude_tags: Exclude results matching these tags (supports prefix:* patterns)
         languages: Filter by programming languages (e.g., ['python', 'java'])

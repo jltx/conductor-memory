@@ -25,6 +25,16 @@ from ..core.models import MemoryChunk, RoleEnum, MemoryType
 from ..core.resources import detect_resources, get_optimal_device, SystemResources
 from ..embedding.sentence_transformer import SentenceTransformerEmbedder
 from ..search.hybrid import HybridSearcher, SearchMode
+from ..search.verification import (
+    parse_verification_query,
+    find_evidence,
+    extract_key_terms,
+    VerificationResult,
+    VerificationInfo,
+    VerificationStatus,
+    SubjectInfo,
+    Evidence,
+)
 from ..llm.summarizer import FileSummarizer, FileSummary
 
 logger = logging.getLogger(__name__)
@@ -323,7 +333,7 @@ class MemoryService:
             codebase: Optional codebase name to search (None = search all)
             max_results: Maximum number of results to return
             project_id: Optional filter by project ID
-            search_mode: "semantic", "keyword", "hybrid", or "auto" (default)
+            search_mode: "semantic", "keyword", "hybrid", "auto" (default), or "verify"
             domain_boosts: Per-query domain boost overrides (e.g., {'class': 1.5, 'test': 0.5})
             include_tags: Include only results matching these tags (supports prefix:* patterns)
             exclude_tags: Exclude results matching these tags (supports prefix:* patterns)
@@ -350,6 +360,15 @@ class MemoryService:
         self._query_active.set()
         
         try:
+            # Handle verification search mode (Phase 3)
+            if search_mode == "verify":
+                return await self._verify_search(
+                    query=query,
+                    codebase=codebase,
+                    max_results=max_results,
+                    include_summaries=include_summaries,
+                )
+            
             # Determine search mode
             mode = SearchMode(search_mode) if search_mode in [m.value for m in SearchMode] else SearchMode.AUTO
             if mode == SearchMode.AUTO:
@@ -517,6 +536,163 @@ class MemoryService:
         finally:
             # Clear query active flag - allow background summarizer to resume
             self._query_active.clear()
+    
+    async def _verify_search(
+        self,
+        query: str,
+        codebase: Optional[str] = None,
+        max_results: int = 10,
+        include_summaries: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Handle verification search mode (Phase 3).
+        
+        Parses "verify X uses Y" style queries and checks implementation signals
+        for evidence supporting or contradicting the claim.
+        
+        Args:
+            query: The verification query (e.g., "verify _generate_features uses iloc")
+            codebase: Optional codebase to search in
+            max_results: Maximum results for subject search
+            include_summaries: Include file summaries in results
+            
+        Returns:
+            Dict with verification result (from VerificationResult.to_dict())
+            Falls back to regular search if query cannot be parsed as verification
+        """
+        start_time = datetime.now()
+        
+        # Parse the verification query
+        intent = parse_verification_query(query)
+        
+        if not intent:
+            # Fall back to regular search if not a verification query
+            logger.debug(f"[Verify] Query not parseable as verification, falling back: {query}")
+            # Remove "verify" prefix if present and do regular search
+            fallback_query = query
+            if query.lower().startswith("verify "):
+                fallback_query = query[7:].strip()
+            
+            return await self.search_async(
+                query=fallback_query,
+                codebase=codebase,
+                max_results=max_results,
+                search_mode="auto",
+                include_summaries=include_summaries,
+            )
+        
+        logger.debug(f"[Verify] Parsed query - subject: '{intent.subject}', claim: '{intent.claim}'")
+        
+        # Search for the subject using existing search
+        subject_search = await self.search_async(
+            query=intent.subject,
+            codebase=codebase,
+            max_results=max_results,
+            search_mode="auto",  # Use auto mode for subject search
+        )
+        
+        # Check if we found the subject
+        results = subject_search.get("results", [])
+        if not results:
+            # Subject not found
+            result = VerificationResult.subject_not_found(intent.subject, intent.claim)
+            query_time = (datetime.now() - start_time).total_seconds() * 1000
+            result_dict = result.to_dict()
+            result_dict["query_time_ms"] = query_time
+            return result_dict
+        
+        # Find evidence across all matching chunks
+        all_evidence: List[Evidence] = []
+        best_file = None
+        best_line = None
+        subject_type = None
+        
+        for chunk_result in results:
+            chunk_tags = chunk_result.get("tags", [])
+            chunk_content = chunk_result.get("content", "")
+            
+            # Extract file path from tags
+            file_path = None
+            for tag in chunk_tags:
+                if tag.startswith("file:"):
+                    file_path = tag[5:]
+                    if best_file is None:
+                        best_file = file_path
+                    break
+            
+            # Extract line info if available
+            for tag in chunk_tags:
+                if tag.startswith("lines:"):
+                    try:
+                        line_range = tag[6:]
+                        best_line = int(line_range.split("-")[0])
+                    except (ValueError, IndexError):
+                        pass
+                    break
+            
+            # Detect subject type from tags
+            for tag in chunk_tags:
+                if tag.startswith("domain:"):
+                    domain = tag[7:]
+                    if domain in ("function", "method"):
+                        subject_type = "method"
+                    elif domain == "class_summary":
+                        subject_type = "class"
+                    break
+            
+            # Find evidence in this chunk
+            chunk_evidence = find_evidence(chunk_tags, chunk_content, intent.claim)
+            all_evidence.extend(chunk_evidence)
+        
+        # Deduplicate evidence by (type, detail) and keep highest relevance
+        seen_evidence: Dict[tuple, Evidence] = {}
+        for ev in all_evidence:
+            key = (ev.type, ev.detail)
+            if key not in seen_evidence or ev.relevance > seen_evidence[key].relevance:
+                seen_evidence[key] = ev
+        
+        deduplicated_evidence = sorted(
+            seen_evidence.values(),
+            key=lambda e: e.relevance,
+            reverse=True
+        )
+        
+        # Determine verification status and confidence
+        if deduplicated_evidence:
+            # Calculate confidence based on evidence strength
+            max_relevance = max(e.relevance for e in deduplicated_evidence)
+            avg_relevance = sum(e.relevance for e in deduplicated_evidence) / len(deduplicated_evidence)
+            confidence = min((max_relevance + avg_relevance) / 2 + 0.1, 1.0)
+            
+            status = VerificationStatus.SUPPORTED
+            summary = f"VERIFIED: '{intent.subject}' {intent.claim} - found {len(deduplicated_evidence)} evidence item(s)."
+        else:
+            status = VerificationStatus.NOT_SUPPORTED
+            confidence = 0.7  # We found the subject but no evidence
+            summary = f"NOT VERIFIED: Found '{intent.subject}' but no evidence that it {intent.claim}."
+        
+        # Build the result
+        result = VerificationResult(
+            subject=SubjectInfo(
+                name=intent.subject,
+                file=best_file,
+                found=True,
+                line=best_line,
+                type=subject_type,
+            ),
+            verification=VerificationInfo(
+                status=status,
+                confidence=confidence,
+                evidence=deduplicated_evidence[:10],  # Limit to top 10 evidence items
+            ),
+            summary=summary,
+        )
+        
+        query_time = (datetime.now() - start_time).total_seconds() * 1000
+        result_dict = result.to_dict()
+        result_dict["query_time_ms"] = query_time
+        
+        return result_dict
     
     async def store_async(
         self,
