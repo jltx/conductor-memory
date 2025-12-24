@@ -33,10 +33,14 @@ class FileSummary:
     response_time_ms: Optional[float] = None
     is_skeleton: bool = False
     error: Optional[str] = None
+    # Phase 2: Implementation-aware summary fields
+    how_it_works: Optional[str] = None  # Explanation of HOW the code works
+    key_mechanisms: Optional[List[str]] = None  # Key mechanisms/patterns used
+    method_summaries: Optional[Dict[str, str]] = None  # Per-method summaries
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for storage."""
-        return {
+        result = {
             'file_path': self.file_path,
             'language': self.language,
             'purpose': self.purpose,
@@ -50,6 +54,14 @@ class FileSummary:
             'is_skeleton': self.is_skeleton,
             'error': self.error
         }
+        # Include implementation-aware fields when present
+        if self.how_it_works is not None:
+            result['how_it_works'] = self.how_it_works
+        if self.key_mechanisms is not None:
+            result['key_mechanisms'] = self.key_mechanisms
+        if self.method_summaries is not None:
+            result['method_summaries'] = self.method_summaries
+        return result
 
 
 class FileSummarizer:
@@ -132,7 +144,11 @@ class FileSummarizer:
                 model_used=summary_data.get('model_used', 'unknown'),
                 tokens_used=summary_data.get('tokens_used'),
                 response_time_ms=summary_data.get('response_time_ms'),
-                is_skeleton=use_skeleton
+                is_skeleton=use_skeleton,
+                # Phase 2: Implementation-aware fields (optional, populated when LLM provides them)
+                how_it_works=summary_data.get('how_it_works'),
+                key_mechanisms=summary_data.get('key_mechanisms'),
+                method_summaries=summary_data.get('method_summaries')
             )
             
         except Exception as e:
@@ -394,6 +410,16 @@ Focus on:
 - Important external dependencies
 - The business domain or technical area this code belongs to
 
+IMPORTANT: Focus on HOW the code works, not just what it does.
+
+For each significant method, explain:
+- What data structures/indices it uses
+- Any caching, memoization, or optimization strategies
+- How parameters flow through the logic
+- Any coordinate systems or index translations
+
+Use the implementation signals provided (calls, attribute access, subscripts) to inform your analysis. These signals show you exactly what methods call, what data they access, and how they use parameters.
+
 Respond with valid JSON only, no additional text or markdown formatting."""
     
     def _build_user_prompt(
@@ -419,7 +445,17 @@ Respond with valid JSON only, no additional text or markdown formatting."""
             f'  "pattern": "architectural pattern (e.g., Repository, ViewModel, Controller, Utility)",',
             f'  "key_exports": ["list", "of", "main", "public", "APIs"],',
             f'  "dependencies": ["key", "external", "dependencies"],',
-            f'  "domain": "business domain (e.g., authentication, payments, ui)"',
+            f'  "domain": "business domain (e.g., authentication, payments, ui)",',
+            f'',
+            f'  "how_it_works": "Explanation of HOW the code works - mechanisms, data flow, key algorithms, optimizations",',
+            f'',
+            f'  "key_mechanisms": [',
+            f'    "list key patterns/mechanisms used (e.g., caching, lazy loading, window-relative indexing)"',
+            f'  ],',
+            f'',
+            f'  "method_summaries": {{',
+            f'    "method_name": "what this method does and HOW - include data access patterns, parameter usage, notable logic"',
+            f'  }}',
             f"}}"
         ]
         
@@ -440,8 +476,79 @@ Respond with valid JSON only, no additional text or markdown formatting."""
             if heuristic_context:
                 prompt_parts.insert(-8, f"Context from static analysis: {'; '.join(heuristic_context)}")
                 prompt_parts.insert(-8, "")
+            
+            # Add implementation signals from method details (Phase 2 enhancement)
+            if heuristic_metadata.method_details:
+                signals_section = self._format_implementation_signals(heuristic_metadata.method_details)
+                if signals_section:
+                    prompt_parts.insert(-8, signals_section)
+                    prompt_parts.insert(-8, "")
         
         return '\n'.join(prompt_parts)
+    
+    def _format_implementation_signals(self, method_details: List) -> str:
+        """
+        Format implementation signals from method details for LLM context.
+        
+        Provides the LLM with extracted signals about what methods call,
+        what data they access, and how they use parameters.
+        """
+        if not method_details:
+            return ""
+        
+        lines = ["Implementation Signals (from static analysis):"]
+        
+        # Limit to most significant methods to control token usage
+        # Prioritize methods with more signals (likely more complex/important)
+        sorted_details = sorted(
+            method_details,
+            key=lambda m: (
+                len(m.internal_calls) + len(m.external_calls) +
+                len(m.subscript_access) + len(m.attribute_reads)
+            ),
+            reverse=True
+        )[:10]  # Top 10 most signal-rich methods
+        
+        for detail in sorted_details:
+            method_signals = []
+            
+            # Combine internal and external calls
+            all_calls = detail.internal_calls + detail.external_calls
+            if all_calls:
+                method_signals.append(f"calls: {', '.join(all_calls[:8])}")
+            
+            if detail.subscript_access:
+                method_signals.append(f"subscripts: {', '.join(detail.subscript_access[:5])}")
+            
+            if detail.attribute_reads:
+                method_signals.append(f"reads: {', '.join(detail.attribute_reads[:5])}")
+            
+            if detail.attribute_writes:
+                method_signals.append(f"writes: {', '.join(detail.attribute_writes[:3])}")
+            
+            if detail.parameters_used:
+                method_signals.append(f"uses params: {', '.join(detail.parameters_used)}")
+            
+            # Add structural hints for complex methods
+            structural = []
+            if detail.has_loop:
+                structural.append("loops")
+            if detail.has_conditional:
+                structural.append("conditionals")
+            if detail.has_try_except:
+                structural.append("error handling")
+            if detail.is_async:
+                structural.append("async")
+            if structural:
+                method_signals.append(f"structure: {', '.join(structural)}")
+            
+            if method_signals:
+                lines.append(f"  {detail.name}(): {'; '.join(method_signals)}")
+        
+        # Only return if we have actual signals
+        if len(lines) > 1:
+            return '\n'.join(lines)
+        return ""
     
     def _parse_text_response(
         self, 
