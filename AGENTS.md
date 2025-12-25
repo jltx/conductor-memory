@@ -19,6 +19,7 @@ This file defines how AI coding assistants should leverage the conductor-memory 
 | `memory_file_centrality` | Get files sorted by importance | PageRank-based centrality for prioritization |
 | `memory_file_dependencies` | Get imports/imported_by for a file | Dependency analysis |
 | `memory_import_graph_stats` | Get import graph statistics | File counts, edges, centrality info |
+| `memory_invalidate_summaries` | **NEW:** Clear all summaries for re-summarization | Schema migration, force regeneration |
 
 ## Search Strategy: Tiered Approach
 

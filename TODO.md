@@ -168,8 +168,10 @@ Phase 6 adds incremental re-summarization when files change and a web dashboard.
 ## Other TODOs
 
 ### Minor Fixes
-- [ ] Fix PowerShell conda activation error in PATH (harmless but noisy)
-- [ ] Consider adding log rotation for `logs/conductor-memory.log`
+- [x] PowerShell conda activation error - EXTERNAL: User environment issue, not in codebase.
+      Scripts use direct Python paths to avoid conda activation. Users experiencing this can run:
+      `conda init powershell --reverse && conda init powershell` to reinitialize cleanly.
+- [x] Log rotation for service logs - Uses RotatingFileHandler with 10MB max, 5 backups (~50MB total)
 
 ### ✅ Issues Resolved During Testing
 - [x] **Heuristic Metadata Storage**: Fixed - Now properly storing `class_count:N`, `function_count:N`, `lang:python` tags
@@ -180,8 +182,15 @@ Phase 6 adds incremental re-summarization when files change and a web dashboard.
 - [x] **Tag Filtering**: Working - `include_tags` with proper tag names returns results
 
 ### 🔧 Known Minor Issues
-- [ ] Keyword search mode returns 0 results for exact class names (semantic/hybrid work fine)
-- [ ] Search result inconsistency: Same wildcard query may return different results on repeated calls
+- [x] Keyword search mode returns 0 results for exact class names (semantic/hybrid work fine)
+  - **Fixed**: Changed from `BM25Okapi` to `BM25Plus` algorithm which handles small corpora correctly
+  - Root cause: `BM25Okapi` returns 0 or negative scores for terms in small document sets due to IDF calculation
+  - Also fixed: `store()` now adds chunks to BM25 index for keyword/hybrid search
+- [x] Search result inconsistency: Same wildcard query may return different results on repeated calls
+  - **Fixed**: Added secondary sort keys (chunk ID, doc_id, etc.) as tiebreakers in all score-based sorts
+  - Root cause: When multiple chunks had identical relevance scores, Python's stable sort preserved 
+    non-deterministic dict iteration order, causing result order to vary between calls
+  - Files fixed: `hybrid.py` (3 sorts), `memory_service.py` (3 sorts), `verification.py` (1 sort), `import_graph.py` (1 sort)
 
 ## 🚀 NEXT PHASE PRIORITIES
 
@@ -204,7 +213,6 @@ Phase 6 adds incremental re-summarization when files change and a web dashboard.
 - [ ] **Multi-Model Support**: OpenAI, Anthropic for cloud options
 
 ### Minor Enhancements
-- [ ] Fix keyword search for exact class names
+- [x] Fix keyword search for exact class names
 - [ ] Add summary diff view when files change
 - [ ] Implement batch re-summarization command
-- [ ] Add log rotation for large deployments

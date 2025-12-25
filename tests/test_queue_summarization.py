@@ -5,8 +5,8 @@ Test script to queue a codebase for summarization via MCP tool.
 import requests
 import json
 
-def test_queue_codebase(codebase_name: str, only_missing: bool = True):
-    """Test the memory_queue_codebase_summarization tool."""
+def queue_codebase(codebase_name: str, only_missing: bool = True):
+    """Queue a codebase for summarization via MCP tool."""
     
     # MCP tool call format for SSE server
     url = "http://localhost:9820/mcp/call"
@@ -82,7 +82,7 @@ if __name__ == "__main__":
     codebase = sys.argv[1] if len(sys.argv) > 1 else "truthsocial-android"
     only_missing = True if len(sys.argv) <= 2 else sys.argv[2].lower() == "true"
     
-    result = test_queue_codebase(codebase, only_missing)
+    result = queue_codebase(codebase, only_missing)
     
     if result and result.get("success"):
         print("\n✅ Successfully queued codebase for summarization!")

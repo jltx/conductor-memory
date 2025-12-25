@@ -7,7 +7,7 @@ Handles file analysis, skeleton extraction for large files, and LLM prompt gener
 import json
 import logging
 import re
-from typing import Dict, Any, Optional, List, Union
+from typing import Dict, Any, Optional, List, Union, Tuple
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -37,6 +37,9 @@ class FileSummary:
     how_it_works: Optional[str] = None  # Explanation of HOW the code works
     key_mechanisms: Optional[List[str]] = None  # Key mechanisms/patterns used
     method_summaries: Optional[Dict[str, str]] = None  # Per-method summaries
+    # Simple file detection fields
+    simple_file: bool = False  # True if summarized without LLM
+    simple_file_reason: Optional[str] = None  # Reason for simple classification
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for storage."""
@@ -52,7 +55,9 @@ class FileSummary:
             'tokens_used': self.tokens_used,
             'response_time_ms': self.response_time_ms,
             'is_skeleton': self.is_skeleton,
-            'error': self.error
+            'error': self.error,
+            'simple_file': self.simple_file,
+            'simple_file_reason': self.simple_file_reason
         }
         # Include implementation-aware fields when present
         if self.how_it_works is not None:
@@ -66,6 +71,35 @@ class FileSummary:
 
 class FileSummarizer:
     """Summarizes files using LLM with skeleton extraction for large files."""
+    
+    # Template summaries for simple files (no LLM needed)
+    SIMPLE_TEMPLATES = {
+        "empty_module": {
+            "purpose": "Empty module placeholder",
+            "pattern": "Empty",
+            "domain": "infrastructure"
+        },
+        "barrel_reexport": {
+            "purpose": "Re-exports {count} symbols from submodules: {modules}",
+            "pattern": "Barrel",
+            "domain": "infrastructure"
+        },
+        "type_definitions": {
+            "purpose": "Type definitions for {domain}",
+            "pattern": "Types",
+            "domain": "types"
+        },
+        "constants_only": {
+            "purpose": "Configuration constants",
+            "pattern": "Constants",
+            "domain": "configuration"
+        },
+        "generated_code": {
+            "purpose": "Auto-generated code (do not edit manually)",
+            "pattern": "Generated",
+            "domain": "generated"
+        }
+    }
     
     def __init__(self, llm_client: LLMClient, config: SummarizationConfig):
         """
@@ -85,7 +119,7 @@ class FileSummarizer:
         heuristic_metadata: Optional[HeuristicMetadata] = None
     ) -> FileSummary:
         """
-        Summarize a file using LLM.
+        Summarize a file using LLM or template (for simple files).
         
         Args:
             file_path: Path to the file
@@ -93,7 +127,7 @@ class FileSummarizer:
             heuristic_metadata: Optional heuristic metadata for context
             
         Returns:
-            FileSummary with LLM-generated summary
+            FileSummary with LLM-generated or template-based summary
         """
         try:
             # Determine language
@@ -111,6 +145,14 @@ class FileSummarizer:
                     domain="skipped",
                     model_used="none",
                     error="File skipped due to skip pattern"
+                )
+            
+            # Check if this is a simple file that doesn't need LLM summarization
+            # Only use simple file detection when enabled in config
+            if (self.config.enable_simple_file_detection and 
+                heuristic_metadata and heuristic_metadata.is_simple_file):
+                return self._generate_simple_summary(
+                    file_path, content, language, heuristic_metadata
                 )
             
             # Determine if we need to extract skeleton
@@ -148,7 +190,9 @@ class FileSummarizer:
                 # Phase 2: Implementation-aware fields (optional, populated when LLM provides them)
                 how_it_works=summary_data.get('how_it_works'),
                 key_mechanisms=summary_data.get('key_mechanisms'),
-                method_summaries=summary_data.get('method_summaries')
+                method_summaries=summary_data.get('method_summaries'),
+                simple_file=False,
+                simple_file_reason=None
             )
             
         except Exception as e:
@@ -196,6 +240,336 @@ class FileSummarizer:
             if fnmatch.fnmatch(file_path, pattern):
                 return True
         return False
+    
+    def _generate_simple_summary(
+        self,
+        file_path: str,
+        content: str,
+        language: str,
+        heuristic_metadata: HeuristicMetadata
+    ) -> FileSummary:
+        """
+        Generate a template-based summary for simple files (no LLM call needed).
+        
+        This is significantly faster than LLM summarization (<100ms vs 2-5s) and
+        produces consistent summaries for common patterns like barrel files,
+        empty modules, and generated code.
+        
+        Args:
+            file_path: Path to the file
+            content: File content
+            language: Detected programming language
+            heuristic_metadata: Heuristic metadata with is_simple_file and simple_file_reason
+            
+        Returns:
+            FileSummary with template-based summary
+        """
+        import time
+        start_time = time.time()
+        
+        reason = heuristic_metadata.simple_file_reason or "empty_module"
+        template = self.SIMPLE_TEMPLATES.get(reason, self.SIMPLE_TEMPLATES["empty_module"])
+        
+        # Initialize with template defaults
+        purpose = template["purpose"]
+        pattern = template["pattern"]
+        domain = template["domain"]
+        key_exports: List[str] = []
+        dependencies: List[str] = []
+        
+        # Customize based on reason
+        if reason == "barrel_reexport":
+            # Extract re-exported symbols and source modules
+            key_exports, dependencies = self._extract_barrel_info(
+                content, language, heuristic_metadata
+            )
+            
+            # Build purpose string with module info
+            export_count = len(key_exports)
+            module_names = self._format_module_list(dependencies)
+            
+            if module_names:
+                purpose = f"Re-exports {export_count} symbols from submodules: {module_names}"
+            else:
+                purpose = f"Re-exports {export_count} symbols from submodules"
+                
+        elif reason == "type_definitions":
+            # Try to infer domain from file path or interface names
+            inferred_domain = self._infer_domain_from_types(
+                file_path, heuristic_metadata
+            )
+            domain = inferred_domain or "types"
+            purpose = f"Type definitions for {domain}"
+            
+            # List interfaces/types as exports
+            key_exports = [iface['name'] for iface in heuristic_metadata.interfaces]
+            
+        elif reason == "constants_only":
+            # Extract constant names as key exports
+            key_exports = self._extract_constant_names(content, language)
+            
+        elif reason == "generated_code":
+            # Try to identify what generated this file
+            generator = self._identify_generator(content)
+            if generator:
+                purpose = f"Auto-generated code by {generator} (do not edit manually)"
+            
+        elif reason == "empty_module":
+            # Keep defaults - nothing to extract
+            pass
+        
+        response_time_ms = (time.time() - start_time) * 1000
+        
+        return FileSummary(
+            file_path=file_path,
+            language=language,
+            purpose=purpose,
+            pattern=pattern,
+            key_exports=key_exports,
+            dependencies=dependencies,
+            domain=domain,
+            model_used="template",
+            tokens_used=0,
+            response_time_ms=response_time_ms,
+            is_skeleton=False,
+            error=None,
+            simple_file=True,
+            simple_file_reason=reason
+        )
+    
+    def _extract_barrel_info(
+        self,
+        content: str,
+        language: str,
+        heuristic_metadata: HeuristicMetadata
+    ) -> Tuple[List[str], List[str]]:
+        """
+        Extract re-exported symbols and source modules from a barrel file.
+        
+        Returns:
+            Tuple of (key_exports, dependencies/source_modules)
+        """
+        key_exports: List[str] = []
+        source_modules: List[str] = []
+        
+        if language == 'python':
+            # Parse Python __init__.py patterns
+            # Pattern 1: from .module import symbol
+            # Pattern 2: from .module import *
+            # Pattern 3: __all__ = ['symbol1', 'symbol2']
+            
+            import re
+            
+            # Check __all__ first
+            all_match = re.search(r'__all__\s*=\s*\[(.*?)\]', content, re.DOTALL)
+            if all_match:
+                all_str = all_match.group(1)
+                # Extract quoted strings
+                key_exports = re.findall(r'["\'](\w+)["\']', all_str)
+            
+            # Extract from imports
+            from_imports = re.findall(
+                r'from\s+\.(\w+)\s+import\s+(.+?)(?:\n|$)', 
+                content
+            )
+            for module, imports in from_imports:
+                source_modules.append(module)
+                if imports.strip() != '*':
+                    # Split imports and clean
+                    for imp in imports.split(','):
+                        imp = imp.strip()
+                        # Handle "as" aliases
+                        if ' as ' in imp:
+                            imp = imp.split(' as ')[0].strip()
+                        if imp and imp not in key_exports:
+                            key_exports.append(imp)
+            
+            # Also check for direct imports
+            direct_imports = re.findall(
+                r'^import\s+\.(\w+)',
+                content,
+                re.MULTILINE
+            )
+            source_modules.extend(direct_imports)
+            
+        elif language in ['typescript', 'javascript']:
+            # Parse TypeScript/JavaScript export patterns
+            # Pattern 1: export { symbol } from './module'
+            # Pattern 2: export * from './module'
+            # Pattern 3: export { symbol }
+            
+            import re
+            
+            # Named re-exports
+            reexport_matches = re.findall(
+                r'export\s*\{([^}]+)\}\s*from\s*["\']\.?/?([^"\']+)["\']',
+                content
+            )
+            for symbols, module in reexport_matches:
+                source_modules.append(module)
+                for sym in symbols.split(','):
+                    sym = sym.strip()
+                    # Handle "as" aliases
+                    if ' as ' in sym:
+                        sym = sym.split(' as ')[-1].strip()
+                    if sym and sym not in key_exports:
+                        key_exports.append(sym)
+            
+            # Wildcard re-exports
+            wildcard_matches = re.findall(
+                r'export\s*\*\s*from\s*["\']\.?/?([^"\']+)["\']',
+                content
+            )
+            source_modules.extend(wildcard_matches)
+            
+            # Default re-exports
+            default_matches = re.findall(
+                r'export\s*\{\s*default\s*(?:as\s+(\w+))?\s*\}\s*from\s*["\']\.?/?([^"\']+)["\']',
+                content
+            )
+            for alias, module in default_matches:
+                source_modules.append(module)
+                if alias:
+                    key_exports.append(alias)
+        
+        # Use heuristic metadata exports if we didn't find any
+        if not key_exports and heuristic_metadata.exports:
+            key_exports = heuristic_metadata.exports
+        
+        # Use heuristic metadata imports as fallback for source modules
+        if not source_modules and heuristic_metadata.imports:
+            for imp in heuristic_metadata.imports:
+                module = imp.get('module', '')
+                if module and module.startswith('.'):
+                    # Relative import
+                    source_modules.append(module.lstrip('.'))
+        
+        # Deduplicate
+        key_exports = list(dict.fromkeys(key_exports))
+        source_modules = list(dict.fromkeys(source_modules))
+        
+        return key_exports, source_modules
+    
+    def _format_module_list(self, modules: List[str]) -> str:
+        """Format a list of module names for display in purpose string."""
+        if not modules:
+            return ""
+        
+        # Clean up module names (remove paths, extensions)
+        clean_modules = []
+        for mod in modules:
+            # Remove path prefix and extension
+            name = Path(mod).stem if '/' in mod or '\\' in mod else mod
+            name = name.lstrip('.')
+            if name and name not in clean_modules:
+                clean_modules.append(name)
+        
+        if len(clean_modules) == 0:
+            return ""
+        elif len(clean_modules) <= 3:
+            return ", ".join(clean_modules)
+        else:
+            return f"{', '.join(clean_modules[:3])} and {len(clean_modules) - 3} more"
+    
+    def _infer_domain_from_types(
+        self,
+        file_path: str,
+        heuristic_metadata: HeuristicMetadata
+    ) -> Optional[str]:
+        """Infer domain from file path or interface names."""
+        # Common domain keywords in paths
+        domain_keywords = {
+            'auth': 'authentication',
+            'user': 'user-management',
+            'payment': 'payments',
+            'order': 'orders',
+            'product': 'products',
+            'api': 'api',
+            'dto': 'data-transfer',
+            'model': 'data-models',
+            'entity': 'entities',
+            'response': 'api-responses',
+            'request': 'api-requests',
+            'config': 'configuration',
+            'util': 'utilities',
+            'common': 'common',
+            'shared': 'shared',
+            'core': 'core',
+        }
+        
+        # Check file path
+        path_lower = file_path.lower()
+        for keyword, domain in domain_keywords.items():
+            if keyword in path_lower:
+                return domain
+        
+        # Check interface names
+        if heuristic_metadata.interfaces:
+            first_interface = heuristic_metadata.interfaces[0]['name'].lower()
+            for keyword, domain in domain_keywords.items():
+                if keyword in first_interface:
+                    return domain
+        
+        return None
+    
+    def _extract_constant_names(self, content: str, language: str) -> List[str]:
+        """Extract constant/variable names from a constants file."""
+        import re
+        constants = []
+        
+        if language == 'python':
+            # Python: CONSTANT_NAME = value (uppercase by convention)
+            matches = re.findall(r'^([A-Z][A-Z0-9_]*)\s*=', content, re.MULTILINE)
+            constants = matches
+            
+        elif language in ['typescript', 'javascript']:
+            # JS/TS: export const CONSTANT_NAME = value
+            matches = re.findall(
+                r'(?:export\s+)?const\s+([A-Z][A-Z0-9_]*)\s*=', 
+                content, 
+                re.MULTILINE
+            )
+            constants = matches
+            
+        elif language == 'java':
+            # Java: public static final TYPE CONSTANT_NAME = value
+            matches = re.findall(
+                r'(?:public\s+)?(?:static\s+)?(?:final\s+)\w+\s+([A-Z][A-Z0-9_]*)\s*=',
+                content,
+                re.MULTILINE
+            )
+            constants = matches
+        
+        return constants[:10]  # Limit to 10 constants
+    
+    def _identify_generator(self, content: str) -> Optional[str]:
+        """Try to identify what tool/framework generated this file."""
+        import re
+        
+        # Common generator signatures
+        generators = {
+            r'protobuf': 'Protocol Buffers',
+            r'openapi': 'OpenAPI Generator',
+            r'swagger': 'Swagger Codegen',
+            r'graphql': 'GraphQL Codegen',
+            r'prisma': 'Prisma',
+            r'sqlc': 'sqlc',
+            r'grpc': 'gRPC',
+            r'thrift': 'Apache Thrift',
+            r'avro': 'Apache Avro',
+            r'jooq': 'jOOQ',
+            r'mybatis': 'MyBatis Generator',
+            r'antlr': 'ANTLR',
+            r'pydantic': 'Pydantic',
+            r'dataclass_json': 'dataclass-json',
+        }
+        
+        header = content[:500].lower()
+        for pattern, name in generators.items():
+            if re.search(pattern, header, re.IGNORECASE):
+                return name
+        
+        return None
     
     def _extract_skeleton(
         self, 
@@ -400,15 +774,19 @@ class FileSummarizer:
             return self._parse_text_response(response, file_path, language)
     
     def _build_system_prompt(self) -> str:
-        """Build system prompt for LLM."""
-        return """You are a code analysis expert. Analyze the provided code file and generate a structured summary in JSON format.
+        """Build system prompt for LLM, conditional on config options."""
+        base_prompt = """You are a code analysis expert. Analyze the provided code file and generate a structured summary in JSON format.
 
 Focus on:
 - The main purpose and functionality of the file
 - Architectural patterns used (e.g., Repository, Controller, Service, Utility, Model, etc.)
 - Key public APIs, classes, and functions that other code would use
 - Important external dependencies
-- The business domain or technical area this code belongs to
+- The business domain or technical area this code belongs to"""
+        
+        # Add Phase 2 how_it_works instructions when enabled
+        if self.config.include_how_it_works:
+            base_prompt += """
 
 IMPORTANT: Focus on HOW the code works, not just what it does.
 
@@ -416,11 +794,19 @@ For each significant method, explain:
 - What data structures/indices it uses
 - Any caching, memoization, or optimization strategies
 - How parameters flow through the logic
-- Any coordinate systems or index translations
+- Any coordinate systems or index translations"""
+        
+        # Add implementation signals instructions when enabled
+        if self.config.include_implementation_signals:
+            base_prompt += """
 
-Use the implementation signals provided (calls, attribute access, subscripts) to inform your analysis. These signals show you exactly what methods call, what data they access, and how they use parameters.
+Use the implementation signals provided (calls, attribute access, subscripts) to inform your analysis. These signals show you exactly what methods call, what data they access, and how they use parameters."""
+        
+        base_prompt += """
 
 Respond with valid JSON only, no additional text or markdown formatting."""
+        
+        return base_prompt
     
     def _build_user_prompt(
         self, 
@@ -429,7 +815,44 @@ Respond with valid JSON only, no additional text or markdown formatting."""
         content: str, 
         heuristic_metadata: Optional[HeuristicMetadata]
     ) -> str:
-        """Build user prompt for LLM."""
+        """Build user prompt for LLM, conditional on config options."""
+        
+        # Build JSON schema based on enabled features
+        json_schema_parts = [
+            f"Respond with JSON only:",
+            f"{{",
+            f'  "purpose": "1-2 sentence description of what this file does",',
+            f'  "pattern": "architectural pattern (e.g., Repository, ViewModel, Controller, Utility)",',
+            f'  "key_exports": ["list", "of", "main", "public", "APIs"],',
+            f'  "dependencies": ["key", "external", "dependencies"],',
+            f'  "domain": "business domain (e.g., authentication, payments, ui)"',
+        ]
+        
+        # Add how_it_works fields when enabled
+        if self.config.include_how_it_works:
+            # Add comma to previous line
+            json_schema_parts[-1] = json_schema_parts[-1] + ','
+            json_schema_parts.extend([
+                f'',
+                f'  "how_it_works": "Explanation of HOW the code works - mechanisms, data flow, key algorithms, optimizations",',
+                f'',
+                f'  "key_mechanisms": [',
+                f'    "list key patterns/mechanisms used (e.g., caching, lazy loading, window-relative indexing)"',
+                f'  ]',
+            ])
+        
+        # Add method_summaries when enabled
+        if self.config.include_method_summaries:
+            # Add comma to previous line
+            json_schema_parts[-1] = json_schema_parts[-1] + ','
+            json_schema_parts.extend([
+                f'',
+                f'  "method_summaries": {{',
+                f'    "method_name": "what this method does and HOW - include data access patterns, parameter usage, notable logic"',
+                f'  }}',
+            ])
+        
+        json_schema_parts.append(f"}}")
         
         prompt_parts = [
             f"Analyze this {language} file and provide a structured summary.",
@@ -439,25 +862,8 @@ Respond with valid JSON only, no additional text or markdown formatting."""
             content,
             f"```",
             f"",
-            f"Respond with JSON only:",
-            f"{{",
-            f'  "purpose": "1-2 sentence description of what this file does",',
-            f'  "pattern": "architectural pattern (e.g., Repository, ViewModel, Controller, Utility)",',
-            f'  "key_exports": ["list", "of", "main", "public", "APIs"],',
-            f'  "dependencies": ["key", "external", "dependencies"],',
-            f'  "domain": "business domain (e.g., authentication, payments, ui)",',
-            f'',
-            f'  "how_it_works": "Explanation of HOW the code works - mechanisms, data flow, key algorithms, optimizations",',
-            f'',
-            f'  "key_mechanisms": [',
-            f'    "list key patterns/mechanisms used (e.g., caching, lazy loading, window-relative indexing)"',
-            f'  ],',
-            f'',
-            f'  "method_summaries": {{',
-            f'    "method_name": "what this method does and HOW - include data access patterns, parameter usage, notable logic"',
-            f'  }}',
-            f"}}"
         ]
+        prompt_parts.extend(json_schema_parts)
         
         # Add heuristic context if available
         if heuristic_metadata:
@@ -474,15 +880,20 @@ Respond with valid JSON only, no additional text or markdown formatting."""
                 heuristic_context.append(f"Annotations: {', '.join(heuristic_metadata.annotations[:3])}")
             
             if heuristic_context:
-                prompt_parts.insert(-8, f"Context from static analysis: {'; '.join(heuristic_context)}")
-                prompt_parts.insert(-8, "")
+                # Insert before the JSON schema (before "Respond with JSON only:")
+                insert_idx = len(prompt_parts) - len(json_schema_parts)
+                prompt_parts.insert(insert_idx, f"Context from static analysis: {'; '.join(heuristic_context)}")
+                prompt_parts.insert(insert_idx + 1, "")
             
             # Add implementation signals from method details (Phase 2 enhancement)
-            if heuristic_metadata.method_details:
+            # Only when include_implementation_signals is enabled
+            if self.config.include_implementation_signals and heuristic_metadata.method_details:
                 signals_section = self._format_implementation_signals(heuristic_metadata.method_details)
                 if signals_section:
-                    prompt_parts.insert(-8, signals_section)
-                    prompt_parts.insert(-8, "")
+                    # Insert before the JSON schema
+                    insert_idx = len(prompt_parts) - len(json_schema_parts)
+                    prompt_parts.insert(insert_idx, signals_section)
+                    prompt_parts.insert(insert_idx + 1, "")
         
         return '\n'.join(prompt_parts)
     

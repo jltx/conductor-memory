@@ -458,7 +458,8 @@ class MemoryService:
                     query_domain_boosts=domain_boosts
                 )
                 # Re-sort by updated relevance scores
-                similar_chunks.sort(key=lambda x: x.relevance_score, reverse=True)
+                # Use chunk ID as secondary key for deterministic ordering when scores are tied
+                similar_chunks.sort(key=lambda x: (x.relevance_score, x.id), reverse=True)
             
             # Apply tag filtering (Phase 2)
             if include_tags or exclude_tags:
@@ -488,7 +489,8 @@ class MemoryService:
                     deduplicated_chunks, codebase
                 )
                 # Re-sort after summary boost
-                deduplicated_chunks.sort(key=lambda x: x.relevance_score, reverse=True)
+                # Use chunk ID as secondary key for deterministic ordering when scores are tied
+                deduplicated_chunks.sort(key=lambda x: (x.relevance_score, x.id), reverse=True)
             
             # Limit results
             filtered_chunks = deduplicated_chunks[:max_results]
@@ -660,9 +662,10 @@ class MemoryService:
             if key not in seen_evidence or ev.relevance > seen_evidence[key].relevance:
                 seen_evidence[key] = ev
         
+        # Sort by relevance, with detail as tiebreaker for deterministic ordering
         deduplicated_evidence = sorted(
             seen_evidence.values(),
-            key=lambda e: e.relevance,
+            key=lambda e: (e.relevance, e.detail),
             reverse=True
         )
         
@@ -788,6 +791,9 @@ class MemoryService:
             # Generate embedding and store
             embedding = self.embedder.generate(content)
             vector_store.add(memory_chunk, embedding)
+            
+            # Also add to BM25 index for hybrid/keyword search
+            self.hybrid_searcher.add_to_index(codebase, memory_chunk)
             
             logger.info(f"Stored memory chunk {memory_chunk.id} in codebase {codebase}")
             
@@ -2551,9 +2557,10 @@ class MemoryService:
         
         This method:
         1. Checks if summarization is enabled
-        2. Initializes the LLM client and summarizer
-        3. Queues files by centrality score (most important first)
-        4. Starts the background summarization task
+        2. Checks schema version and logs warning if outdated
+        3. Initializes the LLM client and summarizer
+        4. Queues files by centrality score (most important first)
+        5. Starts the background summarization task
         """
         if not self._summarization_config.enabled:
             logger.info("[Summarization] Background summarization is disabled")
@@ -2562,6 +2569,43 @@ class MemoryService:
         if not self._summarization_config.llm_enabled:
             logger.info("[Summarization] LLM summarization is disabled")
             return
+        
+        # Check schema version for all codebases and auto-invalidate if mismatched
+        from ..storage.chroma import SUMMARY_SCHEMA_VERSION
+        codebases_invalidated = []
+        
+        for codebase_name, vector_store in self._vector_stores.items():
+            if not vector_store:
+                continue
+            
+            is_current, stored_version = vector_store.summary_index.check_schema_version()
+            
+            if stored_version is None:
+                # First time - set the schema version
+                vector_store.summary_index.set_schema_version(SUMMARY_SCHEMA_VERSION)
+                logger.info(f"[{codebase_name}] Initialized summary schema version: {SUMMARY_SCHEMA_VERSION}")
+            elif not is_current:
+                # Schema version mismatch - auto-invalidate summaries
+                logger.info(
+                    f"[{codebase_name}] Summary schema version upgrade: {stored_version} -> {SUMMARY_SCHEMA_VERSION}. "
+                    f"Auto-invalidating existing summaries for re-summarization."
+                )
+                
+                # Invalidate this codebase's summaries
+                try:
+                    result = await self.invalidate_summaries_async(codebase=codebase_name)
+                    if result.get("success"):
+                        summaries_cleared = result.get("total_summaries_cleared", 0)
+                        chunks_removed = result.get("total_chunks_removed", 0)
+                        logger.info(
+                            f"[{codebase_name}] Auto-invalidation complete: "
+                            f"{summaries_cleared} summaries cleared, {chunks_removed} chunks removed"
+                        )
+                        codebases_invalidated.append(codebase_name)
+                    else:
+                        logger.warning(f"[{codebase_name}] Auto-invalidation failed: {result.get('error')}")
+                except Exception as e:
+                    logger.error(f"[{codebase_name}] Error during auto-invalidation: {e}")
         
         try:
             from ..llm.ollama_client import OllamaClient
@@ -2862,7 +2906,9 @@ class MemoryService:
         """
         Store a file summary as a searchable memory chunk.
         
-        Also updates the summary index for incremental re-summarization tracking.
+        The summary is stored in two places:
+        1. Summary index (SummaryIndexMetadata) - Full structured JSON for retrieval
+        2. Main collection - Searchable text chunk with embeddings
         
         Args:
             codebase: Codebase name
@@ -2875,7 +2921,7 @@ class MemoryService:
             logger.warning(f"[Summarization] Vector store not found for codebase: {codebase}")
             return
         
-        # Check if there's an existing summary to remove
+        # Check if there's an existing summary to remove from main collection
         existing_info = vector_store.summary_index.get_summary_info(file_path)
         if existing_info:
             old_chunk_id = existing_info.get("summary_chunk_id")
@@ -2886,7 +2932,19 @@ class MemoryService:
                 except Exception as e:
                     logger.debug(f"[Summarization] Failed to remove old summary: {e}")
         
-        # Format summary as searchable text
+        # --- Store structured JSON in summary index ---
+        # This enables structured retrieval via get_file_summary_async()
+        summary_dict = summary.to_dict()
+        summary_dict["summarized_at"] = datetime.now().isoformat()
+        
+        vector_store.summary_index.store_summary(
+            file_path=file_path,
+            summary_data=summary_dict,
+            content_hash=content_hash or ""
+        )
+        
+        # --- Store searchable text in main collection ---
+        # Format summary as searchable text for vector search
         key_exports = ", ".join(summary.key_exports) if summary.key_exports else "none"
         dependencies = ", ".join(summary.dependencies) if summary.dependencies else "none"
         
@@ -2899,6 +2957,19 @@ Purpose: {summary.purpose}
 
 Key exports: {key_exports}
 Dependencies: {dependencies}"""
+        
+        # Phase 2: Add implementation-aware fields if present
+        if summary.how_it_works:
+            summary_text += f"\n\nHow it works: {summary.how_it_works}"
+        
+        if summary.key_mechanisms:
+            mechanisms = ", ".join(summary.key_mechanisms)
+            summary_text += f"\n\nKey mechanisms: {mechanisms}"
+        
+        if summary.method_summaries:
+            summary_text += "\n\nMethod summaries:"
+            for method_name, method_desc in summary.method_summaries.items():
+                summary_text += f"\n  - {method_name}: {method_desc}"
         
         # Build tags for filtering
         tags = [
@@ -2913,7 +2984,14 @@ Dependencies: {dependencies}"""
         for export in summary.key_exports[:5]:  # Limit to first 5
             tags.append(f"export:{export}")
         
-        # Store with pinning so summaries aren't pruned
+        # Phase 2: Add mechanism tags for searchability (e.g., mechanism:caching, mechanism:retry)
+        if summary.key_mechanisms:
+            for mechanism in summary.key_mechanisms[:10]:  # Limit to first 10
+                # Normalize mechanism name for tag format (lowercase, replace spaces with hyphens)
+                mechanism_tag = mechanism.lower().replace(" ", "-").replace("_", "-")
+                tags.append(f"mechanism:{mechanism_tag}")
+        
+        # Store searchable chunk with pinning so summaries aren't pruned
         result = await self.store_async(
             content=summary_text,
             codebase=codebase,
@@ -2924,7 +3002,8 @@ Dependencies: {dependencies}"""
             memory_type="code"  # Treat as code-related memory
         )
         
-        # Update summary index for incremental tracking
+        # Update summary index with the chunk ID for backward compatibility
+        # This links the searchable chunk to the structured summary
         if result.get("success") and result.get("id") and content_hash:
             vector_store.summary_index.update_summary_info(
                 file_path=file_path,
@@ -3079,6 +3158,102 @@ Dependencies: {dependencies}"""
                 logger.debug(f"[Summarization] Failed to remove summary chunk: {e}")
         
         return False
+    
+    async def invalidate_summaries_async(
+        self,
+        codebase: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Invalidate all existing summaries to force re-summarization.
+        
+        This clears:
+        1. All entries from the summary index (SummaryIndexMetadata)
+        2. All summary chunks from the main collection (source="llm_summarization")
+        
+        After invalidation, summaries will be regenerated on the next summarization run.
+        
+        Args:
+            codebase: Optional codebase name to invalidate (None = all codebases)
+            
+        Returns:
+            Dict with invalidation results including counts
+        """
+        if not self._vector_stores:
+            return {"error": "No codebases configured", "success": False}
+        
+        results = {
+            "success": True,
+            "codebases": {},
+            "total_summaries_cleared": 0,
+            "total_chunks_removed": 0
+        }
+        
+        # Determine which codebases to process
+        if codebase:
+            stores_to_process = {codebase: self._vector_stores.get(codebase)}
+            if not stores_to_process[codebase]:
+                return {"error": f"Codebase not found: {codebase}", "success": False}
+        else:
+            stores_to_process = self._vector_stores
+        
+        for codebase_name, vector_store in stores_to_process.items():
+            if not vector_store:
+                continue
+            
+            codebase_result = {
+                "summaries_cleared": 0,
+                "chunks_removed": 0
+            }
+            
+            try:
+                # Step 1: Clear the summary index
+                summaries_cleared = vector_store.summary_index.clear_all_summaries()
+                codebase_result["summaries_cleared"] = summaries_cleared
+                results["total_summaries_cleared"] += summaries_cleared
+                
+                # Step 2: Remove summary chunks from main collection
+                # These are stored with source="llm_summarization"
+                try:
+                    summary_results = vector_store.collection.get(
+                        where={"source": "llm_summarization"},
+                        include=[]  # Only need IDs
+                    )
+                    
+                    if summary_results["ids"]:
+                        chunk_ids = summary_results["ids"]
+                        # Delete in batches
+                        BATCH_SIZE = 500
+                        for i in range(0, len(chunk_ids), BATCH_SIZE):
+                            batch = chunk_ids[i:i + BATCH_SIZE]
+                            vector_store.collection.delete(ids=batch)
+                        
+                        codebase_result["chunks_removed"] = len(chunk_ids)
+                        results["total_chunks_removed"] += len(chunk_ids)
+                        logger.info(f"[{codebase_name}] Removed {len(chunk_ids)} summary chunks from main collection")
+                        
+                except Exception as e:
+                    logger.warning(f"[{codebase_name}] Error removing summary chunks: {e}")
+                
+                # Step 3: Update schema version to current
+                from ..storage.chroma import SUMMARY_SCHEMA_VERSION
+                vector_store.summary_index.set_schema_version(SUMMARY_SCHEMA_VERSION)
+                
+                results["codebases"][codebase_name] = codebase_result
+                logger.info(
+                    f"[{codebase_name}] Invalidated {summaries_cleared} summaries, "
+                    f"removed {codebase_result['chunks_removed']} chunks"
+                )
+                
+            except Exception as e:
+                logger.error(f"[{codebase_name}] Error invalidating summaries: {e}")
+                codebase_result["error"] = str(e)
+                results["codebases"][codebase_name] = codebase_result
+        
+        return results
+    
+    def invalidate_summaries(self, codebase: Optional[str] = None) -> Dict[str, Any]:
+        """Sync wrapper for invalidate_summaries_async"""
+        return _run_sync(self.invalidate_summaries_async(codebase))
     
     async def queue_codebase_for_summarization(
         self, 
@@ -3966,52 +4141,65 @@ Dependencies: {dependencies}"""
         file_path: str
     ) -> Dict[str, Any]:
         """
-        Get just the summary for a file (lightweight, no chunks).
+        Get the full structured summary for a file.
+        
+        Returns all Phase 2 fields (how_it_works, key_mechanisms, method_summaries)
+        when available, along with the basic summary fields.
         
         Args:
             codebase: Codebase name
             file_path: Relative path to file
             
         Returns:
-            Dict with summary only
+            Dict with structured summary including all available fields
         """
         vector_store = self._vector_stores.get(codebase)
         if not vector_store:
             return {"error": f"Codebase not found: {codebase}"}
         
         try:
-            summary_info = vector_store.summary_index.get_summary_info(file_path)
-            if not summary_info:
+            # Use the new get_full_summary method which parses stored JSON
+            full_summary = vector_store.summary_index.get_full_summary(file_path)
+            
+            if not full_summary:
                 return {"codebase": codebase, "file_path": file_path, "summary": None}
             
-            # Get summary content from the MAIN collection using summary_chunk_id
-            summary_content = ""
-            summary_chunk_id = summary_info.get("summary_chunk_id")
-            if summary_chunk_id:
-                try:
-                    result = vector_store.collection.get(
-                        ids=[summary_chunk_id],
-                        include=["documents"]
-                    )
-                    if result["ids"] and result["documents"]:
-                        summary_content = result["documents"][0]
-                except Exception as e:
-                    logger.debug(f"Error fetching summary content: {e}")
+            # Build response with all available fields
+            summary_response = {
+                "purpose": full_summary.get("purpose", ""),
+                "pattern": full_summary.get("pattern", ""),
+                "domain": full_summary.get("domain", ""),
+                "language": full_summary.get("language", ""),
+                "key_exports": full_summary.get("key_exports", []),
+                "dependencies": full_summary.get("dependencies", []),
+                "model": full_summary.get("model_used", full_summary.get("model", "")),
+                "summarized_at": full_summary.get("summarized_at", ""),
+                "validation_status": full_summary.get("validation_status", "unreviewed"),
+                # Simple file tracking
+                "simple_file": full_summary.get("simple_file", False),
+                "simple_file_reason": full_summary.get("simple_file_reason"),
+            }
+            
+            # Add Phase 2 fields when present
+            if full_summary.get("how_it_works"):
+                summary_response["how_it_works"] = full_summary["how_it_works"]
+            
+            if full_summary.get("key_mechanisms"):
+                summary_response["key_mechanisms"] = full_summary["key_mechanisms"]
+            
+            if full_summary.get("method_summaries"):
+                summary_response["method_summaries"] = full_summary["method_summaries"]
+            
+            # Include boolean flags for quick filtering
+            summary_response["has_how_it_works"] = full_summary.get("has_how_it_works", False)
+            summary_response["has_method_summaries"] = full_summary.get("has_method_summaries", False)
             
             return {
                 "codebase": codebase,
                 "file_path": file_path,
-                "summary": {
-                    "content": summary_content,
-                    "purpose": summary_content,  # Alias for compatibility
-                    "model": summary_info.get("model", ""),
-                    "pattern": summary_info.get("pattern", ""),
-                    "domain": summary_info.get("domain", ""),
-                    "exports": summary_info.get("exports", ""),
-                    "summarized_at": summary_info.get("summarized_at", ""),
-                    "validation_status": summary_info.get("validation_status", "unreviewed")
-                }
+                "summary": summary_response
             }
+            
         except Exception as e:
             logger.error(f"Error getting file summary: {e}")
             return {"error": str(e)}

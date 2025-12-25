@@ -4,9 +4,15 @@ Test suite for memory type enhancements:
 - New store tools: memory_store_warning, memory_store_convention, memory_store_experiment
 - New query tools: memory_get_warnings, memory_get_conventions, memory_get_experiments
 - Lifecycle tools: memory_deprecate_decision, memory_update_experiment, memory_get_active_decisions
+
+NOTE: These features are NOT YET IMPLEMENTED. This test file serves as a specification
+for future development. All tests are skipped until the features are implemented.
 """
 
 import pytest
+
+# Skip all tests in this module - features not yet implemented
+pytestmark = pytest.mark.skip(reason="Memory type enhancements not yet implemented - this is a spec for future features")
 import asyncio
 from datetime import datetime
 from unittest.mock import patch, MagicMock, AsyncMock

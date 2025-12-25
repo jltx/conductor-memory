@@ -266,8 +266,8 @@ def print_tree(node, indent=0, max_depth=4):
             print_tree(child, indent + 1, max_depth)
 
 
-def test_query(lang, query_string, description=""):
-    """Test if a query is valid."""
+def validate_query(lang, query_string, description=""):
+    """Validate if a query is valid."""
     try:
         query = Query(lang, query_string)
         return True, None
@@ -292,8 +292,8 @@ def find_node_types(node, target_types, results=None, depth=0, max_depth=10):
     return results
 
 
-def test_language(lang_name):
-    """Test a single language."""
+def check_language(lang_name):
+    """Check a single language's tree-sitter support."""
     print(f"\n{'='*60}")
     print(f"Testing: {lang_name.upper()}")
     print('='*60)
@@ -370,7 +370,7 @@ def test_language(lang_name):
     
     working_queries = []
     for query_str, desc in basic_queries:
-        success, error = test_query(lang, query_str, desc)
+        success, error = validate_query(lang, query_str, desc)
         if success:
             # Also test if it actually matches anything
             try:
@@ -401,7 +401,7 @@ def test_language(lang_name):
     ]
     
     for query_str in field_queries:
-        success, error = test_query(lang, query_str)
+        success, error = validate_query(lang, query_str)
         if success:
             try:
                 query = Query(lang, query_str)
@@ -430,7 +430,7 @@ def main():
     results = {}
     for lang in languages:
         try:
-            results[lang] = test_language(lang)
+            results[lang] = check_language(lang)
         except Exception as e:
             print(f"\n[ERROR] Failed to test {lang}: {e}")
             import traceback

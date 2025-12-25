@@ -11,7 +11,7 @@ import re
 from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass
 from enum import Enum
-from rank_bm25 import BM25Okapi
+from rank_bm25 import BM25Plus
 
 from ..core.models import MemoryChunk
 
@@ -48,7 +48,7 @@ class BM25Index:
     def __init__(self):
         self._documents: Dict[str, str] = {}  # id -> text
         self._chunk_map: Dict[str, MemoryChunk] = {}  # id -> chunk
-        self._bm25: Optional[BM25Okapi] = None
+        self._bm25: Optional[BM25Plus] = None
         self._doc_ids: List[str] = []  # Ordered list of doc IDs matching BM25 corpus
         self._tokenized_corpus: List[List[str]] = []
         self._needs_rebuild: bool = False  # Track if rebuild is needed
@@ -101,7 +101,7 @@ class BM25Index:
         logger.info(f"BM25: Tokenization completed in {tokenize_elapsed:.2f}s")
         
         bm25_build_start = time.time()
-        self._bm25 = BM25Okapi(self._tokenized_corpus)
+        self._bm25 = BM25Plus(self._tokenized_corpus)
         bm25_build_elapsed = time.time() - bm25_build_start
         logger.info(f"BM25: Index construction completed in {bm25_build_elapsed:.2f}s")
         
@@ -145,12 +145,17 @@ class BM25Index:
         scores = self._bm25.get_scores(tokenized_query)
         
         # Get top-k indices
+        # Sort by score, with doc_id as tiebreaker for deterministic ordering
         scored_docs = list(zip(self._doc_ids, scores))
-        scored_docs.sort(key=lambda x: x[1], reverse=True)
+        scored_docs.sort(key=lambda x: (x[1], x[0]), reverse=True)
         
         results = []
         for doc_id, score in scored_docs[:top_k]:
-            if score > 0:  # Only include documents with positive scores
+            # Include documents with non-zero scores
+            # Note: BM25 can return negative scores for small corpora where terms
+            # appear in all/most documents (IDF becomes negative). These are still
+            # valid matches - a score of 0 means no query terms matched at all.
+            if score != 0:
                 chunk = self._chunk_map.get(doc_id)
                 if chunk:
                     results.append((chunk, score))
@@ -276,7 +281,8 @@ class HybridSearcher:
                 results.extend(cb_results)
             
             # Sort combined results and take top_k
-            results.sort(key=lambda x: x[1], reverse=True)
+            # Use chunk ID as tiebreaker for deterministic ordering
+            results.sort(key=lambda x: (x[1], x[0].id), reverse=True)
             results = results[:top_k]
         
         return results
@@ -346,8 +352,8 @@ class HybridSearcher:
                 keyword_rank=kw_rank if chunk_id in keyword_ranks else -1
             ))
         
-        # Sort by combined score
-        results.sort(key=lambda r: r.combined_score, reverse=True)
+        # Sort by combined score, with chunk ID as tiebreaker for deterministic ordering
+        results.sort(key=lambda r: (r.combined_score, r.chunk.id), reverse=True)
         
         return results[:top_k]
     

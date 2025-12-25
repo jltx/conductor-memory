@@ -171,8 +171,19 @@ class FileIndexMetadata:
         return indexed_files
 
 
+# Schema version for summary index structure.
+# Increment this when making breaking changes to summary storage format.
+# Version history:
+#   1 - Original flat text format
+#   2 - Structured JSON storage with Phase 2 fields (how_it_works, method_summaries, etc.)
+SUMMARY_SCHEMA_VERSION = "2"
+
+
 class SummaryIndexMetadata:
     """Tracks metadata for summarized files to support incremental re-summarization"""
+    
+    # Special ID for storing schema version metadata
+    _SCHEMA_VERSION_ID = "__schema_version__"
     
     def __init__(self, client: chromadb.ClientAPI, collection_name: str = "summary_index_metadata"):
         """
@@ -200,6 +211,85 @@ class SummaryIndexMetadata:
             )
             logger.info(f"Created new summary index metadata collection: {collection_name}")
     
+    def get_schema_version(self) -> Optional[str]:
+        """
+        Get the stored schema version from the summary index.
+        
+        Returns:
+            The stored schema version string, or None if not set
+        """
+        try:
+            result = self.collection.get(ids=[self._SCHEMA_VERSION_ID], include=["metadatas"])
+            if result["ids"] and result["metadatas"]:
+                return result["metadatas"][0].get("version")
+        except Exception as e:
+            logger.debug(f"Error getting schema version: {e}")
+        return None
+    
+    def set_schema_version(self, version: str) -> None:
+        """
+        Store the schema version in the summary index.
+        
+        Args:
+            version: Schema version string to store
+        """
+        try:
+            self.collection.upsert(
+                ids=[self._SCHEMA_VERSION_ID],
+                metadatas=[{"version": version, "type": "schema_version"}],
+                documents=[f"Schema version: {version}"]
+            )
+            logger.info(f"Set summary schema version to: {version}")
+        except Exception as e:
+            logger.warning(f"Error setting schema version: {e}")
+    
+    def check_schema_version(self) -> tuple[bool, Optional[str]]:
+        """
+        Check if the stored schema version matches the current version.
+        
+        Returns:
+            Tuple of (is_current: bool, stored_version: str or None)
+            - is_current is True if stored version matches SUMMARY_SCHEMA_VERSION
+            - stored_version is the version found in storage (None if not set)
+        """
+        stored_version = self.get_schema_version()
+        is_current = stored_version == SUMMARY_SCHEMA_VERSION
+        return is_current, stored_version
+    
+    def clear_all_summaries(self) -> int:
+        """
+        Clear all summaries from the summary index.
+        
+        This removes all entries EXCEPT the schema version marker.
+        Used for schema migrations or manual invalidation.
+        
+        Returns:
+            Number of summaries cleared
+        """
+        try:
+            # Get all IDs in the collection
+            result = self.collection.get(include=[])
+            all_ids = result["ids"] if result["ids"] else []
+            
+            # Filter out the schema version marker
+            ids_to_delete = [id for id in all_ids if id != self._SCHEMA_VERSION_ID]
+            
+            if ids_to_delete:
+                # Delete in batches to avoid hitting limits
+                BATCH_SIZE = 1000
+                for i in range(0, len(ids_to_delete), BATCH_SIZE):
+                    batch = ids_to_delete[i:i + BATCH_SIZE]
+                    self.collection.delete(ids=batch)
+                
+                logger.info(f"Cleared {len(ids_to_delete)} summaries from summary index")
+            
+            self._invalidate_cache()
+            return len(ids_to_delete)
+            
+        except Exception as e:
+            logger.error(f"Error clearing summaries: {e}")
+            return 0
+    
     def _invalidate_cache(self):
         """Invalidate the cache after updates"""
         self._cache = None
@@ -223,21 +313,39 @@ class SummaryIndexMetadata:
         pattern: str = "",
         domain: str = ""
     ) -> None:
-        """Update or insert summary metadata after summarization"""
-        metadata = {
-            "content_hash": content_hash,
-            "summary_chunk_id": summary_chunk_id,
-            "model": model,
-            "pattern": pattern,
-            "domain": domain,
-            "summarized_at": datetime.now().isoformat()
-        }
+        """
+        Update summary metadata after summarization (legacy method).
         
+        Note: This method only updates specific metadata fields without
+        overwriting the document content (which may contain structured JSON
+        from store_summary()).
+        """
         try:
+            # Get existing entry to preserve the document content
+            existing = self.collection.get(ids=[file_path], include=["documents", "metadatas"])
+            
+            # Preserve existing document (may contain structured JSON)
+            existing_doc = ""
+            existing_meta = {}
+            if existing["ids"]:
+                existing_doc = existing["documents"][0] if existing["documents"] else file_path
+                existing_meta = existing["metadatas"][0] if existing["metadatas"] else {}
+            
+            # Merge new metadata with existing
+            metadata = {**existing_meta}
+            metadata.update({
+                "content_hash": content_hash,
+                "summary_chunk_id": summary_chunk_id,
+                "model": model,
+                "pattern": pattern,
+                "domain": domain,
+                "summarized_at": datetime.now().isoformat()
+            })
+            
             self.collection.upsert(
                 ids=[file_path],
                 metadatas=[metadata],
-                documents=[file_path]  # Required by Chroma
+                documents=[existing_doc if existing_doc else file_path]
             )
             self._invalidate_cache()
         except Exception as e:
@@ -278,15 +386,30 @@ class SummaryIndexMetadata:
         """
         Update summary metadata for a file (e.g., validation status).
         
+        Preserves the existing document content (which may contain structured JSON).
+        
         Args:
             file_path: Relative path to the file
-            metadata: Metadata dict to update
+            metadata: Metadata dict to merge with existing metadata
         """
         try:
+            # Get existing entry to preserve the document content
+            existing = self.collection.get(ids=[file_path], include=["documents", "metadatas"])
+            
+            # Preserve existing document (may contain structured JSON)
+            existing_doc = file_path
+            existing_meta = {}
+            if existing["ids"]:
+                existing_doc = existing["documents"][0] if existing["documents"] else file_path
+                existing_meta = existing["metadatas"][0] if existing["metadatas"] else {}
+            
+            # Merge new metadata with existing
+            merged_meta = {**existing_meta, **metadata}
+            
             self.collection.upsert(
                 ids=[file_path],
-                metadatas=[metadata],
-                documents=[file_path]  # Required by Chroma
+                metadatas=[merged_meta],
+                documents=[existing_doc]
             )
             self._invalidate_cache()
         except Exception as e:
@@ -299,28 +422,64 @@ class SummaryIndexMetadata:
         content_hash: str = ""
     ) -> None:
         """
-        Store summary data for a file.
+        Store summary data for a file as structured JSON.
+        
+        The full summary is stored as JSON in the document field for later retrieval.
+        Key fields are stored in metadata for filtering (pattern, domain, model, etc.).
         
         Args:
             file_path: Relative path to the file
-            summary_data: Summary metadata including content, pattern, domain, etc.
+            summary_data: Full FileSummary.to_dict() or equivalent dict containing:
+                - file_path, language, purpose, pattern, key_exports, dependencies
+                - domain, model_used, tokens_used, response_time_ms, is_skeleton, error
+                - how_it_works (optional), key_mechanisms (optional), method_summaries (optional)
+                - simple_file (optional), simple_file_reason (optional)
             content_hash: Hash of the file content
         """
+        import json
+        
+        # Add timestamp if not present
+        if "summarized_at" not in summary_data:
+            summary_data["summarized_at"] = datetime.now().isoformat()
+        
+        # Determine boolean flags for Phase 2 fields
+        has_how_it_works = bool(summary_data.get("how_it_works"))
+        has_method_summaries = bool(summary_data.get("method_summaries"))
+        
+        # Key exports as comma-separated string for metadata
+        key_exports = summary_data.get("key_exports", [])
+        exports_str = ", ".join(key_exports[:10]) if key_exports else ""  # Limit to 10
+        
+        # Build metadata for filtering
         metadata = {
             "content_hash": content_hash,
-            "model": summary_data.get("model", ""),
+            "model": summary_data.get("model_used", summary_data.get("model", "")),
             "pattern": summary_data.get("pattern", ""),
             "domain": summary_data.get("domain", ""),
-            "exports": summary_data.get("exports", ""),
-            "summarized_at": summary_data.get("summarized_at", datetime.now().isoformat()),
-            "validation_status": summary_data.get("validation_status", "unreviewed")
+            "language": summary_data.get("language", ""),
+            "exports": exports_str,
+            "summarized_at": summary_data.get("summarized_at"),
+            "validation_status": summary_data.get("validation_status", "unreviewed"),
+            # Phase 2: Boolean flags for filtering
+            "has_how_it_works": has_how_it_works,
+            "has_method_summaries": has_method_summaries,
+            # Simple file tracking
+            "simple_file": summary_data.get("simple_file", False),
         }
+        
+        # Store full summary as JSON in document field
+        try:
+            summary_json = json.dumps(summary_data, ensure_ascii=False)
+        except (TypeError, ValueError) as e:
+            logger.warning(f"Error serializing summary to JSON for {file_path}: {e}")
+            # Fallback to storing just the purpose as content
+            summary_json = summary_data.get("purpose", "")
         
         try:
             self.collection.upsert(
                 ids=[file_path],
                 metadatas=[metadata],
-                documents=[summary_data.get("content", "")]
+                documents=[summary_json]
             )
             self._invalidate_cache()
         except Exception as e:
@@ -338,6 +497,9 @@ class SummaryIndexMetadata:
             result = self.collection.get(include=["metadatas"])
             if result["ids"]:
                 for i, file_path in enumerate(result["ids"]):
+                    # Skip the schema version marker entry
+                    if file_path == self._SCHEMA_VERSION_ID:
+                        continue
                     summarized_files[file_path] = result["metadatas"][i]
             
             # Update cache
@@ -346,6 +508,67 @@ class SummaryIndexMetadata:
         except Exception as e:
             logger.warning(f"Error getting summarized files: {e}")
         return summarized_files
+    
+    def get_full_summary(self, file_path: str) -> Optional[Dict[str, Any]]:
+        """
+        Get the full structured summary for a file.
+        
+        This retrieves the JSON stored in the document field and parses it,
+        along with the metadata fields.
+        
+        Args:
+            file_path: Relative path to the file
+            
+        Returns:
+            Full summary dict including all Phase 2 fields, or None if not found
+        """
+        import json
+        
+        try:
+            result = self.collection.get(
+                ids=[file_path],
+                include=["documents", "metadatas"]
+            )
+            
+            if not result["ids"]:
+                return None
+            
+            metadata = result["metadatas"][0] if result["metadatas"] else {}
+            document = result["documents"][0] if result["documents"] else ""
+            
+            # Try to parse the document as JSON (new format)
+            summary_data = None
+            if document:
+                try:
+                    summary_data = json.loads(document)
+                except json.JSONDecodeError:
+                    # Old format: document is plain text, not JSON
+                    # Fall back to extracting fields from metadata
+                    summary_data = {
+                        "purpose": document,  # Old format stored text here
+                        "pattern": metadata.get("pattern", ""),
+                        "domain": metadata.get("domain", ""),
+                        "model_used": metadata.get("model", ""),
+                    }
+            
+            if not summary_data:
+                summary_data = {}
+            
+            # Merge metadata fields (in case they were updated separately)
+            summary_data["content_hash"] = metadata.get("content_hash", "")
+            summary_data["validation_status"] = metadata.get("validation_status", "unreviewed")
+            summary_data["summarized_at"] = metadata.get("summarized_at", "")
+            summary_data["summary_chunk_id"] = metadata.get("summary_chunk_id", "")
+            
+            # Add boolean flags from metadata
+            summary_data["has_how_it_works"] = metadata.get("has_how_it_works", False)
+            summary_data["has_method_summaries"] = metadata.get("has_method_summaries", False)
+            
+            return summary_data
+            
+        except Exception as e:
+            logger.debug(f"Error getting full summary for {file_path}: {e}")
+            return None
     
     def get_summary_stats(self) -> Dict[str, Any]:
         """Get summary statistics"""

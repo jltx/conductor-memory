@@ -678,7 +678,7 @@ def find_evidence(
                     relevance=relevance,
                 ))
     
-    # Sort by relevance (highest first)
-    evidence.sort(key=lambda e: e.relevance, reverse=True)
+    # Sort by relevance (highest first), with detail as tiebreaker for deterministic ordering
+    evidence.sort(key=lambda e: (e.relevance, e.detail), reverse=True)
     
     return evidence

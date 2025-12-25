@@ -3527,6 +3527,54 @@ async def memory_method_relationships(
     return result
 
 
+@mcp.tool()
+async def memory_invalidate_summaries(
+    codebase: str | None = None
+) -> dict[str, Any]:
+    """
+    Invalidate all existing summaries to force re-summarization.
+    
+    This is useful when:
+    - The summary schema has changed (new fields, different format)
+    - Summaries need to be regenerated with a different model
+    - Summaries are corrupted or inconsistent
+    
+    The operation clears:
+    1. All entries from the summary index (file -> summary mapping)
+    2. All summary chunks from the main collection (searchable summary text)
+    3. Updates the schema version to current
+    
+    After invalidation:
+    - Use memory_queue_codebase_summarization to re-summarize files
+    - Or wait for the background summarizer to pick up the files
+    
+    Args:
+        codebase: Optional codebase name to invalidate (None = all codebases)
+    
+    Returns:
+        Dictionary with:
+        - success: Whether the operation succeeded
+        - total_summaries_cleared: Total summary entries removed
+        - total_chunks_removed: Total summary chunks removed from main collection
+        - codebases: Per-codebase breakdown
+    
+    Example:
+        # Invalidate all summaries in all codebases
+        memory_invalidate_summaries()
+        
+        # Invalidate summaries for a specific codebase
+        memory_invalidate_summaries(codebase="my-project")
+    """
+    if not memory_service:
+        return {"error": "Memory service not initialized"}
+    
+    try:
+        result = await memory_service.invalidate_summaries_async(codebase)
+        return result
+    except Exception as e:
+        return {"error": f"Failed to invalidate summaries: {str(e)}"}
+
+
 def main():
     """Main entry point for SSE MCP server"""
     global memory_service

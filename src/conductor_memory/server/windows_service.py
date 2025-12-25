@@ -47,6 +47,7 @@ if _src_dir not in sys.path:
     sys.path.insert(0, _src_dir)
 
 import logging
+import logging.handlers
 import asyncio
 import threading
 from pathlib import Path
@@ -70,19 +71,35 @@ except ImportError:
 LOG_DIR = Path.home() / ".conductor-memory" / "logs"
 LOG_FILE = LOG_DIR / "service.log"
 
+# Log rotation settings: 10MB max per file, keep 5 backups (~50MB total)
+LOG_MAX_BYTES = 10 * 1024 * 1024  # 10 MB
+LOG_BACKUP_COUNT = 5
+
 
 def setup_logging():
-    """Setup logging for the service"""
+    """Setup logging for the service with rotation to prevent unbounded growth."""
     try:
         LOG_DIR.mkdir(parents=True, exist_ok=True)
         
+        # Use RotatingFileHandler to prevent unbounded log growth
+        file_handler = logging.handlers.RotatingFileHandler(
+            LOG_FILE,
+            maxBytes=LOG_MAX_BYTES,
+            backupCount=LOG_BACKUP_COUNT,
+            encoding='utf-8'
+        )
+        file_handler.setFormatter(
+            logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        )
+        
+        stream_handler = logging.StreamHandler(sys.stdout)
+        stream_handler.setFormatter(
+            logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        )
+        
         logging.basicConfig(
             level=logging.INFO,
-            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-            handlers=[
-                logging.FileHandler(LOG_FILE),
-                logging.StreamHandler(sys.stdout)
-            ]
+            handlers=[file_handler, stream_handler]
         )
     except Exception as e:
         # Fallback to stderr if file logging fails

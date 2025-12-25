@@ -2,12 +2,30 @@
 """
 Live test script for Phase 1 boosting on real codebases.
 Run this while the memory server is running.
+
+These tests require a running memory server on port 9820.
+They will be skipped if the server is not available.
 """
 
+import pytest
 import requests
 import json
 
-BASE_URL = "http://localhost:9800"
+BASE_URL = "http://localhost:9820"
+
+def server_available():
+    """Check if the memory server is running."""
+    try:
+        response = requests.get(f"{BASE_URL}/health", timeout=2)
+        return response.status_code == 200
+    except requests.exceptions.RequestException:
+        return False
+
+# Skip all tests in this module if server is not available
+pytestmark = pytest.mark.skipif(
+    not server_available(),
+    reason="Memory server not running on localhost:9820"
+)
 
 def search(query: str, codebase: str = None, domain_boosts: dict = None, max_results: int = 5):
     """Execute a search against the memory server"""

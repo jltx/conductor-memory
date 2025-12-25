@@ -180,11 +180,12 @@ class ImportGraph:
             self.calculate_centrality()
         
         # Sort files by centrality score (descending)
+        # Use file_path as tiebreaker for deterministic ordering
         priority_list = [
             (node.file_path, node.centrality_score)
             for node in self.nodes.values()
         ]
-        priority_list.sort(key=lambda x: x[1], reverse=True)
+        priority_list.sort(key=lambda x: (x[1], x[0]), reverse=True)
         
         if max_files is not None:
             priority_list = priority_list[:max_files]
