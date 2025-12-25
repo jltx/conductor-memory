@@ -3041,6 +3041,8 @@ Dependencies: {dependencies}"""
         """
         # Get summary stats from all codebases
         total_summarized = 0
+        total_simple = 0
+        total_llm = 0
         summary_stats_by_codebase = {}
         
         for codebase_name, vector_store in self._vector_stores.items():
@@ -3048,6 +3050,8 @@ Dependencies: {dependencies}"""
                 stats = vector_store.summary_index.get_summary_stats()
                 summary_stats_by_codebase[codebase_name] = stats
                 total_summarized += stats.get("total_summarized", 0)
+                total_simple += stats.get("simple_count", 0)
+                total_llm += stats.get("llm_count", 0)
             except Exception as e:
                 logger.debug(f"[{codebase_name}] Error getting summary stats: {e}")
         
@@ -3073,16 +3077,14 @@ Dependencies: {dependencies}"""
             "model": self._summarization_config.model,
             "is_running": self._summarization_stats["is_running"],
             "files_queued": files_queued,
-            "files_completed": files_completed,
             "files_failed": files_failed,
-            "files_skipped": files_skipped_total,
-            "files_skipped_pattern": self._summarization_stats.get("files_skipped_pattern", 0),
-            "files_skipped_unchanged": self._summarization_stats.get("files_skipped_unchanged", 0),
-            "files_skipped_empty": self._summarization_stats.get("files_skipped_empty", 0),
             "files_total_queued": files_total_queued,
             "files_processed": files_processed,
             "progress_percentage": progress_percentage,
+            # Summary breakdown: total vs simple vs LLM
             "total_summarized": total_summarized,
+            "simple_count": total_simple,
+            "llm_count": total_llm,
             "current_file": self._summarization_stats["current_file"],
             "last_error": self._summarization_stats["last_error"],
             "by_codebase": summary_stats_by_codebase,
@@ -3505,7 +3507,9 @@ Dependencies: {dependencies}"""
                     "indexed_at": metadata.get("indexed_at"),
                     "has_summary": file_has_summary,
                     "pattern": summary_data.get("pattern"),
-                    "domain": summary_data.get("domain")
+                    "domain": summary_data.get("domain"),
+                    "simple_file": summary_data.get("simple_file", False),
+                    "simple_file_reason": summary_data.get("simple_file_reason")
                 })
             
             # Sort by path
@@ -3580,11 +3584,11 @@ Dependencies: {dependencies}"""
                 except Exception as e:
                     logger.warning(f"Error fetching chunks for {file_path}: {e}")
             
-            # Get summary if available
+            # Get summary if available (use get_full_summary for Phase 2 fields)
             summary = None
-            summary_info = vector_store.summary_index.get_summary_info(file_path)
-            if summary_info:
-                summary_chunk_id = summary_info.get("summary_chunk_id")
+            full_summary = vector_store.summary_index.get_full_summary(file_path)
+            if full_summary:
+                summary_chunk_id = full_summary.get("summary_chunk_id")
                 if summary_chunk_id:
                     try:
                         summary_result = vector_store.collection.get(
@@ -3594,10 +3598,18 @@ Dependencies: {dependencies}"""
                         if summary_result["ids"]:
                             summary = {
                                 "content": summary_result["documents"][0] if summary_result["documents"] else "",
-                                "model": summary_info.get("model", ""),
-                                "pattern": summary_info.get("pattern", ""),
-                                "domain": summary_info.get("domain", ""),
-                                "summarized_at": summary_info.get("summarized_at", "")
+                                "model": full_summary.get("model_used", full_summary.get("model", "")),
+                                "pattern": full_summary.get("pattern", ""),
+                                "domain": full_summary.get("domain", ""),
+                                "summarized_at": full_summary.get("summarized_at", ""),
+                                "simple_file": full_summary.get("simple_file", False),
+                                "simple_file_reason": full_summary.get("simple_file_reason"),
+                                # Phase 2 fields
+                                "purpose": full_summary.get("purpose", ""),
+                                "how_it_works": full_summary.get("how_it_works"),
+                                "key_mechanisms": full_summary.get("key_mechanisms"),
+                                "method_summaries": full_summary.get("method_summaries"),
+                                "exports": full_summary.get("exports"),
                             }
                     except Exception as e:
                         logger.warning(f"Error fetching summary for {file_path}: {e}")
@@ -4033,6 +4045,75 @@ Dependencies: {dependencies}"""
     # Summary Validation API
     # ─────────────────────────────────────────────────────────────────────────
     
+    async def get_summary_statistics_async(
+        self,
+        codebase: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Get aggregated summary statistics with distribution by pattern, domain, and status.
+        
+        Args:
+            codebase: Optional codebase name. If None, aggregates across all codebases.
+            
+        Returns:
+            Dict with:
+                - total_summarized: Total number of summarized files
+                - by_pattern: Dict mapping pattern -> count (sorted by count desc)
+                - by_domain: Dict mapping domain -> count (sorted by count desc)
+                - by_status: Dict mapping status -> count
+                - by_codebase: Dict mapping codebase -> count (if codebase is None)
+        """
+        result = {
+            "total_summarized": 0,
+            "by_pattern": {},
+            "by_domain": {},
+            "by_status": {},
+            "by_codebase": {}
+        }
+        
+        # Determine which codebases to query
+        if codebase:
+            vector_store = self._vector_stores.get(codebase)
+            if not vector_store:
+                return {"error": f"Codebase not found: {codebase}", **result}
+            stores_to_query = [(codebase, vector_store)]
+        else:
+            stores_to_query = list(self._vector_stores.items())
+        
+        # Aggregate statistics across codebases
+        for cb_name, vector_store in stores_to_query:
+            try:
+                stats = vector_store.summary_index.get_summary_stats()
+                
+                cb_total = stats.get("total_summarized", 0)
+                result["total_summarized"] += cb_total
+                result["by_codebase"][cb_name] = cb_total
+                
+                # Merge pattern counts
+                for pattern, count in stats.get("by_pattern", {}).items():
+                    result["by_pattern"][pattern] = result["by_pattern"].get(pattern, 0) + count
+                
+                # Merge domain counts
+                for domain, count in stats.get("by_domain", {}).items():
+                    result["by_domain"][domain] = result["by_domain"].get(domain, 0) + count
+                
+                # Merge status counts
+                for status, count in stats.get("by_status", {}).items():
+                    result["by_status"][status] = result["by_status"].get(status, 0) + count
+                    
+            except Exception as e:
+                logger.warning(f"Error getting summary stats for {cb_name}: {e}")
+        
+        # Sort by count descending and convert to list of tuples for consistent ordering
+        result["by_pattern"] = dict(
+            sorted(result["by_pattern"].items(), key=lambda x: x[1], reverse=True)
+        )
+        result["by_domain"] = dict(
+            sorted(result["by_domain"].items(), key=lambda x: x[1], reverse=True)
+        )
+        
+        return result
+    
     async def get_validation_queue_async(
         self,
         codebase: str,
@@ -4108,7 +4189,8 @@ Dependencies: {dependencies}"""
                     "path": file_path,
                     "status": validation_status,
                     "pattern": file_pattern,
-                    "domain": file_domain
+                    "domain": file_domain,
+                    "simple_file": info.get("simple_file", False)
                 })
             
             # Sort by path

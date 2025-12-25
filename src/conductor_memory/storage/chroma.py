@@ -579,25 +579,39 @@ class SummaryIndexMetadata:
             patterns = {}
             domains = {}
             models = {}
+            validation_statuses = {}
+            simple_count = 0
+            llm_count = 0
             
             for file_path, info in all_files.items():
                 pattern = info.get("pattern", "unknown")
                 domain = info.get("domain", "unknown")
                 model = info.get("model", "unknown")
+                validation_status = info.get("validation_status", "unreviewed")
                 
                 patterns[pattern] = patterns.get(pattern, 0) + 1
                 domains[domain] = domains.get(domain, 0) + 1
                 models[model] = models.get(model, 0) + 1
+                validation_statuses[validation_status] = validation_statuses.get(validation_status, 0) + 1
+                
+                # Count simple vs LLM summarized
+                if info.get("simple_file", False):
+                    simple_count += 1
+                else:
+                    llm_count += 1
             
             return {
                 "total_summarized": len(all_files),
+                "simple_count": simple_count,
+                "llm_count": llm_count,
                 "by_pattern": patterns,
                 "by_domain": domains,
-                "by_model": models
+                "by_model": models,
+                "by_status": validation_statuses
             }
         except Exception as e:
             logger.warning(f"Error getting summary stats: {e}")
-            return {"total_summarized": 0, "error": str(e)}
+            return {"total_summarized": 0, "simple_count": 0, "llm_count": 0, "error": str(e)}
 
 
 class ChromaVectorStore(VectorStore):

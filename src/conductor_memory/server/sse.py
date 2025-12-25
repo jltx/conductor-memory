@@ -242,6 +242,23 @@ async def api_list_codebases(request):
         return JSONResponse({"error": str(e)}, status_code=400)
 
 
+# Summary statistics API endpoint
+@mcp.custom_route("/api/summary-stats", methods=["GET"])
+async def api_summary_stats(request):
+    """Get aggregated summary statistics by pattern, domain, and validation status."""
+    if not memory_service:
+        return JSONResponse({"error": "Service not initialized"}, status_code=503)
+    
+    try:
+        params = request.query_params
+        codebase = params.get("codebase") or None  # Empty string -> None for all codebases
+        
+        result = await memory_service.get_summary_statistics_async(codebase=codebase)
+        return JSONResponse(result)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+
 # Validation queue API endpoint
 @mcp.custom_route("/api/validation-queue", methods=["GET"])
 async def api_validation_queue(request):
@@ -354,6 +371,61 @@ async def api_regenerate_summary(request):
             return JSONResponse({"error": "codebase and file_path are required"}, status_code=400)
         
         result = await memory_service.regenerate_summary_async(codebase, file_path)
+        return JSONResponse(result)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+
+# Queue summarization API endpoint (for dashboard action buttons)
+@mcp.custom_route("/api/queue-summarization", methods=["POST"])
+async def api_queue_summarization(request):
+    """Queue a codebase for summarization."""
+    if not memory_service:
+        return JSONResponse({"error": "Service not initialized"}, status_code=503)
+    
+    try:
+        body = await request.json()
+        codebase = body.get("codebase")
+        only_missing = body.get("only_missing", True)
+        
+        if not codebase:
+            return JSONResponse({"error": "codebase is required"}, status_code=400)
+        
+        result = await memory_service.queue_codebase_for_summarization(codebase, only_missing)
+        return JSONResponse(result)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+
+# Invalidate summaries API endpoint (for dashboard action buttons)
+@mcp.custom_route("/api/invalidate-summaries", methods=["POST"])
+async def api_invalidate_summaries(request):
+    """Invalidate all summaries to force re-summarization."""
+    if not memory_service:
+        return JSONResponse({"error": "Service not initialized"}, status_code=503)
+    
+    try:
+        result = await memory_service.invalidate_summaries_async()
+        return JSONResponse(result)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+
+# Reindex codebase API endpoint (for dashboard action buttons)
+@mcp.custom_route("/api/reindex", methods=["POST"])
+async def api_reindex_codebase(request):
+    """Reindex a specific codebase."""
+    if not memory_service:
+        return JSONResponse({"error": "Service not initialized"}, status_code=503)
+    
+    try:
+        body = await request.json()
+        codebase = body.get("codebase")
+        
+        if not codebase:
+            return JSONResponse({"error": "codebase is required"}, status_code=400)
+        
+        result = await memory_service.reindex_codebase_async(codebase)
         return JSONResponse(result)
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=400)
@@ -622,6 +694,62 @@ async def web_dashboard(request):
             border-color: #00ff88; color: #00ff88;
         }
         
+        /* Search result summary preview */
+        .result-summary-preview {
+            margin: 8px 12px 0 12px;
+            padding: 10px 12px;
+            background: #0f3460;
+            border-radius: 6px;
+            border-left: 3px solid #00d4ff;
+        }
+        .result-summary-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            gap: 10px;
+            margin-bottom: 6px;
+        }
+        .result-summary-purpose {
+            font-size: 12px;
+            color: #ccc;
+            line-height: 1.4;
+            flex: 1;
+        }
+        .result-summary-badges {
+            display: flex;
+            gap: 6px;
+            flex-wrap: wrap;
+            flex-shrink: 0;
+        }
+        .result-summary-badges .pattern-badge {
+            padding: 2px 8px;
+            border-radius: 10px;
+            font-size: 10px;
+            font-weight: bold;
+            text-transform: uppercase;
+            background: rgba(0, 212, 255, 0.15);
+            color: #00d4ff;
+        }
+        .result-summary-badges .domain-badge {
+            padding: 2px 8px;
+            border-radius: 10px;
+            font-size: 10px;
+            background: rgba(0, 255, 136, 0.15);
+            color: #00ff88;
+        }
+        .result-summary-meta {
+            display: flex;
+            gap: 12px;
+            font-size: 11px;
+            color: #888;
+        }
+        .result-summary-meta .has-indicator {
+            color: #00d4ff;
+        }
+        .result-summary-meta .has-indicator::before {
+            content: "✓ ";
+        }
+        
         /* Browse tab styles */
         .browse-controls { 
             display: flex; gap: 15px; margin-bottom: 10px; flex-wrap: wrap; align-items: center;
@@ -788,6 +916,36 @@ async def web_dashboard(request):
         }
         .file-item-summary-indicator.has-summary {
             background: #00ff88;
+        }
+        
+        /* Summarization type badges */
+        .summary-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-size: 10px;
+            font-weight: 500;
+            cursor: help;
+        }
+        .summary-badge.simple {
+            background: rgba(147, 112, 219, 0.2);
+            color: #b794f4;
+            border: 1px solid rgba(147, 112, 219, 0.3);
+        }
+        .summary-badge.llm {
+            background: rgba(72, 187, 120, 0.2);
+            color: #68d391;
+            border: 1px solid rgba(72, 187, 120, 0.3);
+        }
+        .summary-badge.pending {
+            background: rgba(237, 137, 54, 0.2);
+            color: #f6ad55;
+            border: 1px solid rgba(237, 137, 54, 0.3);
+        }
+        .summary-badge-icon {
+            font-size: 10px;
         }
         
         /* Detail panel sections */
@@ -991,6 +1149,28 @@ async def web_dashboard(request):
         .validate-status-icon.rejected { color: #ff6b6b; }
         .validate-status-icon.unreviewed { color: #555; }
         
+        /* Simple file styling */
+        .validate-file-item.simple-file {
+            opacity: 0.75;
+        }
+        .validate-file-item.simple-file:hover {
+            opacity: 1;
+        }
+        .validate-simple-badge {
+            margin-right: 6px;
+            font-size: 10px;
+            flex-shrink: 0;
+        }
+        .validate-simple-header-badge {
+            display: inline-block;
+            background: #1a4a3a;
+            color: #4ade80;
+            font-size: 11px;
+            padding: 2px 8px;
+            border-radius: 4px;
+            margin-left: 8px;
+        }
+        
         /* Content panels (middle and right) */
         .validate-panel {
             background: #16213e;
@@ -1121,6 +1301,191 @@ async def web_dashboard(request):
         .summary-title { color: #00ff88; font-size: 13px; margin-bottom: 8px; }
         .summary-content { font-size: 13px; color: #ccc; white-space: pre-wrap; }
         
+        /* Phase 2: Collapsible sections */
+        .collapsible-section {
+            margin-top: 12px;
+            border-top: 1px solid rgba(255,255,255,0.1);
+            padding-top: 12px;
+        }
+        .collapsible-header {
+            display: flex;
+            align-items: center;
+            cursor: pointer;
+            color: #00ff88;
+            font-size: 13px;
+            user-select: none;
+        }
+        .collapsible-header:hover { color: #00ffaa; }
+        .collapsible-arrow {
+            margin-right: 6px;
+            transition: transform 0.2s;
+            font-size: 10px;
+        }
+        .collapsible-header.expanded .collapsible-arrow {
+            transform: rotate(90deg);
+        }
+        .collapsible-body {
+            display: none;
+            margin-top: 8px;
+            padding: 10px;
+            background: rgba(0,0,0,0.2);
+            border-radius: 4px;
+            font-size: 13px;
+            color: #ccc;
+            white-space: pre-wrap;
+        }
+        .collapsible-body.show { display: block; }
+        
+        /* Phase 2: Mechanism tags */
+        .mechanism-tags {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+            margin-top: 10px;
+        }
+        .mechanism-tag {
+            background: #1a4a7a;
+            color: #88ccff;
+            padding: 3px 8px;
+            border-radius: 12px;
+            font-size: 11px;
+            font-weight: 500;
+        }
+        
+        /* Phase 2: Method summaries list */
+        .method-summaries-list {
+            margin-top: 8px;
+            font-size: 12px;
+        }
+        .method-item {
+            padding: 6px 0;
+            border-bottom: 1px solid rgba(255,255,255,0.05);
+            display: flex;
+            gap: 8px;
+        }
+        .method-item:last-child { border-bottom: none; }
+        .method-name {
+            color: #ffcc00;
+            font-family: monospace;
+            font-weight: 500;
+            flex-shrink: 0;
+        }
+        .method-desc {
+            color: #aaa;
+        }
+        
+        /* Summary Statistics Section */
+        .summary-stats-container {
+            margin-bottom: 15px;
+        }
+        .summary-stats-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 12px 15px;
+            background: #16213e;
+            border: 1px solid #0f3460;
+            border-radius: 8px 8px 0 0;
+            cursor: pointer;
+            user-select: none;
+        }
+        .summary-stats-header:hover {
+            background: #1a2a4e;
+        }
+        .summary-stats-title {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 14px;
+            color: #00d4ff;
+        }
+        .summary-stats-arrow {
+            transition: transform 0.2s;
+            font-size: 10px;
+        }
+        .summary-stats-header.collapsed .summary-stats-arrow {
+            transform: rotate(-90deg);
+        }
+        .summary-stats-total {
+            font-size: 12px;
+            color: #888;
+        }
+        .summary-stats-body {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 15px;
+            padding: 15px;
+            background: #0f3460;
+            border: 1px solid #0f3460;
+            border-top: none;
+            border-radius: 0 0 8px 8px;
+        }
+        .summary-stats-body.hidden {
+            display: none;
+        }
+        .stats-column {
+            background: #16213e;
+            border-radius: 6px;
+            padding: 12px;
+        }
+        .stats-column-title {
+            font-size: 12px;
+            color: #888;
+            margin-bottom: 10px;
+            padding-bottom: 8px;
+            border-bottom: 1px solid #0f3460;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        .stats-list {
+            max-height: 180px;
+            overflow-y: auto;
+        }
+        .stats-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 6px 8px;
+            margin-bottom: 4px;
+            border-radius: 4px;
+            font-size: 13px;
+        }
+        .stats-item:hover {
+            background: rgba(0, 212, 255, 0.1);
+        }
+        .stats-item-label {
+            color: #ccc;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            max-width: 120px;
+        }
+        .stats-item-count {
+            color: #00d4ff;
+            font-weight: 500;
+            flex-shrink: 0;
+            margin-left: 8px;
+        }
+        .stats-item.status-approved .stats-item-label { color: #00ff88; }
+        .stats-item.status-rejected .stats-item-label { color: #ff6b6b; }
+        .stats-item.status-unreviewed .stats-item-label { color: #888; }
+        .stats-item.status-approved .stats-item-count { color: #00ff88; }
+        .stats-item.status-rejected .stats-item-count { color: #ff6b6b; }
+        .stats-loading {
+            text-align: center;
+            padding: 20px;
+            color: #888;
+            font-size: 12px;
+        }
+        @media (max-width: 900px) {
+            .summary-stats-body {
+                grid-template-columns: 1fr;
+            }
+            .stats-list {
+                max-height: 120px;
+            }
+        }
+        
         /* Loading & empty states */
         .loading { text-align: center; padding: 40px; color: #888; }
         .empty-state { text-align: center; padding: 40px; color: #888; }
@@ -1217,6 +1582,197 @@ async def web_dashboard(request):
             border-radius: 3px;
             margin-left: 5px;
         }
+        
+        /* Action buttons card */
+        .action-buttons {
+            display: flex;
+            gap: 12px;
+            flex-wrap: wrap;
+        }
+        .action-btn {
+            padding: 12px 20px;
+            border: 1px solid #1a3a6e;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 13px;
+            font-weight: 500;
+            transition: all 0.2s;
+            background: #0f3460;
+            color: #eee;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .action-btn:hover:not(:disabled) {
+            border-color: #00d4ff;
+            background: rgba(0, 212, 255, 0.1);
+        }
+        .action-btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+        .action-btn.loading {
+            pointer-events: none;
+        }
+        .action-btn .spinner {
+            display: none;
+            width: 14px;
+            height: 14px;
+            border: 2px solid #555;
+            border-top-color: #00d4ff;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+        .action-btn.loading .spinner {
+            display: inline-block;
+        }
+        .action-btn.loading .btn-icon {
+            display: none;
+        }
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+        
+        /* Modal styles */
+        .modal-overlay {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0, 0, 0, 0.7);
+            z-index: 1000;
+            align-items: center;
+            justify-content: center;
+        }
+        .modal-overlay.open {
+            display: flex;
+        }
+        .modal {
+            background: #16213e;
+            border-radius: 8px;
+            border: 1px solid #0f3460;
+            padding: 20px;
+            min-width: 350px;
+            max-width: 450px;
+        }
+        .modal-title {
+            font-size: 16px;
+            color: #eee;
+            margin-bottom: 15px;
+        }
+        .modal-body {
+            margin-bottom: 20px;
+        }
+        .modal-body p {
+            color: #888;
+            font-size: 13px;
+            margin-bottom: 12px;
+        }
+        .modal-body select {
+            width: 100%;
+            padding: 10px 12px;
+            background: #0f3460;
+            border: 1px solid #1a3a6e;
+            border-radius: 4px;
+            color: #eee;
+            font-size: 14px;
+        }
+        .modal-body select:focus {
+            outline: none;
+            border-color: #00d4ff;
+        }
+        .modal-body label {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            color: #ccc;
+            font-size: 13px;
+            margin-top: 12px;
+            cursor: pointer;
+        }
+        .modal-body label input[type="checkbox"] {
+            width: 16px;
+            height: 16px;
+        }
+        .modal-footer {
+            display: flex;
+            gap: 10px;
+            justify-content: flex-end;
+        }
+        .modal-btn {
+            padding: 8px 16px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 13px;
+            transition: all 0.2s;
+        }
+        .modal-btn-cancel {
+            background: transparent;
+            border: 1px solid #1a3a6e;
+            color: #888;
+        }
+        .modal-btn-cancel:hover {
+            border-color: #555;
+            color: #ccc;
+        }
+        .modal-btn-confirm {
+            background: #00d4ff;
+            border: none;
+            color: #1a1a2e;
+            font-weight: 500;
+        }
+        .modal-btn-confirm:hover {
+            background: #00b8e6;
+        }
+        .modal-btn-confirm:disabled {
+            background: #555;
+            cursor: not-allowed;
+        }
+        .modal-btn-danger {
+            background: #ff6b6b;
+            border: none;
+            color: #fff;
+            font-weight: 500;
+        }
+        .modal-btn-danger:hover {
+            background: #ff5252;
+        }
+        
+        /* Toast notifications */
+        .toast-container {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            z-index: 1100;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+        .toast {
+            padding: 12px 16px;
+            border-radius: 6px;
+            font-size: 13px;
+            animation: slideIn 0.3s ease;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .toast-success {
+            background: rgba(0, 255, 136, 0.15);
+            border: 1px solid rgba(0, 255, 136, 0.3);
+            color: #00ff88;
+        }
+        .toast-error {
+            background: rgba(255, 107, 107, 0.15);
+            border: 1px solid rgba(255, 107, 107, 0.3);
+            color: #ff6b6b;
+        }
+        @keyframes slideIn {
+            from { transform: translateX(100%); opacity: 0; }
+            to { transform: translateX(0); opacity: 1; }
+        }
     </style>
 </head>
 <body>
@@ -1226,7 +1782,7 @@ async def web_dashboard(request):
             <button class="tab active" data-tab="status">Status</button>
             <button class="tab" data-tab="search">Search</button>
             <button class="tab" data-tab="browse">Browse</button>
-            <button class="tab" data-tab="validate">Validate</button>
+            <button class="tab" data-tab="summaries">Summaries</button>
         </div>
     </div>
     
@@ -1250,6 +1806,27 @@ async def web_dashboard(request):
                 
                 <h2>Codebases</h2>
                 <div class="card" id="codebases"></div>
+                
+                <h2>Actions</h2>
+                <div class="card">
+                    <div class="action-buttons">
+                        <button class="action-btn" id="btn-queue-summarization" onclick="openQueueSummarizationModal()">
+                            <span class="btn-icon">📋</span>
+                            <span class="spinner"></span>
+                            Queue Summarization
+                        </button>
+                        <button class="action-btn" id="btn-invalidate-summaries" onclick="openInvalidateSummariesModal()">
+                            <span class="btn-icon">🗑️</span>
+                            <span class="spinner"></span>
+                            Invalidate Summaries
+                        </button>
+                        <button class="action-btn" id="btn-reindex-codebase" onclick="openReindexCodebaseModal()">
+                            <span class="btn-icon">🔄</span>
+                            <span class="spinner"></span>
+                            Reindex Codebase
+                        </button>
+                    </div>
+                </div>
             </div>
             <p class="refresh-note">Auto-refreshes every 5 seconds</p>
         </div>
@@ -1449,9 +2026,23 @@ async def web_dashboard(request):
             </div>
         </div>
         
-        <!-- VALIDATE TAB -->
-        <div id="validate-tab" class="tab-content">
+        <!-- SUMMARIES TAB -->
+        <div id="summaries-tab" class="tab-content">
             <h2>Summary Validation</h2>
+            
+            <!-- Summary Statistics Section (collapsible) -->
+            <div class="summary-stats-container">
+                <div class="summary-stats-header" onclick="toggleSummaryStats()">
+                    <div class="summary-stats-title">
+                        <span class="summary-stats-arrow">▼</span>
+                        Summary Statistics
+                    </div>
+                    <span class="summary-stats-total" id="summary-stats-total">Loading...</span>
+                </div>
+                <div class="summary-stats-body" id="summary-stats-body">
+                    <div class="stats-loading" id="summary-stats-loading">Loading statistics...</div>
+                </div>
+            </div>
             
             <!-- Filter Bar -->
             <div class="validate-filter-bar">
@@ -1543,6 +2134,58 @@ async def web_dashboard(request):
         </div>
     </div>
     
+    <!-- Toast container for notifications -->
+    <div class="toast-container" id="toast-container"></div>
+    
+    <!-- Modal: Queue Summarization -->
+    <div class="modal-overlay" id="modal-queue-summarization">
+        <div class="modal">
+            <div class="modal-title">Queue Summarization</div>
+            <div class="modal-body">
+                <p>Queue files from a codebase for LLM summarization.</p>
+                <select id="queue-codebase-select"></select>
+                <label>
+                    <input type="checkbox" id="queue-only-missing" checked />
+                    Only queue files without summaries
+                </label>
+            </div>
+            <div class="modal-footer">
+                <button class="modal-btn modal-btn-cancel" onclick="closeModal('modal-queue-summarization')">Cancel</button>
+                <button class="modal-btn modal-btn-confirm" id="queue-confirm-btn" onclick="confirmQueueSummarization()">Queue</button>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Modal: Invalidate Summaries -->
+    <div class="modal-overlay" id="modal-invalidate-summaries">
+        <div class="modal">
+            <div class="modal-title">Invalidate All Summaries</div>
+            <div class="modal-body">
+                <p>This will clear all existing summaries from all codebases. Files will need to be re-summarized.</p>
+                <p style="color: #ff6b6b;"><strong>Warning:</strong> This action cannot be undone.</p>
+            </div>
+            <div class="modal-footer">
+                <button class="modal-btn modal-btn-cancel" onclick="closeModal('modal-invalidate-summaries')">Cancel</button>
+                <button class="modal-btn modal-btn-danger" id="invalidate-confirm-btn" onclick="confirmInvalidateSummaries()">Invalidate All</button>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Modal: Reindex Codebase -->
+    <div class="modal-overlay" id="modal-reindex-codebase">
+        <div class="modal">
+            <div class="modal-title">Reindex Codebase</div>
+            <div class="modal-body">
+                <p>Force reindexing of a codebase to update metadata and heuristics.</p>
+                <select id="reindex-codebase-select"></select>
+            </div>
+            <div class="modal-footer">
+                <button class="modal-btn modal-btn-cancel" onclick="closeModal('modal-reindex-codebase')">Cancel</button>
+                <button class="modal-btn modal-btn-confirm" id="reindex-confirm-btn" onclick="confirmReindexCodebase()">Reindex</button>
+            </div>
+        </div>
+    </div>
+    
     <script>
         // =========== State ===========
         let codebases = [];
@@ -1570,8 +2213,9 @@ async def web_dashboard(request):
                     loadBrowseData();
                 }
                 
-                // Load data for validate tab
-                if (tab.dataset.tab === 'validate') {
+                // Load data for summaries tab
+                if (tab.dataset.tab === 'summaries') {
+                    loadSummaryStats();
                     loadValidationQueue();
                 }
             });
@@ -1632,15 +2276,25 @@ async def web_dashboard(request):
                 }
             }
             
+            // Build stats - only show Failed if > 0
+            const failedStat = (data.files_failed || 0) > 0 
+                ? `<div class="stat"><div class="stat-value status-error">${data.files_failed}</div><div class="stat-label">Failed</div></div>`
+                : '';
+            
+            // Only show timing stats if queue is active
+            const timingStats = data.files_queued > 0 
+                ? `<div class="stat"><div class="stat-value">${avgTimeText}</div><div class="stat-label">Avg Time/File</div></div>
+                   <div class="stat"><div class="stat-value">${estRemainingText}</div><div class="stat-label">Est. Remaining</div></div>`
+                : '';
+            
             document.getElementById('summary-stats').innerHTML = `
                 <div class="stat"><div class="stat-value ${statusClass}">${statusText}</div><div class="stat-label">Status</div></div>
-                <div class="stat"><div class="stat-value">${data.total_summarized || 0}</div><div class="stat-label">Summarized</div></div>
-                <div class="stat"><div class="stat-value">${data.files_queued || 0}</div><div class="stat-label">In Queue</div></div>
-                <div class="stat"><div class="stat-value">${data.files_completed || 0}</div><div class="stat-label">This Session</div></div>
-                <div class="stat"><div class="stat-value">${data.files_skipped || 0}</div><div class="stat-label">Skipped</div></div>
-                <div class="stat"><div class="stat-value">${data.files_failed || 0}</div><div class="stat-label">Failed</div></div>
-                <div class="stat"><div class="stat-value">${avgTimeText}</div><div class="stat-label">Avg Time/File</div></div>
-                <div class="stat"><div class="stat-value">${estRemainingText}</div><div class="stat-label">Est. Remaining</div></div>
+                <div class="stat"><div class="stat-value">${data.total_summarized || 0}</div><div class="stat-label">Files Summarized</div></div>
+                <div class="stat"><div class="stat-value">${data.files_queued || 0}</div><div class="stat-label">Files Pending</div></div>
+                <div class="stat"><div class="stat-value">${data.simple_count || 0}</div><div class="stat-label">Simple Files</div></div>
+                <div class="stat"><div class="stat-value">${data.llm_count || 0}</div><div class="stat-label">LLM Summarized</div></div>
+                ${failedStat}
+                ${timingStats}
             `;
             
             const total = data.files_total_queued || 0;
@@ -1812,9 +2466,49 @@ async def web_dashboard(request):
             }
         }
         
+        function renderSummaryPreview(summary) {
+            if (!summary) return '';
+            
+            // Truncate purpose to ~100 chars
+            let purpose = summary.purpose || '';
+            if (purpose.length > 100) {
+                purpose = purpose.substring(0, 100).trim() + '...';
+            }
+            
+            // Build badges
+            let badges = '';
+            if (summary.pattern) {
+                badges += `<span class="pattern-badge">${escapeHtml(summary.pattern)}</span>`;
+            }
+            if (summary.domain) {
+                badges += `<span class="domain-badge">${escapeHtml(summary.domain)}</span>`;
+            }
+            
+            // Build meta indicators
+            let meta = [];
+            if (summary.has_how_it_works) {
+                meta.push('<span class="has-indicator">How It Works</span>');
+            }
+            if (summary.has_method_summaries) {
+                const methodCount = Array.isArray(summary.method_summaries) ? summary.method_summaries.length : 0;
+                meta.push(`<span class="has-indicator">${methodCount || 'Has'} Methods</span>`);
+            }
+            
+            return `
+                <div class="result-summary-preview">
+                    <div class="result-summary-header">
+                        <div class="result-summary-purpose">${escapeHtml(purpose)}</div>
+                        ${badges ? `<div class="result-summary-badges">${badges}</div>` : ''}
+                    </div>
+                    ${meta.length > 0 ? `<div class="result-summary-meta">${meta.join('')}</div>` : ''}
+                </div>
+            `;
+        }
+        
         function renderSearchResults(data) {
             const resultsDiv = document.getElementById('search-results');
             const results = data.results || [];
+            const includeSummaries = document.getElementById('filter-include-summaries').checked;
             
             if (results.length === 0) {
                 resultsDiv.innerHTML = '<div class="empty-state">No results found. Try different search terms or adjust filters.</div>';
@@ -1858,6 +2552,11 @@ async def web_dashboard(request):
                     scoreSegments += `<div class="score-segment ${segClass}"></div>`;
                 }
                 
+                // Render summary preview if summaries enabled and available
+                const summaryPreview = (includeSummaries && r.has_summary && r.file_summary) 
+                    ? renderSummaryPreview(r.file_summary) 
+                    : '';
+                
                 html += `
                     <div class="result-item">
                         <div class="result-item-header">
@@ -1872,6 +2571,7 @@ async def web_dashboard(request):
                             </div>
                         </div>
                         ${r.source ? `<div class="result-file">${r.source}</div>` : ''}
+                        ${summaryPreview}
                         <div class="result-body">
                             ${tags ? `<div class="result-tags">${tags}</div>` : ''}
                             <div class="result-content" id="result-content-${idx}">${preview}${hasMore ? '...' : ''}</div>
@@ -2054,13 +2754,14 @@ async def web_dashboard(request):
             let html = '';
             files.forEach((f, idx) => {
                 const patternTag = f.pattern ? `<span class="tag" style="font-size: 10px;">${f.pattern}</span>` : '';
+                const summaryBadge = getSummaryBadge(f.has_summary, f.simple_file, f.simple_file_reason);
                 html += `
                     <div class="file-list-item" data-index="${idx}" onclick="selectFileItem(${idx})" tabindex="-1">
                         <span class="file-item-path" title="${escapeHtml(f.path)}">${escapeHtml(f.path)}</span>
                         <div class="file-item-meta">
+                            ${summaryBadge}
                             ${patternTag}
                             <span class="file-item-chunks">${f.chunk_count}</span>
-                            <span class="file-item-summary-indicator ${f.has_summary ? 'has-summary' : ''}" title="${f.has_summary ? 'Has summary' : 'No summary'}"></span>
                         </div>
                     </div>
                 `;
@@ -2114,6 +2815,8 @@ async def web_dashboard(request):
                     return;
                 }
                 
+                const summaryMethod = getSummarizationMethod(data.summary);
+                
                 let html = `<div class="detail-meta-grid">
                     <div class="detail-meta-item">
                         <div class="detail-meta-label">Codebase</div>
@@ -2128,16 +2831,13 @@ async def web_dashboard(request):
                         <div class="detail-meta-value">${data.indexed_at ? new Date(data.indexed_at).toLocaleString() : '-'}</div>
                     </div>
                     <div class="detail-meta-item">
-                        <div class="detail-meta-label">Hash</div>
-                        <div class="detail-meta-value">${(data.content_hash || '').substring(0, 12)}...</div>
+                        <div class="detail-meta-label">Summarization</div>
+                        <div class="detail-meta-value">${summaryMethod || 'Pending'}</div>
                     </div>
                 </div>`;
                 
                 if (data.summary) {
-                    html += `<div class="summary-section">
-                        <div class="summary-title">Summary (${data.summary.model || 'unknown'} - ${data.summary.pattern || 'unknown'})</div>
-                        <div class="summary-content">${escapeHtml(data.summary.content)}</div>
-                    </div>`;
+                    html += renderSummarySection(data.summary);
                 }
                 
                 html += '<h3 style="color: #888; font-size: 13px; margin: 15px 0 10px;">Chunks</h3><div class="chunk-list">';
@@ -2445,6 +3145,350 @@ async def web_dashboard(request):
             };
         }
         
+        function getSummaryBadge(hasSummary, simpleFile, simpleFileReason) {
+            if (!hasSummary) {
+                return '<span class="summary-badge pending" title="No summary yet"><span class="summary-badge-icon">⏳</span>Pending</span>';
+            }
+            if (simpleFile) {
+                const reasonMap = {
+                    'barrel_reexport': 'Barrel/re-export file',
+                    'empty_module': 'Empty module',
+                    'generated_code': 'Generated code',
+                    'constants_only': 'Constants only',
+                    'type_definitions': 'Type definitions only'
+                };
+                const tooltip = reasonMap[simpleFileReason] || simpleFileReason || 'Simple file';
+                return `<span class="summary-badge simple" title="${tooltip}"><span class="summary-badge-icon">🔹</span>Simple</span>`;
+            }
+            return '<span class="summary-badge llm" title="LLM summarized"><span class="summary-badge-icon">📝</span>LLM</span>';
+        }
+        
+        function getSummarizationMethod(summary) {
+            if (!summary) return null;
+            if (summary.simple_file) {
+                const reasonMap = {
+                    'barrel_reexport': 'Barrel/re-export',
+                    'empty_module': 'Empty module',
+                    'generated_code': 'Generated code',
+                    'constants_only': 'Constants only',
+                    'type_definitions': 'Type definitions'
+                };
+                const reason = reasonMap[summary.simple_file_reason] || summary.simple_file_reason || 'template';
+                return `Simple (${reason})`;
+            }
+            return `LLM (${summary.model || 'unknown'})`;
+        }
+        
+        // Render summary section with Phase 2 fields (how_it_works, key_mechanisms, method_summaries)
+        function renderSummarySection(summary) {
+            if (!summary) return '';
+            
+            // Header with pattern and domain tags
+            let html = `<div class="summary-section">
+                <div class="summary-title">Summary</div>`;
+            
+            // Pattern and domain tags
+            const tags = [];
+            if (summary.pattern) tags.push(summary.pattern);
+            if (summary.domain) tags.push(summary.domain);
+            if (tags.length > 0) {
+                html += `<div style="margin-bottom: 10px;">`;
+                tags.forEach(tag => {
+                    html += `<span class="tag">${escapeHtml(tag)}</span> `;
+                });
+                html += `</div>`;
+            }
+            
+            // Purpose (from content or purpose field)
+            const purpose = summary.purpose || summary.content || '';
+            if (purpose) {
+                html += `<div style="margin-bottom: 8px;"><strong style="color: #888;">Purpose:</strong> ${escapeHtml(purpose)}</div>`;
+            }
+            
+            // How It Works (collapsible)
+            if (summary.how_it_works) {
+                const sectionId = 'how-it-works-' + Math.random().toString(36).substr(2, 9);
+                html += `
+                    <div class="collapsible-section">
+                        <div class="collapsible-header" onclick="toggleCollapsible('${sectionId}', this)">
+                            <span class="collapsible-arrow">▶</span>
+                            <span>How It Works</span>
+                        </div>
+                        <div class="collapsible-body" id="${sectionId}">${escapeHtml(summary.how_it_works)}</div>
+                    </div>`;
+            }
+            
+            // Key Mechanisms (as tag badges)
+            if (summary.key_mechanisms && summary.key_mechanisms.length > 0) {
+                html += `
+                    <div class="collapsible-section">
+                        <div style="color: #888; font-size: 12px; margin-bottom: 6px;">Key Mechanisms:</div>
+                        <div class="mechanism-tags">`;
+                summary.key_mechanisms.forEach(mech => {
+                    html += `<span class="mechanism-tag">${escapeHtml(mech)}</span>`;
+                });
+                html += `</div></div>`;
+            }
+            
+            // Method Summaries (collapsible list)
+            if (summary.method_summaries && Object.keys(summary.method_summaries).length > 0) {
+                const methods = Object.entries(summary.method_summaries);
+                const sectionId = 'method-summaries-' + Math.random().toString(36).substr(2, 9);
+                html += `
+                    <div class="collapsible-section">
+                        <div class="collapsible-header" onclick="toggleCollapsible('${sectionId}', this)">
+                            <span class="collapsible-arrow">▶</span>
+                            <span>Method Summaries (${methods.length})</span>
+                        </div>
+                        <div class="collapsible-body" id="${sectionId}">
+                            <div class="method-summaries-list">`;
+                methods.forEach(([name, desc]) => {
+                    html += `
+                        <div class="method-item">
+                            <span class="method-name">${escapeHtml(name)}()</span>
+                            <span class="method-desc">${escapeHtml(desc)}</span>
+                        </div>`;
+                });
+                html += `</div></div></div>`;
+            }
+            
+            // Exports
+            if (summary.exports && summary.exports.length > 0) {
+                html += `
+                    <div class="collapsible-section">
+                        <div style="color: #888; font-size: 12px; margin-bottom: 6px;">Exports:</div>
+                        <div style="color: #ccc; font-size: 13px;">${escapeHtml(summary.exports.join(', '))}</div>
+                    </div>`;
+            }
+            
+            html += `</div>`;
+            return html;
+        }
+        
+        // Toggle collapsible section
+        function toggleCollapsible(sectionId, headerEl) {
+            const body = document.getElementById(sectionId);
+            if (body.classList.contains('show')) {
+                body.classList.remove('show');
+                headerEl.classList.remove('expanded');
+            } else {
+                body.classList.add('show');
+                headerEl.classList.add('expanded');
+            }
+        }
+        
+        // Render summary panel for Summaries (Validate) tab with Phase 2 fields
+        function renderValidateSummaryPanel(summary) {
+            if (!summary) return '<div class="error-msg">No summary data</div>';
+            
+            let html = '';
+            
+            // Purpose section
+            const purpose = summary.purpose || summary.content || '';
+            if (purpose) {
+                html += `
+                    <div style="margin-bottom: 15px;">
+                        <div style="color: #888; font-size: 11px; margin-bottom: 4px;">PURPOSE</div>
+                        <div style="color: #eee; font-family: sans-serif;">${escapeHtml(purpose)}</div>
+                    </div>`;
+            }
+            
+            // Pattern and Domain tags
+            if (summary.pattern || summary.domain) {
+                html += `<div style="margin-bottom: 12px;">`;
+                if (summary.pattern) {
+                    html += `<span class="tag">${escapeHtml(summary.pattern)}</span> `;
+                }
+                if (summary.domain) {
+                    html += `<span class="tag">${escapeHtml(summary.domain)}</span>`;
+                }
+                html += `</div>`;
+            }
+            
+            // Key Mechanisms (as tag badges)
+            if (summary.key_mechanisms && summary.key_mechanisms.length > 0) {
+                html += `
+                    <div style="margin-bottom: 12px;">
+                        <div style="color: #888; font-size: 11px; margin-bottom: 6px;">KEY MECHANISMS</div>
+                        <div class="mechanism-tags">`;
+                summary.key_mechanisms.forEach(mech => {
+                    html += `<span class="mechanism-tag">${escapeHtml(mech)}</span>`;
+                });
+                html += `</div></div>`;
+            }
+            
+            // How It Works (collapsible)
+            if (summary.how_it_works) {
+                const sectionId = 'validate-how-it-works-' + Math.random().toString(36).substr(2, 9);
+                html += `
+                    <div class="collapsible-section" style="margin-bottom: 12px;">
+                        <div class="collapsible-header" onclick="toggleCollapsible('${sectionId}', this)">
+                            <span class="collapsible-arrow">▶</span>
+                            <span>How It Works</span>
+                        </div>
+                        <div class="collapsible-body" id="${sectionId}">${escapeHtml(summary.how_it_works)}</div>
+                    </div>`;
+            }
+            
+            // Method Summaries (collapsible list)
+            if (summary.method_summaries && Object.keys(summary.method_summaries).length > 0) {
+                const methods = Object.entries(summary.method_summaries);
+                const sectionId = 'validate-methods-' + Math.random().toString(36).substr(2, 9);
+                html += `
+                    <div class="collapsible-section" style="margin-bottom: 12px;">
+                        <div class="collapsible-header" onclick="toggleCollapsible('${sectionId}', this)">
+                            <span class="collapsible-arrow">▶</span>
+                            <span>Methods (${methods.length})</span>
+                        </div>
+                        <div class="collapsible-body" id="${sectionId}">
+                            <div class="method-summaries-list">`;
+                methods.forEach(([name, desc]) => {
+                    html += `
+                        <div class="method-item">
+                            <span class="method-name">${escapeHtml(name)}()</span>
+                            <span class="method-desc">${escapeHtml(desc)}</span>
+                        </div>`;
+                });
+                html += `</div></div></div>`;
+            }
+            
+            // Exports - handle both array and string formats
+            const exports = summary.key_exports || summary.exports;
+            if (exports && (Array.isArray(exports) ? exports.length > 0 : exports)) {
+                const exportsText = Array.isArray(exports) ? exports.join(', ') : exports;
+                html += `
+                    <div style="margin-top: 12px;">
+                        <div style="color: #888; font-size: 11px; margin-bottom: 4px;">EXPORTS</div>
+                        <div style="color: #ccc; font-size: 13px;">${escapeHtml(exportsText)}</div>
+                    </div>`;
+            }
+            
+            return html || '<div style="color: #888;">No summary details available</div>';
+        }
+        
+        // =========== Summary Statistics ===========
+        let summaryStatsCollapsed = false;
+        
+        function toggleSummaryStats() {
+            summaryStatsCollapsed = !summaryStatsCollapsed;
+            const header = document.querySelector('.summary-stats-header');
+            const body = document.getElementById('summary-stats-body');
+            
+            if (summaryStatsCollapsed) {
+                header.classList.add('collapsed');
+                body.classList.add('hidden');
+            } else {
+                header.classList.remove('collapsed');
+                body.classList.remove('hidden');
+            }
+        }
+        
+        async function loadSummaryStats() {
+            const codebase = document.getElementById('validate-codebase').value || '';
+            const loadingEl = document.getElementById('summary-stats-loading');
+            const bodyEl = document.getElementById('summary-stats-body');
+            const totalEl = document.getElementById('summary-stats-total');
+            
+            try {
+                const params = codebase ? `?codebase=${encodeURIComponent(codebase)}` : '';
+                const res = await fetch(`/api/summary-stats${params}`);
+                const data = await res.json();
+                
+                if (data.error) {
+                    loadingEl.textContent = 'Error: ' + data.error;
+                    return;
+                }
+                
+                // Update total in header
+                totalEl.textContent = `${data.total_summarized || 0} summaries`;
+                
+                // Render the three columns
+                bodyEl.innerHTML = renderStatsColumns(data);
+                
+            } catch (err) {
+                console.error('Error loading summary stats:', err);
+                loadingEl.textContent = 'Failed to load statistics';
+            }
+        }
+        
+        function renderStatsColumns(data) {
+            // Pattern column
+            const patterns = Object.entries(data.by_pattern || {}).slice(0, 10);
+            let patternHtml = '';
+            patterns.forEach(([name, count]) => {
+                patternHtml += `
+                    <div class="stats-item">
+                        <span class="stats-item-label" title="${escapeHtml(name)}">${escapeHtml(name || '(none)')}</span>
+                        <span class="stats-item-count">${count}</span>
+                    </div>`;
+            });
+            if (patterns.length === 0) {
+                patternHtml = '<div style="color: #555; font-size: 12px; padding: 8px;">No patterns</div>';
+            }
+            
+            // Domain column
+            const domains = Object.entries(data.by_domain || {}).slice(0, 10);
+            let domainHtml = '';
+            domains.forEach(([name, count]) => {
+                domainHtml += `
+                    <div class="stats-item">
+                        <span class="stats-item-label" title="${escapeHtml(name)}">${escapeHtml(name || '(none)')}</span>
+                        <span class="stats-item-count">${count}</span>
+                    </div>`;
+            });
+            if (domains.length === 0) {
+                domainHtml = '<div style="color: #555; font-size: 12px; padding: 8px;">No domains</div>';
+            }
+            
+            // Status column with icons
+            const statuses = data.by_status || {};
+            const statusOrder = ['approved', 'rejected', 'unreviewed'];
+            const statusLabels = {
+                'approved': '✓ Approved',
+                'rejected': '✗ Rejected', 
+                'unreviewed': '● Pending'
+            };
+            let statusHtml = '';
+            statusOrder.forEach(status => {
+                const count = statuses[status] || 0;
+                if (count > 0 || status === 'unreviewed') {
+                    statusHtml += `
+                        <div class="stats-item status-${status}">
+                            <span class="stats-item-label">${statusLabels[status] || status}</span>
+                            <span class="stats-item-count">${count}</span>
+                        </div>`;
+                }
+            });
+            // Add any other statuses not in our order
+            Object.entries(statuses).forEach(([status, count]) => {
+                if (!statusOrder.includes(status) && count > 0) {
+                    statusHtml += `
+                        <div class="stats-item">
+                            <span class="stats-item-label">${escapeHtml(status)}</span>
+                            <span class="stats-item-count">${count}</span>
+                        </div>`;
+                }
+            });
+            if (!statusHtml) {
+                statusHtml = '<div style="color: #555; font-size: 12px; padding: 8px;">No status data</div>';
+            }
+            
+            return `
+                <div class="stats-column">
+                    <div class="stats-column-title">By Pattern</div>
+                    <div class="stats-list">${patternHtml}</div>
+                </div>
+                <div class="stats-column">
+                    <div class="stats-column-title">By Domain</div>
+                    <div class="stats-list">${domainHtml}</div>
+                </div>
+                <div class="stats-column">
+                    <div class="stats-column-title">By Status</div>
+                    <div class="stats-list">${statusHtml}</div>
+                </div>
+            `;
+        }
+        
         // =========== Validate Tab ===========
         let validateFiles = [];         // Current page of files
         let validateTotal = 0;          // Total matching filters
@@ -2558,10 +3602,16 @@ async def web_dashboard(request):
                                   file.status === 'rejected' ? '✗' : '●';
                 const statusClass = file.status || 'unreviewed';
                 const selected = idx === validateSelectedIndex ? 'selected' : '';
+                const simpleClass = file.simple_file ? 'simple-file' : '';
+                
+                // Show simple file badge (auto-approved indicator)
+                const simpleBadge = file.simple_file 
+                    ? '<span class="validate-simple-badge" title="Simple file (auto-approved)">🔹</span>' 
+                    : '';
                 
                 html += `
-                    <div class="validate-file-item ${selected}" data-index="${idx}" onclick="selectValidateFile(${idx})" tabindex="-1">
-                        <span class="validate-file-item-path" title="${escapeHtml(file.path)}">${escapeHtml(file.path)}</span>
+                    <div class="validate-file-item ${selected} ${simpleClass}" data-index="${idx}" onclick="selectValidateFile(${idx})" tabindex="-1">
+                        ${simpleBadge}<span class="validate-file-item-path" title="${escapeHtml(file.path)}">${escapeHtml(file.path)}</span>
                         <span class="validate-status-icon ${statusClass}">${statusIcon}</span>
                     </div>
                 `;
@@ -2663,25 +3713,30 @@ async def web_dashboard(request):
                         `<div class="error-msg">${fileData.error || 'Could not load file'}</div>`;
                 }
                 
-                // Display summary
+                // Display summary with Phase 2 fields
                 if (summaryData.summary) {
                     const summary = summaryData.summary;
-                    document.getElementById('validate-model').textContent = 
-                        `${summary.model || 'unknown'} • ${summary.pattern || 'unknown'}`;
-                    document.getElementById('validate-summary-content').innerHTML = `
-                        <div style="margin-bottom: 15px;">
-                            <div style="color: #888; font-size: 11px; margin-bottom: 4px;">PURPOSE</div>
-                            <div style="color: #eee; font-family: sans-serif;">${escapeHtml(summary.purpose || summary.content)}</div>
-                        </div>
-                        ${summary.pattern ? `<div style="margin-bottom: 10px;"><span class="tag">Pattern: ${summary.pattern}</span></div>` : ''}
-                        ${summary.domain ? `<div style="margin-bottom: 10px;"><span class="tag">Domain: ${summary.domain}</span></div>` : ''}
-                        ${summary.exports ? `
-                            <div style="margin-top: 15px;">
-                                <div style="color: #888; font-size: 11px; margin-bottom: 4px;">EXPORTS</div>
-                                <div style="color: #ccc;">${escapeHtml(summary.exports)}</div>
-                            </div>
-                        ` : ''}
-                    `;
+                    
+                    // Build header: show simple file badge or model info
+                    let headerHtml = '';
+                    if (summary.simple_file) {
+                        const reasonMap = {
+                            'barrel_reexport': 'Barrel/re-export',
+                            'empty_module': 'Empty module',
+                            'generated_code': 'Generated code',
+                            'constants_only': 'Constants only',
+                            'type_definitions': 'Type definitions'
+                        };
+                        const reason = reasonMap[summary.simple_file_reason] || summary.simple_file_reason || 'template';
+                        headerHtml = `<span class="validate-simple-header-badge">🔹 Simple (${reason})</span>`;
+                        if (summary.pattern) {
+                            headerHtml += ` <span style="color:#888">• ${summary.pattern}</span>`;
+                        }
+                    } else {
+                        headerHtml = `${summary.model || 'unknown'} • ${summary.pattern || 'unknown'}`;
+                    }
+                    document.getElementById('validate-model').innerHTML = headerHtml;
+                    document.getElementById('validate-summary-content').innerHTML = renderValidateSummaryPanel(summary);
                 } else {
                     document.getElementById('validate-model').textContent = '';
                     document.getElementById('validate-summary-content').innerHTML = 
@@ -2889,6 +3944,10 @@ async def web_dashboard(request):
                 validateOffset = 0;
                 validateSelectedIndex = -1;
                 loadValidationQueue();
+                // Reload stats when codebase changes
+                if (id === 'validate-codebase') {
+                    loadSummaryStats();
+                }
             });
         });
         
@@ -2906,7 +3965,13 @@ async def web_dashboard(request):
         
         // =========== Global Keyboard Shortcuts ===========
         document.addEventListener('keydown', function(e) {
-            // Don't trigger if typing in an input
+            // Escape key closes modals (works even in inputs)
+            if (e.key === 'Escape') {
+                document.querySelectorAll('.modal-overlay.open').forEach(m => m.classList.remove('open'));
+                return;
+            }
+            
+            // Don't trigger other shortcuts if typing in an input
             if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.tagName === 'SELECT') {
                 return;
             }
@@ -2959,8 +4024,177 @@ async def web_dashboard(request):
             }
         });
         
+        // =========== Action Modals & Toasts ===========
+        function showToast(message, type = 'success') {
+            const container = document.getElementById('toast-container');
+            const toast = document.createElement('div');
+            toast.className = `toast toast-${type}`;
+            toast.innerHTML = `<span>${type === 'success' ? '✓' : '✗'}</span><span>${message}</span>`;
+            container.appendChild(toast);
+            
+            setTimeout(() => {
+                toast.style.animation = 'slideIn 0.3s ease reverse';
+                setTimeout(() => toast.remove(), 300);
+            }, 4000);
+        }
+        
+        function closeModal(modalId) {
+            document.getElementById(modalId).classList.remove('open');
+        }
+        
+        function openModal(modalId) {
+            document.getElementById(modalId).classList.add('open');
+        }
+        
+        // Close modal on overlay click (Escape key handled in global keyboard shortcuts)
+        document.querySelectorAll('.modal-overlay').forEach(overlay => {
+            overlay.addEventListener('click', function(e) {
+                if (e.target === this) {
+                    this.classList.remove('open');
+                }
+            });
+        });
+        
+        function populateActionCodebaseDropdowns() {
+            const queueSelect = document.getElementById('queue-codebase-select');
+            const reindexSelect = document.getElementById('reindex-codebase-select');
+            
+            queueSelect.innerHTML = '';
+            reindexSelect.innerHTML = '';
+            
+            codebases.forEach(cb => {
+                queueSelect.innerHTML += `<option value="${cb.name}">${cb.name}</option>`;
+                reindexSelect.innerHTML += `<option value="${cb.name}">${cb.name}</option>`;
+            });
+        }
+        
+        function openQueueSummarizationModal() {
+            populateActionCodebaseDropdowns();
+            openModal('modal-queue-summarization');
+        }
+        
+        function openInvalidateSummariesModal() {
+            openModal('modal-invalidate-summaries');
+        }
+        
+        function openReindexCodebaseModal() {
+            populateActionCodebaseDropdowns();
+            openModal('modal-reindex-codebase');
+        }
+        
+        async function confirmQueueSummarization() {
+            const codebase = document.getElementById('queue-codebase-select').value;
+            const onlyMissing = document.getElementById('queue-only-missing').checked;
+            const btn = document.getElementById('btn-queue-summarization');
+            const confirmBtn = document.getElementById('queue-confirm-btn');
+            
+            if (!codebase) {
+                showToast('Please select a codebase', 'error');
+                return;
+            }
+            
+            closeModal('modal-queue-summarization');
+            btn.classList.add('loading');
+            confirmBtn.disabled = true;
+            
+            try {
+                const res = await fetch('/api/queue-summarization', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ codebase, only_missing: onlyMissing })
+                });
+                
+                const data = await res.json();
+                
+                if (data.success) {
+                    showToast(`Queued ${data.files_queued} files for summarization`, 'success');
+                    fetchStatus(); // Refresh status
+                } else {
+                    showToast(data.error || 'Failed to queue summarization', 'error');
+                }
+            } catch (err) {
+                showToast('Error: ' + err.message, 'error');
+            } finally {
+                btn.classList.remove('loading');
+                confirmBtn.disabled = false;
+            }
+        }
+        
+        async function confirmInvalidateSummaries() {
+            const btn = document.getElementById('btn-invalidate-summaries');
+            const confirmBtn = document.getElementById('invalidate-confirm-btn');
+            
+            closeModal('modal-invalidate-summaries');
+            btn.classList.add('loading');
+            confirmBtn.disabled = true;
+            
+            try {
+                const res = await fetch('/api/invalidate-summaries', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: '{}'
+                });
+                
+                const data = await res.json();
+                
+                if (data.success) {
+                    const count = data.total_summaries_cleared || 0;
+                    showToast(`Invalidated ${count} summaries`, 'success');
+                    fetchStatus(); // Refresh status
+                } else {
+                    showToast(data.error || 'Failed to invalidate summaries', 'error');
+                }
+            } catch (err) {
+                showToast('Error: ' + err.message, 'error');
+            } finally {
+                btn.classList.remove('loading');
+                confirmBtn.disabled = false;
+            }
+        }
+        
+        async function confirmReindexCodebase() {
+            const codebase = document.getElementById('reindex-codebase-select').value;
+            const btn = document.getElementById('btn-reindex-codebase');
+            const confirmBtn = document.getElementById('reindex-confirm-btn');
+            
+            if (!codebase) {
+                showToast('Please select a codebase', 'error');
+                return;
+            }
+            
+            closeModal('modal-reindex-codebase');
+            btn.classList.add('loading');
+            confirmBtn.disabled = true;
+            
+            try {
+                const res = await fetch('/api/reindex', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ codebase })
+                });
+                
+                const data = await res.json();
+                
+                if (data.success || data.files_indexed !== undefined) {
+                    const count = data.files_indexed || data.files_reindexed || 0;
+                    showToast(`Reindexed ${count} files in ${codebase}`, 'success');
+                    fetchStatus(); // Refresh status
+                } else {
+                    showToast(data.error || 'Failed to reindex codebase', 'error');
+                }
+            } catch (err) {
+                showToast('Error: ' + err.message, 'error');
+            } finally {
+                btn.classList.remove('loading');
+                confirmBtn.disabled = false;
+            }
+        }
+        
         // =========== Init ===========
-        loadCodebases().then(populateValidateCodebase);
+        loadCodebases().then(() => {
+            populateValidateCodebase();
+            populateActionCodebaseDropdowns();
+        });
         startStatusRefresh();
     </script>
 </body>

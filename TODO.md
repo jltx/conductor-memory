@@ -212,6 +212,21 @@ Phase 6 adds incremental re-summarization when files change and a web dashboard.
 - [ ] **Quality Metrics**: Validation and scoring of summary quality
 - [ ] **Multi-Model Support**: OpenAI, Anthropic for cloud options
 
+### Dashboard UX Enhancements - COMPLETED
+See `docs/plans/DASHBOARD_UX_ENHANCEMENTS.md` for details.
+- [x] Fix summarization stats terminology (remove "session" concept)
+- [x] Add action buttons (queue, invalidate, reindex)
+- [x] Show simple file indicators in Browse/Summaries tabs
+- [x] Show Phase 2 fields (how_it_works, mechanisms, method summaries)
+- [x] Rename Validate tab to Summaries
+- [x] Add summary statistics view
+- [x] Show summary preview in search results
+
+### Future Dashboard Enhancements (Deferred)
+- [ ] **Call Graph Explorer**: Visualize method-to-method relationships
+- [ ] **Dependency Graph**: Visualize file import relationships
+- [ ] **File Centrality View**: Show most important files by PageRank score
+
 ### Minor Enhancements
 - [x] Fix keyword search for exact class names
 - [ ] Add summary diff view when files change
