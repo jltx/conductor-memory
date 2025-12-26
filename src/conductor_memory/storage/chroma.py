@@ -199,7 +199,7 @@ class SummaryIndexMetadata:
         # Cache for get_all_summarized_files (invalidated on updates)
         self._cache: Optional[Dict[str, Dict[str, Any]]] = None
         self._cache_time: float = 0
-        self._cache_ttl: float = 5.0  # 5 second cache TTL
+        self._cache_ttl: float = 300.0  # 5 minute cache TTL (summary stats change infrequently)
         
         try:
             self.collection = self.client.get_collection(name=collection_name)
@@ -612,6 +612,59 @@ class SummaryIndexMetadata:
         except Exception as e:
             logger.warning(f"Error getting summary stats: {e}")
             return {"total_summarized": 0, "simple_count": 0, "llm_count": 0, "error": str(e)}
+    
+    def get_summary_stats_basic(self) -> Dict[str, Any]:
+        """
+        Get basic summary statistics (fast, count-only).
+        
+        This is much faster than get_summary_stats() as it only retrieves
+        the total count using collection.count(), not all document metadata.
+        
+        Use this when you only need the total count, not detailed breakdowns
+        by pattern, domain, model, etc.
+        
+        Returns:
+            Dict with total_summarized count only
+        """
+        try:
+            count = self.get_summary_count()
+            return {
+                "total_summarized": count,
+                # These are unknown without full retrieval
+                "simple_count": None,
+                "llm_count": None,
+            }
+        except Exception as e:
+            logger.warning(f"Error getting basic summary stats: {e}")
+            return {"total_summarized": 0, "error": str(e)}
+    
+    def get_summary_count(self) -> int:
+        """
+        Get total count of summarized files (fast, uses collection.count()).
+        
+        This is much faster than get_summary_stats() as it doesn't retrieve
+        all document metadata.
+        
+        Returns:
+            Total number of summarized files
+        """
+        try:
+            # collection.count() is very fast - O(1) operation
+            count = self.collection.count()
+            # Subtract 1 for the schema version marker if it exists
+            # (The marker has ID "__schema_version__")
+            if count > 0:
+                # Check if schema version marker exists
+                try:
+                    result = self.collection.get(ids=[self._SCHEMA_VERSION_ID], include=[])
+                    if result["ids"]:
+                        count -= 1
+                except Exception:
+                    pass
+            return max(0, count)
+        except Exception as e:
+            logger.warning(f"Error getting summary count: {e}")
+            return 0
 
 
 class ChromaVectorStore(VectorStore):

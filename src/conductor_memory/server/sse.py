@@ -37,6 +37,7 @@ from starlette.responses import JSONResponse
 
 from ..config.server import ServerConfig
 from ..service.memory_service import MemoryService
+from .chroma_manager import ChromaServerManager
 
 # Configure logging to stderr (stdout may be used by transport)
 logging.basicConfig(
@@ -48,6 +49,7 @@ logger = logging.getLogger(__name__)
 
 # Global service instance (initialized in main)
 memory_service: MemoryService | None = None
+chroma_manager: ChromaServerManager | None = None
 
 # Create the MCP server with SSE settings
 mcp = FastMCP(
@@ -85,9 +87,10 @@ async def health_check(request):
 # Summarization status API endpoint
 @mcp.custom_route("/api/summarization", methods=["GET"])
 async def summarization_status_api(request):
-    """Get summarization status as JSON."""
+    """Get summarization status as JSON (fast, uses cached counts)."""
     if memory_service:
-        return JSONResponse(memory_service.get_summarization_status())
+        # Use basic method to avoid expensive ChromaDB queries on every poll
+        return JSONResponse(memory_service.get_summarization_status_basic())
     return JSONResponse({"error": "Service not initialized"}, status_code=503)
 
 
@@ -98,6 +101,46 @@ async def indexing_status_api(request):
     if memory_service:
         return JSONResponse(memory_service.get_status())
     return JSONResponse({"error": "Service not initialized"}, status_code=503)
+
+
+# ChromaDB status API endpoint
+@mcp.custom_route("/api/chroma-status", methods=["GET"])
+async def chroma_status_api(request):
+    """Get ChromaDB connection status."""
+    if not memory_service:
+        return JSONResponse({"error": "Service not initialized"}, status_code=503)
+    
+    config = memory_service.config
+    status = {
+        "mode": config.chroma_mode,
+        "host": config.chroma_host if config.chroma_mode == "http" else None,
+        "port": config.chroma_port if config.chroma_mode == "http" else None,
+    }
+    
+    if config.chroma_mode == "http":
+        # Check if ChromaDB server is healthy
+        if chroma_manager:
+            status["process_running"] = chroma_manager.is_running()
+            status["server_healthy"] = await chroma_manager.is_healthy()
+        else:
+            status["process_running"] = False
+            status["server_healthy"] = False
+        
+        # Try to get collection info
+        try:
+            # Get first vector store to check connection
+            if memory_service._vector_stores:
+                store = next(iter(memory_service._vector_stores.values()))
+                status["collections"] = len(store.client.list_collections())
+                status["connected"] = True
+        except Exception as e:
+            status["connected"] = False
+            status["error"] = str(e)
+    else:
+        status["persist_directory"] = config.persist_directory
+        status["connected"] = True
+    
+    return JSONResponse(status)
 
 
 # Search API endpoint for web dashboard
@@ -231,12 +274,13 @@ async def api_list_summaries(request):
 # List available codebases API endpoint
 @mcp.custom_route("/api/codebases", methods=["GET"])
 async def api_list_codebases(request):
-    """List all configured codebases."""
+    """List all configured codebases (fast, uses cached counts)."""
     if not memory_service:
         return JSONResponse({"error": "Service not initialized"}, status_code=503)
     
     try:
-        codebases = memory_service.list_codebases()
+        # Use basic method to avoid expensive ChromaDB queries
+        codebases = memory_service.list_codebases_basic()
         return JSONResponse({"codebases": codebases})
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=400)
@@ -2194,32 +2238,66 @@ async def web_dashboard(request):
         let statusInterval = null;
         
         // =========== Tab Management ===========
+        const validTabs = ['status', 'search', 'browse', 'summaries'];
+        
+        function switchToTab(tabName) {
+            // Validate tab name, default to 'status'
+            if (!validTabs.includes(tabName)) {
+                tabName = 'status';
+            }
+            
+            // Update URL hash without triggering hashchange (if already correct)
+            if (window.location.hash !== '#' + tabName) {
+                history.replaceState(null, '', '#' + tabName);
+            }
+            
+            // Update tab UI
+            document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+            document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+            
+            const tabButton = document.querySelector(`.tab[data-tab="${tabName}"]`);
+            if (tabButton) {
+                tabButton.classList.add('active');
+            }
+            document.getElementById(tabName + '-tab').classList.add('active');
+            
+            // Start/stop status refresh based on active tab
+            if (tabName === 'status') {
+                startStatusRefresh();
+            } else {
+                stopStatusRefresh();
+            }
+            
+            // Load data for browse tab
+            if (tabName === 'browse') {
+                loadBrowseData();
+            }
+            
+            // Load data for summaries tab
+            if (tabName === 'summaries') {
+                loadSummaryStats();
+                loadValidationQueue();
+            }
+        }
+        
+        // Tab click handlers
         document.querySelectorAll('.tab').forEach(tab => {
             tab.addEventListener('click', () => {
-                document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-                document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
-                tab.classList.add('active');
-                document.getElementById(tab.dataset.tab + '-tab').classList.add('active');
-                
-                // Start/stop status refresh based on active tab
-                if (tab.dataset.tab === 'status') {
-                    startStatusRefresh();
-                } else {
-                    stopStatusRefresh();
-                }
-                
-                // Load data for browse tab
-                if (tab.dataset.tab === 'browse') {
-                    loadBrowseData();
-                }
-                
-                // Load data for summaries tab
-                if (tab.dataset.tab === 'summaries') {
-                    loadSummaryStats();
-                    loadValidationQueue();
-                }
+                switchToTab(tab.dataset.tab);
             });
         });
+        
+        // Handle browser back/forward navigation
+        window.addEventListener('hashchange', () => {
+            const hash = window.location.hash.slice(1); // Remove '#'
+            switchToTab(hash || 'status');
+        });
+        
+        // Initialize tab from URL hash on page load
+        function initTabFromHash() {
+            const hash = window.location.hash.slice(1); // Remove '#'
+            switchToTab(hash || 'status');
+        }
         
         // =========== Status Tab ===========
         async function fetchStatus() {
@@ -2300,13 +2378,28 @@ async def web_dashboard(request):
             const total = data.files_total_queued || 0;
             const processed = data.files_processed || 0;
             const pct = data.progress_percentage || 0;
+            const queued = data.files_queued || 0;
             
-            document.getElementById('progress-section').innerHTML = data.is_running && total > 0 ? `
-                <div style="display: flex; justify-content: space-between; font-size: 13px; color: #888; margin-top: 10px;">
-                    <span>Progress (${processed}/${total})</span><span>${Math.round(pct)}% • ${estRemainingText} remaining</span>
-                </div>
-                <div class="progress-bar"><div class="progress-fill" style="width: ${pct}%"></div></div>
-            ` : '';
+            // Determine what to show in progress section
+            let progressHtml = '';
+            if (data.is_running && queued > 0 && total > 0) {
+                // Active processing: show progress bar
+                progressHtml = `
+                    <div style="display: flex; justify-content: space-between; font-size: 13px; color: #888; margin-top: 10px;">
+                        <span>Progress (${processed}/${total})</span><span>${Math.round(pct)}% • ${estRemainingText} remaining</span>
+                    </div>
+                    <div class="progress-bar"><div class="progress-fill" style="width: ${pct}%"></div></div>
+                `;
+            } else if (processed > 0 && queued === 0) {
+                // Queue empty but work was done this session: show completion
+                progressHtml = `
+                    <div style="display: flex; align-items: center; gap: 8px; font-size: 13px; color: #4ade80; margin-top: 10px;">
+                        <span style="font-size: 16px;">✓</span>
+                        <span>${processed} Items Summarized</span>
+                    </div>
+                `;
+            }
+            document.getElementById('progress-section').innerHTML = progressHtml;
             
             document.getElementById('current-file-section').innerHTML = data.current_file 
                 ? `<div class="current-file">${data.current_file}</div>` : '';
@@ -2576,8 +2669,8 @@ async def web_dashboard(request):
                             ${tags ? `<div class="result-tags">${tags}</div>` : ''}
                             <div class="result-content" id="result-content-${idx}">${preview}${hasMore ? '...' : ''}</div>
                             <div class="result-actions">
-                                ${hasMore ? `<span class="expand-btn" onclick="toggleResultExpand(${idx}, \`${escapeJs(content)}\`)">Show more</span>` : '<span></span>'}
-                                <button class="copy-btn" onclick="copyResult(${idx}, \`${escapeJs(content)}\`)">Copy</button>
+                                ${hasMore ? `<span class="expand-btn" onclick="toggleResultExpand(${idx}, \\`${escapeJs(content)}\\`)">Show more</span>` : '<span></span>'}
+                                <button class="copy-btn" onclick="copyResult(${idx}, \\`${escapeJs(content)}\\`)">Copy</button>
                             </div>
                         </div>
                     </div>
@@ -2853,7 +2946,7 @@ async def web_dashboard(request):
                                 <span>${chunk.memory_type || ''}</span>
                             </div>
                             <div class="chunk-content" id="detail-chunk-${idx}">${preview}</div>
-                            ${chunkContent.length > 200 ? `<span class="expand-btn" onclick="toggleDetailChunk(${idx}, \`${escapeJs(chunkContent)}\`)">Show more</span>` : ''}
+                            ${chunkContent.length > 200 ? `<span class="expand-btn" onclick="toggleDetailChunk(${idx}, \\`${escapeJs(chunkContent)}\\`)">Show more</span>` : ''}
                         </div>
                     `;
                 });
@@ -4195,7 +4288,7 @@ async def web_dashboard(request):
             populateValidateCodebase();
             populateActionCodebaseDropdowns();
         });
-        startStatusRefresh();
+        initTabFromHash();
     </script>
 </body>
 </html>"""
@@ -4823,6 +4916,10 @@ def main():
 
     # Set log level
     logging.getLogger().setLevel(getattr(logging, args.log_level.upper()))
+    
+    # Suppress noisy httpx logging (ChromaDB HTTP client)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
 
     # Load configuration - check multiple locations in priority order
     DEFAULT_HOME_CONFIG = Path.home() / ".conductor-memory" / "config.json"
@@ -4858,6 +4955,29 @@ def main():
         logger.warning(f"No config file found. Create {DEFAULT_HOME_CONFIG} or use --config")
         config = ServerConfig()
     
+    # Start ChromaDB server if in HTTP mode
+    global chroma_manager
+    chroma_manager = None
+    if config.chroma_mode == "http":
+        chroma_server_path = config.chroma_server_path or os.path.join(
+            config.persist_directory or os.path.expanduser("~/.conductor-memory"),
+            "chroma-server"
+        )
+        chroma_manager = ChromaServerManager(
+            host=config.chroma_host,
+            port=config.chroma_port,
+            data_path=chroma_server_path
+        )
+        
+        # Start ChromaDB synchronously before creating MemoryService
+        # Use start_sync() to avoid async task issues with asyncio.run()
+        if not chroma_manager.start_sync():
+            logger.error("Failed to start ChromaDB server, falling back to embedded mode")
+            config.chroma_mode = "embedded"
+            chroma_manager = None
+        else:
+            logger.info(f"ChromaDB server running at http://{config.chroma_host}:{config.chroma_port}")
+    
     # Create and initialize MemoryService
     memory_service = MemoryService(config)
     
@@ -4885,15 +5005,23 @@ def main():
     import asyncio
     
     async def run_server():
+        global chroma_manager
+        
         # Start file watchers and background summarizer in the async context
         if config.enable_file_watcher:
             await memory_service.start_file_watchers_async()
         
         # Start background summarizer (with proper callback system)
-        summarization_status = memory_service.get_summarization_status()
+        # Use basic status to avoid expensive ChromaDB queries at startup
+        summarization_status = memory_service.get_summarization_status_basic()
         if summarization_status.get("enabled") and summarization_status.get("llm_enabled"):
             logger.info("[Summarization] Starting background summarizer...")
             await memory_service.start_background_summarizer_async()
+        
+        # Start ChromaDB monitoring now that we're in the async context
+        if chroma_manager:
+            chroma_manager.start_monitoring()
+            logger.info("ChromaDB health monitoring started")
         
         # Get the ASGI app from FastMCP
         app = mcp.sse_app()
@@ -4907,7 +5035,14 @@ def main():
             access_log=True
         )
         server = uvicorn.Server(config_uvicorn)
-        await server.serve()
+        
+        try:
+            await server.serve()
+        finally:
+            # Cleanup on shutdown
+            if chroma_manager:
+                logger.info("Shutting down ChromaDB server...")
+                await chroma_manager.stop()
     
     asyncio.run(run_server())
 

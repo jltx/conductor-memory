@@ -8,7 +8,10 @@ Both the HTTP server and stdio MCP server are thin wrappers around this service.
 import asyncio
 import concurrent.futures
 import logging
+import queue
 import sys
+import threading
+import time
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -136,7 +139,11 @@ class MemoryService:
         self._summarization_config = config.summarization_config
         self._summarizer: Optional[FileSummarizer] = None
         self._summarizer_task: Optional[asyncio.Task] = None
+        self._summarizer_thread: Optional[threading.Thread] = None
+        self._summarizer_stop_event = threading.Event()
         self._summary_queue: asyncio.PriorityQueue = asyncio.PriorityQueue()
+        # Thread-safe queue for the background thread
+        self._summary_queue_threaded: queue.PriorityQueue = queue.PriorityQueue()
         self._query_active: asyncio.Event = asyncio.Event()
         self._summarization_stats = {
             "files_summarized": 0,
@@ -166,12 +173,35 @@ class MemoryService:
         logger.info(f"MemoryService initialized with {len(self._vector_stores)} codebase(s)")
         logger.info(f"Persistent storage at: {self.persist_directory}")
     
+    async def _run_blocking(self, func, *args, **kwargs):
+        """Run a blocking function in a thread pool executor.
+        
+        Use this to wrap synchronous I/O operations (ChromaDB, embeddings)
+        to prevent blocking the async event loop.
+        """
+        loop = asyncio.get_event_loop()
+        if kwargs:
+            return await loop.run_in_executor(None, lambda: func(*args, **kwargs))
+        return await loop.run_in_executor(None, func, *args)
+    
     def _init_codebase(self, codebase: CodebaseConfig) -> None:
         """Initialize vector store and status for a codebase"""
-        self._vector_stores[codebase.name] = ChromaVectorStore(
-            collection_name=f"codebase_{codebase.name}",
-            persist_directory=self.persist_directory
-        )
+        
+        # Determine ChromaDB connection mode
+        if self.config.chroma_mode == "http":
+            # HTTP client mode - connect to standalone ChromaDB server
+            self._vector_stores[codebase.name] = ChromaVectorStore(
+                collection_name=f"codebase_{codebase.name}",
+                host=self.config.chroma_host,
+                port=self.config.chroma_port
+            )
+            logger.info(f"[{codebase.name}] Using ChromaDB HTTP client at {self.config.chroma_host}:{self.config.chroma_port}")
+        else:
+            # Embedded mode - use PersistentClient (current behavior)
+            self._vector_stores[codebase.name] = ChromaVectorStore(
+                collection_name=f"codebase_{codebase.name}",
+                persist_directory=self.persist_directory
+            )
         self._indexing_status[codebase.name] = {
             "name": codebase.name,
             "path": codebase.path,
@@ -398,7 +428,7 @@ class MemoryService:
                 
             elif mode == SearchMode.SEMANTIC:
                 # Semantic-only search using vectors
-                query_embedding = self.embedder.generate(query)
+                query_embedding = await self._run_blocking(self.embedder.generate, query)
                 
                 if codebase:
                     vector_store = self._vector_stores.get(codebase)
@@ -408,15 +438,15 @@ class MemoryService:
                             "results": [],
                             "total_found": 0
                         }
-                    similar_chunks = vector_store.search(query_embedding, max_results * 2)
+                    similar_chunks = await self._run_blocking(vector_store.search, query_embedding, max_results * 2)
                 else:
                     for codebase_name, vector_store in self._vector_stores.items():
-                        chunks = vector_store.search(query_embedding, max_results)
+                        chunks = await self._run_blocking(vector_store.search, query_embedding, max_results)
                         similar_chunks.extend(chunks)
                 
             else:  # HYBRID
                 # Combined semantic + keyword search with RRF fusion
-                query_embedding = self.embedder.generate(query)
+                query_embedding = await self._run_blocking(self.embedder.generate, query)
                 
                 # Get semantic results
                 semantic_chunks = []
@@ -428,10 +458,10 @@ class MemoryService:
                             "results": [],
                             "total_found": 0
                         }
-                    semantic_chunks = vector_store.search(query_embedding, max_results * 2)
+                    semantic_chunks = await self._run_blocking(vector_store.search, query_embedding, max_results * 2)
                 else:
                     for codebase_name, vector_store in self._vector_stores.items():
-                        chunks = vector_store.search(query_embedding, max_results)
+                        chunks = await self._run_blocking(vector_store.search, query_embedding, max_results)
                         semantic_chunks.extend(chunks)
                 
                 # Get hybrid results with RRF fusion
@@ -788,9 +818,9 @@ class MemoryService:
                 memory_type=memory_type_enum
             )
             
-            # Generate embedding and store
-            embedding = self.embedder.generate(content)
-            vector_store.add(memory_chunk, embedding)
+            # Generate embedding and store (non-blocking)
+            embedding = await self._run_blocking(self.embedder.generate, content)
+            await self._run_blocking(vector_store.add, memory_chunk, embedding)
             
             # Also add to BM25 index for hybrid/keyword search
             self.hybrid_searcher.add_to_index(codebase, memory_chunk)
@@ -1263,11 +1293,43 @@ class MemoryService:
         return {name: self.get_codebase_status(name) for name in self._indexing_status}
     
     def list_codebases(self) -> List[Dict[str, Any]]:
-        """List all configured codebases with their info"""
+        """
+        List all configured codebases with their info.
+        
+        NOTE: This method is expensive as it queries ChromaDB for accurate file counts.
+        For fast status checks, use list_codebases_basic() instead.
+        """
         codebases = []
         for codebase in self.config.get_enabled_codebases():
             vector_store = self._vector_stores.get(codebase.name)
             indexed_count = len(vector_store.get_indexed_files()) if vector_store else 0
+            
+            codebases.append({
+                "name": codebase.name,
+                "path": codebase.path,
+                "description": codebase.description,
+                "enabled": codebase.enabled,
+                "indexed_files_count": indexed_count,
+                "extensions": codebase.extensions
+            })
+        
+        return codebases
+    
+    def list_codebases_basic(self) -> List[Dict[str, Any]]:
+        """
+        List all configured codebases with basic info (fast, no ChromaDB queries).
+        
+        Uses cached file counts from indexing status rather than querying ChromaDB.
+        This is suitable for health checks and dashboard polling.
+        
+        Returns:
+            List of codebase info dictionaries
+        """
+        codebases = []
+        for codebase in self.config.get_enabled_codebases():
+            # Use pre-computed count from indexing status (no ChromaDB query)
+            status = self._indexing_status.get(codebase.name, {})
+            indexed_count = status.get("indexed_files_count", 0)
             
             codebases.append({
                 "name": codebase.name,
@@ -2654,6 +2716,9 @@ class MemoryService:
             # Initialize summarizer
             self._summarizer = FileSummarizer(llm_client, self._summarization_config)
             
+            # Reset session stats for fresh start
+            self._reset_session_stats_if_idle()
+            
             # Queue files by centrality (highest first), or all indexed files if no import graph
             total_queued = 0
             for codebase in self.config.get_enabled_codebases():
@@ -2727,12 +2792,26 @@ class MemoryService:
                 await llm_client.close()
                 return
             
-            # Start background task
-            self._summarizer_task = asyncio.create_task(self._background_summarizer())
+            # Transfer items from async queue to thread-safe queue
+            while not self._summary_queue.empty():
+                try:
+                    item = self._summary_queue.get_nowait()
+                    self._summary_queue_threaded.put(item)
+                except asyncio.QueueEmpty:
+                    break
+            
+            # Start background thread (not async task) to avoid blocking main event loop
+            self._summarizer_stop_event.clear()
+            self._summarizer_thread = threading.Thread(
+                target=self._background_summarizer_thread,
+                name="SummarizerThread",
+                daemon=True
+            )
+            self._summarizer_thread.start()
             self._summarization_stats["is_running"] = True
             
             logger.info(
-                f"[Summarization] Started background summarizer with {total_queued} files queued "
+                f"[Summarization] Started background summarizer THREAD with {total_queued} files queued "
                 f"(using {self._summarization_config.model})"
             )
             
@@ -2829,6 +2908,92 @@ class MemoryService:
                 self._summarization_stats["last_error"] = str(e)
                 await asyncio.sleep(1.0)  # Brief pause before retrying
     
+    def _background_summarizer_thread(self) -> None:
+        """
+        Background thread that summarizes files in priority order.
+        
+        This runs in a separate thread with its own event loop to avoid
+        blocking the main async event loop. This is critical for API responsiveness.
+        """
+        logger.info("[Summarization] Background summarizer thread started")
+        
+        # Create a new event loop for this thread
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        try:
+            while not self._summarizer_stop_event.is_set():
+                try:
+                    # Get next file from thread-safe queue (with timeout to check stop event)
+                    try:
+                        file_data = self._summary_queue_threaded.get(timeout=5.0)
+                    except queue.Empty:
+                        # No files in queue, check if we should stop
+                        if self._summary_queue_threaded.empty():
+                            logger.debug("[Summarization] Queue empty, thread idle")
+                        continue
+                    
+                    priority, codebase_name, file_path, codebase_path = file_data
+                    
+                    # Update current file
+                    self._summarization_stats["current_file"] = file_path
+                    
+                    try:
+                        # Run the async processing in this thread's event loop
+                        success, processing_time = loop.run_until_complete(
+                            self._process_single_file_for_summary(
+                                codebase_name, codebase_path, file_path
+                            )
+                        )
+                        
+                        if success:
+                            self._summarization_stats["files_summarized"] += 1
+                            
+                            # Update timing statistics
+                            self._summarization_stats["total_time_seconds"] += processing_time
+                            completed_count = self._summarization_stats["files_summarized"]
+                            self._summarization_stats["avg_time_per_file"] = (
+                                self._summarization_stats["total_time_seconds"] / completed_count
+                            )
+                            
+                            # Calculate estimated time remaining
+                            remaining_files = self._summary_queue_threaded.qsize()
+                            avg_time_with_rate_limit = (
+                                self._summarization_stats["avg_time_per_file"] + 
+                                self._summarization_config.rate_limit_seconds
+                            )
+                            est_time = avg_time_with_rate_limit * remaining_files
+                            self._summarization_stats["estimated_time_remaining"] = est_time
+                            
+                            # Log progress periodically
+                            if completed_count % 10 == 0:
+                                failed = self._summarization_stats["files_failed"]
+                                skipped = self._summarization_stats.get("files_skipped", 0)
+                                avg_time = self._summarization_stats["avg_time_per_file"]
+                                
+                                logger.info(
+                                    f"[Summarization] Progress: {completed_count} completed, {failed} failed, {skipped} skipped, "
+                                    f"{remaining_files} remaining | Avg: {avg_time:.1f}s/file, Est. remaining: {est_time/60:.1f}min"
+                                )
+                        
+                    except Exception as e:
+                        logger.error(f"[Summarization] Error processing {file_path}: {e}")
+                        self._summarization_stats["last_error"] = str(e)
+                    finally:
+                        self._summary_queue_threaded.task_done()
+                        # Rate limit after each file
+                        time.sleep(self._summarization_config.rate_limit_seconds)
+                    
+                except Exception as e:
+                    logger.error(f"[Summarization] Error in background summarizer thread: {e}")
+                    self._summarization_stats["last_error"] = str(e)
+                    time.sleep(1.0)  # Brief pause before retrying
+        finally:
+            loop.close()
+            self._summarization_stats["is_running"] = False
+            self._summarization_stats["current_file"] = None
+            logger.info("[Summarization] Background summarizer thread stopped")
+    
     async def _process_single_file_for_summary(
         self,
         codebase_name: str,
@@ -2922,12 +3087,14 @@ class MemoryService:
             return
         
         # Check if there's an existing summary to remove from main collection
-        existing_info = vector_store.summary_index.get_summary_info(file_path)
+        existing_info = await self._run_blocking(
+            vector_store.summary_index.get_summary_info, file_path
+        )
         if existing_info:
             old_chunk_id = existing_info.get("summary_chunk_id")
             if old_chunk_id:
                 try:
-                    vector_store.delete(old_chunk_id)
+                    await self._run_blocking(vector_store.delete, old_chunk_id)
                     logger.debug(f"[Summarization] Removed old summary for: {file_path}")
                 except Exception as e:
                     logger.debug(f"[Summarization] Failed to remove old summary: {e}")
@@ -2937,7 +3104,8 @@ class MemoryService:
         summary_dict = summary.to_dict()
         summary_dict["summarized_at"] = datetime.now().isoformat()
         
-        vector_store.summary_index.store_summary(
+        await self._run_blocking(
+            vector_store.summary_index.store_summary,
             file_path=file_path,
             summary_data=summary_dict,
             content_hash=content_hash or ""
@@ -3005,7 +3173,8 @@ Dependencies: {dependencies}"""
         # Update summary index with the chunk ID for backward compatibility
         # This links the searchable chunk to the structured summary
         if result.get("success") and result.get("id") and content_hash:
-            vector_store.summary_index.update_summary_info(
+            await self._run_blocking(
+                vector_store.summary_index.update_summary_info,
                 file_path=file_path,
                 content_hash=content_hash,
                 summary_chunk_id=result["id"],
@@ -3017,7 +3186,16 @@ Dependencies: {dependencies}"""
         logger.debug(f"[Summarization] Stored summary for: {file_path}")
     
     async def stop_background_summarizer_async(self) -> None:
-        """Stop the background summarization task."""
+        """Stop the background summarization task/thread."""
+        # Stop the thread if running
+        if self._summarizer_thread and self._summarizer_thread.is_alive():
+            logger.info("[Summarization] Stopping background summarizer thread...")
+            self._summarizer_stop_event.set()
+            self._summarizer_thread.join(timeout=10.0)
+            if self._summarizer_thread.is_alive():
+                logger.warning("[Summarization] Thread did not stop gracefully")
+        
+        # Also handle legacy async task if present
         if self._summarizer_task and not self._summarizer_task.done():
             self._summarizer_task.cancel()
             try:
@@ -3031,6 +3209,29 @@ Dependencies: {dependencies}"""
         self._summarization_stats["is_running"] = False
         self._summarization_stats["current_file"] = None
         logger.info("[Summarization] Background summarizer stopped")
+    
+    def _reset_session_stats_if_idle(self) -> None:
+        """
+        Reset session stats when transitioning from idle to active.
+        
+        This ensures the "N Items Summarized" counter reflects work done
+        since the last time the queue was empty, not cumulative session totals.
+        """
+        queue_size = self._summary_queue_threaded.qsize() if self._summary_queue_threaded else 0
+        if queue_size == 0:
+            # Queue is empty, reset session counters for next batch
+            self._summarization_stats["files_summarized"] = 0
+            self._summarization_stats["files_failed"] = 0
+            self._summarization_stats["files_skipped"] = 0
+            self._summarization_stats["files_skipped_pattern"] = 0
+            self._summarization_stats["files_skipped_unchanged"] = 0
+            self._summarization_stats["files_skipped_empty"] = 0
+            self._summarization_stats["files_total_queued"] = 0
+            self._summarization_stats["total_time_seconds"] = 0.0
+            self._summarization_stats["avg_time_per_file"] = 0.0
+            self._summarization_stats["estimated_time_remaining"] = 0.0
+            self._summarization_stats["last_error"] = None
+            logger.debug("[Summarization] Reset session stats for new batch")
     
     def get_summarization_status(self) -> Dict[str, Any]:
         """
@@ -3055,8 +3256,10 @@ Dependencies: {dependencies}"""
             except Exception as e:
                 logger.debug(f"[{codebase_name}] Error getting summary stats: {e}")
         
+        # Use thread-safe queue size (the threaded queue is what's actually being processed)
+        files_queued = self._summary_queue_threaded.qsize() if self._summary_queue_threaded else 0
+        
         # Calculate timing estimates (including rate limit delay)
-        files_queued = self._summary_queue.qsize() if self._summary_queue else 0
         avg_time_per_file = self._summarization_stats.get("avg_time_per_file", 0.0)
         avg_time_with_rate_limit = avg_time_per_file + self._summarization_config.rate_limit_seconds
         estimated_time_remaining = avg_time_with_rate_limit * files_queued
@@ -3082,6 +3285,73 @@ Dependencies: {dependencies}"""
             "files_processed": files_processed,
             "progress_percentage": progress_percentage,
             # Summary breakdown: total vs simple vs LLM
+            "total_summarized": total_summarized,
+            "simple_count": total_simple,
+            "llm_count": total_llm,
+            "current_file": self._summarization_stats["current_file"],
+            "last_error": self._summarization_stats["last_error"],
+            "by_codebase": summary_stats_by_codebase,
+            # Timing estimates
+            "avg_time_per_file_seconds": avg_time_per_file,
+            "estimated_time_remaining_seconds": estimated_time_remaining,
+            "estimated_time_remaining_minutes": estimated_time_remaining / 60.0,
+            "total_processing_time_seconds": self._summarization_stats.get("total_time_seconds", 0.0)
+        }
+    
+    def get_summarization_status_basic(self) -> Dict[str, Any]:
+        """
+        Get basic summarization status (fast, uses count() for totals).
+        
+        This version uses collection.count() for totals instead of fetching
+        all document metadata. Suitable for health checks and dashboard polling.
+        
+        Returns:
+            Dictionary with basic summarization status including timing info
+        """
+        # Get summary counts from all codebases using fast count() method
+        total_summarized = 0
+        total_simple = 0
+        total_llm = 0
+        summary_stats_by_codebase = {}
+        
+        for codebase_name, vector_store in self._vector_stores.items():
+            try:
+                # Use get_summary_stats for per-codebase breakdown
+                stats = vector_store.summary_index.get_summary_stats()
+                summary_stats_by_codebase[codebase_name] = stats
+                total_summarized += stats.get("total_summarized", 0)
+                total_simple += stats.get("simple_count", 0)
+                total_llm += stats.get("llm_count", 0)
+            except Exception as e:
+                logger.debug(f"[{codebase_name}] Error getting summary count: {e}")
+        
+        # Use thread-safe queue size (the threaded queue is what's actually being processed)
+        files_queued = self._summary_queue_threaded.qsize() if self._summary_queue_threaded else 0
+        
+        # Timing info from in-memory stats
+        files_completed = self._summarization_stats["files_summarized"]
+        files_failed = self._summarization_stats["files_failed"]
+        files_total_queued = self._summarization_stats.get("files_total_queued", 0)
+        
+        files_processed = files_completed + files_failed + self._summarization_stats.get("files_skipped", 0)
+        progress_percentage = (files_processed / files_total_queued * 100.0) if files_total_queued > 0 else 0.0
+        
+        # Calculate timing estimates
+        avg_time_per_file = self._summarization_stats.get("avg_time_per_file", 0.0)
+        avg_time_with_rate_limit = avg_time_per_file + self._summarization_config.rate_limit_seconds
+        estimated_time_remaining = avg_time_with_rate_limit * files_queued
+        
+        return {
+            "enabled": self._summarization_config.enabled,
+            "llm_enabled": self._summarization_config.llm_enabled,
+            "model": self._summarization_config.model if self._summarization_config else None,
+            "is_running": self._summarization_stats["is_running"],
+            "files_queued": files_queued,
+            "files_failed": files_failed,
+            "files_processed": files_processed,
+            "files_total_queued": files_total_queued,
+            "progress_percentage": progress_percentage,
+            # Summary breakdown
             "total_summarized": total_summarized,
             "simple_count": total_simple,
             "llm_count": total_llm,
@@ -3126,9 +3396,12 @@ Dependencies: {dependencies}"""
         if self._summarizer._should_skip_file(file_path):
             return False
         
+        # Reset session stats if queue was empty (starting new batch)
+        self._reset_session_stats_if_idle()
+        
         # Queue with negative priority (PriorityQueue uses min-first)
-        await self._summary_queue.put((-priority, codebase_name, file_path, codebase_path))
-        self._summarization_stats["files_queued"] = self._summary_queue.qsize()
+        # Use the thread-safe queue since the summarizer runs in a separate thread
+        self._summary_queue_threaded.put((-priority, codebase_name, file_path, codebase_path))
         # Update total queued for individual file additions
         self._summarization_stats["files_total_queued"] += 1
         
@@ -3327,6 +3600,9 @@ Dependencies: {dependencies}"""
         files_queued = 0
         files_skipped = 0
         
+        # Reset session stats if queue was empty (starting new batch)
+        self._reset_session_stats_if_idle()
+        
         # Get existing summaries if only_missing is True
         summarized_files = set()
         if only_missing:
@@ -3350,7 +3626,8 @@ Dependencies: {dependencies}"""
                     files_skipped += 1
                     continue
                 
-                await self._summary_queue.put((-score, codebase_name, file_path, str(codebase_path)))
+                # Use thread-safe queue since summarizer runs in separate thread
+                self._summary_queue_threaded.put((-score, codebase_name, file_path, str(codebase_path)))
                 files_queued += 1
         else:
             # Fallback: queue all indexed files with equal priority
@@ -3369,11 +3646,10 @@ Dependencies: {dependencies}"""
                     files_skipped += 1
                     continue
                 
-                await self._summary_queue.put((0.5, codebase_name, file_path, str(codebase_path)))
+                # Use thread-safe queue since summarizer runs in separate thread
+                self._summary_queue_threaded.put((0.5, codebase_name, file_path, str(codebase_path)))
                 files_queued += 1
         
-        # Update queue size stat
-        self._summarization_stats["files_queued"] = self._summary_queue.qsize()
         # Update total queued if this is adding new files
         if files_queued > 0:
             self._summarization_stats["files_total_queued"] += files_queued
@@ -3388,7 +3664,7 @@ Dependencies: {dependencies}"""
             "message": f"Queued {files_queued} files from {codebase_name} for summarization",
             "files_queued": files_queued,
             "files_skipped": files_skipped,
-            "total_queue_size": self._summary_queue.qsize()
+            "total_queue_size": self._summary_queue_threaded.qsize()
         }
     
     # Sync wrapper

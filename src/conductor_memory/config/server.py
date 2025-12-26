@@ -226,6 +226,17 @@ class ServerConfig:
     # Summarization configuration
     summarization_config: SummarizationConfig = field(default_factory=SummarizationConfig)
     
+    # ChromaDB connection mode: "embedded" (SQLite) or "http" (standalone server)
+    chroma_mode: str = "embedded"
+    
+    # ChromaDB server settings (used when chroma_mode="http")
+    chroma_host: str = "localhost"
+    chroma_port: int = 8000
+    
+    # Path for ChromaDB server data (when running in http mode)
+    # If None, uses persist_directory + "/chroma-server"
+    chroma_server_path: Optional[str] = None
+    
     def __post_init__(self):
         """Validate and normalize the configuration"""
         self.persist_directory = os.path.abspath(os.path.expanduser(self.persist_directory))
@@ -255,7 +266,11 @@ class ServerConfig:
             'device': self.device,
             'embedding_batch_size': self.embedding_batch_size,
             'boost_config': self.boost_config.to_dict(),
-            'summarization': self.summarization_config.to_dict()
+            'summarization': self.summarization_config.to_dict(),
+            'chroma_mode': self.chroma_mode,
+            'chroma_host': self.chroma_host,
+            'chroma_port': self.chroma_port,
+            'chroma_server_path': self.chroma_server_path
         }
     
     @classmethod
@@ -278,7 +293,11 @@ class ServerConfig:
             device=data.get('device', 'auto'),
             embedding_batch_size=str(data.get('embedding_batch_size', 'auto')),
             boost_config=boost_config,
-            summarization_config=summarization_config
+            summarization_config=summarization_config,
+            chroma_mode=data.get('chroma_mode', 'embedded'),
+            chroma_host=data.get('chroma_host', 'localhost'),
+            chroma_port=data.get('chroma_port', 8000),
+            chroma_server_path=data.get('chroma_server_path')
         )
     
     @classmethod

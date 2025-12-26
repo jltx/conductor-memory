@@ -36,12 +36,35 @@ class OllamaClient(LLMClient):
         """
         super().__init__(base_url, model, timeout)
         self._session: Optional[aiohttp.ClientSession] = None
+        self._session_loop: Optional[asyncio.AbstractEventLoop] = None
     
     async def _get_session(self) -> aiohttp.ClientSession:
-        """Get or create aiohttp session."""
-        if self._session is None or self._session.closed:
-            timeout = aiohttp.ClientTimeout(total=self.timeout)
-            self._session = aiohttp.ClientSession(timeout=timeout)
+        """Get or create aiohttp session.
+        
+        Note: We don't set a timeout here because aiohttp's ClientTimeout
+        uses asyncio.timeout() which requires being inside a Task. When running
+        in a thread with loop.run_until_complete(), there's no Task wrapper.
+        Instead, we handle timeouts at the request level with asyncio.wait_for().
+        
+        Also tracks which event loop created the session to avoid cross-loop issues
+        when running in a background thread.
+        """
+        current_loop = asyncio.get_event_loop()
+        
+        # Check if session exists and is for the current loop
+        if self._session is not None and not self._session.closed:
+            if self._session_loop is current_loop:
+                return self._session
+            else:
+                # Session was created in a different loop - close it and create new one
+                try:
+                    await self._session.close()
+                except Exception:
+                    pass  # Ignore errors closing session from different loop
+        
+        # Create new session for this loop
+        self._session = aiohttp.ClientSession()
+        self._session_loop = current_loop
         return self._session
     
     async def generate(
@@ -88,42 +111,52 @@ class OllamaClient(LLMClient):
             else:
                 payload["options"]["num_predict"] = 2048  # Default for summarization
             
-            # Make request
+            # Make request with explicit timeout using asyncio.wait_for
+            # This works correctly in threads without a Task wrapper
             url = f"{self.base_url}/api/generate"
-            async with session.post(url, json=payload) as response:
-                if response.status != 200:
-                    error_text = await response.text()
-                    raise LLMResponseError(f"Ollama API error {response.status}: {error_text}")
-                
-                response_data = await response.json()
-                
-                # Check for errors in response
-                if "error" in response_data:
-                    raise LLMResponseError(f"Ollama error: {response_data['error']}")
-                
-                # Extract content
-                if "response" not in response_data:
-                    raise LLMResponseError("No response field in Ollama response")
-                
-                content = response_data["response"]
-                
-                # Extract usage info (Ollama provides different metrics)
-                tokens_used = None
-                if "eval_count" in response_data:
-                    # eval_count is output tokens, prompt_eval_count is input tokens
-                    eval_count = response_data.get("eval_count", 0)
-                    prompt_eval_count = response_data.get("prompt_eval_count", 0)
-                    tokens_used = eval_count + prompt_eval_count
-                
-                response_time_ms = (time.time() - start_time) * 1000
-                
-                return LLMResponse(
-                    content=content,
-                    model=self.model,
-                    tokens_used=tokens_used,
-                    response_time_ms=response_time_ms,
-                    raw_response=response_data
-                )
+            
+            async def do_request():
+                async with session.post(url, json=payload) as response:
+                    if response.status != 200:
+                        error_text = await response.text()
+                        raise LLMResponseError(f"Ollama API error {response.status}: {error_text}")
+                    
+                    response_data = await response.json()
+                    
+                    # Check for errors in response
+                    if "error" in response_data:
+                        raise LLMResponseError(f"Ollama error: {response_data['error']}")
+                    
+                    # Extract content
+                    if "response" not in response_data:
+                        raise LLMResponseError("No response field in Ollama response")
+                    
+                    return response_data
+            
+            try:
+                response_data = await asyncio.wait_for(do_request(), timeout=self.timeout)
+            except asyncio.TimeoutError:
+                raise LLMConnectionError(f"Ollama request timed out after {self.timeout}s")
+            
+            content = response_data["response"]
+            
+            # Extract usage info (Ollama provides different metrics)
+            tokens_used = None
+            if "eval_count" in response_data:
+                # eval_count is output tokens, prompt_eval_count is input tokens
+                eval_count = response_data.get("eval_count", 0)
+                prompt_eval_count = response_data.get("prompt_eval_count", 0)
+                tokens_used = eval_count + prompt_eval_count
+            
+            response_time_ms = (time.time() - start_time) * 1000
+            
+            return LLMResponse(
+                content=content,
+                model=self.model,
+                tokens_used=tokens_used,
+                response_time_ms=response_time_ms,
+                raw_response=response_data
+            )
                 
         except aiohttp.ClientError as e:
             raise LLMConnectionError(f"Failed to connect to Ollama: {e}")
@@ -147,32 +180,42 @@ class OllamaClient(LLMClient):
         try:
             session = await self._get_session()
             
-            # Check if service is running
+            # Check if service is running with explicit timeout
             url = f"{self.base_url}/api/tags"
-            async with session.get(url) as response:
-                if response.status != 200:
-                    return False
+            
+            async def do_request():
+                async with session.get(url) as response:
+                    if response.status != 200:
+                        return None
+                    return await response.json()
+            
+            try:
+                tags_data = await asyncio.wait_for(do_request(), timeout=10.0)
+            except asyncio.TimeoutError:
+                logger.debug("Ollama health check timed out")
+                return False
+            
+            if tags_data is None:
+                return False
+            
+            # Check if our model is available
+            if "models" not in tags_data:
+                return False
+            
+            available_models = [model["name"] for model in tags_data["models"]]
+            
+            # Check if our specific model is available
+            if self.model not in available_models:
+                logger.warning(f"Ollama model '{self.model}' not found. Available: {available_models}")
                 
-                tags_data = await response.json()
+                if auto_pull:
+                    logger.info(f"Attempting to pull model '{self.model}'...")
+                    if await self.pull_model():
+                        return True
                 
-                # Check if our model is available
-                if "models" not in tags_data:
-                    return False
-                
-                available_models = [model["name"] for model in tags_data["models"]]
-                
-                # Check if our specific model is available
-                if self.model not in available_models:
-                    logger.warning(f"Ollama model '{self.model}' not found. Available: {available_models}")
-                    
-                    if auto_pull:
-                        logger.info(f"Attempting to pull model '{self.model}'...")
-                        if await self.pull_model():
-                            return True
-                    
-                    return False
-                
-                return True
+                return False
+            
+            return True
                 
         except Exception as e:
             logger.debug(f"Ollama health check failed: {e}")
@@ -191,48 +234,52 @@ class OllamaClient(LLMClient):
         logger.info(f"Pulling Ollama model '{self.model}'... (this may take several minutes)")
         
         try:
-            pull_timeout = aiohttp.ClientTimeout(total=timeout)
-            async with aiohttp.ClientSession(timeout=pull_timeout) as session:
-                url = f"{self.base_url}/api/pull"
-                payload = {"name": self.model, "stream": True}
-                
-                async with session.post(url, json=payload) as response:
-                    if response.status != 200:
-                        error_text = await response.text()
-                        logger.error(f"Failed to pull model: {error_text}")
-                        return False
+            # Don't use aiohttp.ClientTimeout - it requires Task context
+            # Instead use asyncio.wait_for for the entire operation
+            async def do_pull():
+                async with aiohttp.ClientSession() as session:
+                    url = f"{self.base_url}/api/pull"
+                    payload = {"name": self.model, "stream": True}
                     
-                    # Stream the response to show progress
-                    last_status = ""
-                    async for line in response.content:
-                        if line:
-                            try:
-                                data = json.loads(line.decode('utf-8'))
-                                status = data.get("status", "")
-                                
-                                # Log progress updates (but not too frequently)
-                                if status != last_status:
-                                    if "pulling" in status.lower():
-                                        # Extract progress percentage if available
-                                        completed = data.get("completed", 0)
-                                        total = data.get("total", 0)
-                                        if total > 0:
-                                            pct = (completed / total) * 100
-                                            logger.info(f"  Downloading: {pct:.1f}%")
-                                    elif status:
-                                        logger.info(f"  {status}")
-                                    last_status = status
-                                
-                                # Check for completion or error
-                                if data.get("error"):
-                                    logger.error(f"Pull error: {data['error']}")
-                                    return False
+                    async with session.post(url, json=payload) as response:
+                        if response.status != 200:
+                            error_text = await response.text()
+                            logger.error(f"Failed to pull model: {error_text}")
+                            return False
+                        
+                        # Stream the response to show progress
+                        last_status = ""
+                        async for line in response.content:
+                            if line:
+                                try:
+                                    data = json.loads(line.decode('utf-8'))
+                                    status = data.get("status", "")
                                     
-                            except json.JSONDecodeError:
-                                continue
-                    
-                    logger.info(f"Successfully pulled model '{self.model}'")
-                    return True
+                                    # Log progress updates (but not too frequently)
+                                    if status != last_status:
+                                        if "pulling" in status.lower():
+                                            # Extract progress percentage if available
+                                            completed = data.get("completed", 0)
+                                            total = data.get("total", 0)
+                                            if total > 0:
+                                                pct = (completed / total) * 100
+                                                logger.info(f"  Downloading: {pct:.1f}%")
+                                        elif status:
+                                            logger.info(f"  {status}")
+                                        last_status = status
+                                    
+                                    # Check for completion or error
+                                    if data.get("error"):
+                                        logger.error(f"Pull error: {data['error']}")
+                                        return False
+                                        
+                                except json.JSONDecodeError:
+                                    continue
+                        
+                        logger.info(f"Successfully pulled model '{self.model}'")
+                        return True
+            
+            return await asyncio.wait_for(do_pull(), timeout=timeout)
                     
         except asyncio.TimeoutError:
             logger.error(f"Model pull timed out after {timeout}s")
@@ -321,28 +368,31 @@ class OllamaClient(LLMClient):
         logger.info(f"Warming up Ollama model '{self.model}'... (this may take a minute)")
         
         try:
-            # Create a session with longer timeout for warm-up
-            warm_up_timeout = aiohttp.ClientTimeout(total=timeout)
-            async with aiohttp.ClientSession(timeout=warm_up_timeout) as session:
-                payload = {
-                    "model": self.model,
-                    "prompt": "Say 'ready' in one word.",
-                    "stream": False,
-                    "options": {
-                        "num_predict": 10,  # Very short response
-                        "temperature": 0.0
+            # Don't use aiohttp.ClientTimeout - it requires Task context
+            # Instead use asyncio.wait_for for the entire operation
+            async def do_warmup():
+                async with aiohttp.ClientSession() as session:
+                    payload = {
+                        "model": self.model,
+                        "prompt": "Say 'ready' in one word.",
+                        "stream": False,
+                        "options": {
+                            "num_predict": 10,  # Very short response
+                            "temperature": 0.0
+                        }
                     }
-                }
-                
-                url = f"{self.base_url}/api/generate"
-                async with session.post(url, json=payload) as response:
-                    if response.status == 200:
-                        logger.info(f"Model '{self.model}' is warmed up and ready")
-                        return True
-                    else:
-                        error_text = await response.text()
-                        logger.warning(f"Model warm-up failed: {error_text}")
-                        return False
+                    
+                    url = f"{self.base_url}/api/generate"
+                    async with session.post(url, json=payload) as response:
+                        if response.status == 200:
+                            logger.info(f"Model '{self.model}' is warmed up and ready")
+                            return True
+                        else:
+                            error_text = await response.text()
+                            logger.warning(f"Model warm-up failed: {error_text}")
+                            return False
+            
+            return await asyncio.wait_for(do_warmup(), timeout=timeout)
                         
         except asyncio.TimeoutError:
             logger.warning(f"Model warm-up timed out after {timeout}s")
@@ -362,16 +412,22 @@ class OllamaClient(LLMClient):
             session = await self._get_session()
             
             url = f"{self.base_url}/api/tags"
-            async with session.get(url) as response:
-                if response.status != 200:
-                    raise LLMConnectionError(f"Failed to list models: HTTP {response.status}")
-                
-                tags_data = await response.json()
-                
-                if "models" not in tags_data:
-                    return []
-                
-                return [model["name"] for model in tags_data["models"]]
+            
+            async def do_request():
+                async with session.get(url) as response:
+                    if response.status != 200:
+                        raise LLMConnectionError(f"Failed to list models: HTTP {response.status}")
+                    return await response.json()
+            
+            try:
+                tags_data = await asyncio.wait_for(do_request(), timeout=10.0)
+            except asyncio.TimeoutError:
+                raise LLMConnectionError("Timed out listing models")
+            
+            if "models" not in tags_data:
+                return []
+            
+            return [model["name"] for model in tags_data["models"]]
                 
         except aiohttp.ClientError as e:
             raise LLMConnectionError(f"Failed to connect to Ollama: {e}")

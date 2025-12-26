@@ -36,12 +36,35 @@ class LMStudioClient(LLMClient):
         """
         super().__init__(base_url, model, timeout)
         self._session: Optional[aiohttp.ClientSession] = None
+        self._session_loop: Optional[asyncio.AbstractEventLoop] = None
     
     async def _get_session(self) -> aiohttp.ClientSession:
-        """Get or create aiohttp session."""
-        if self._session is None or self._session.closed:
-            timeout = aiohttp.ClientTimeout(total=self.timeout)
-            self._session = aiohttp.ClientSession(timeout=timeout)
+        """Get or create aiohttp session.
+        
+        Note: We don't set a timeout here because aiohttp's ClientTimeout
+        uses asyncio.timeout() which requires being inside a Task. When running
+        in a thread with loop.run_until_complete(), there's no Task wrapper.
+        Instead, we handle timeouts at the request level with asyncio.wait_for().
+        
+        Also tracks which event loop created the session to avoid cross-loop issues
+        when running in a background thread.
+        """
+        current_loop = asyncio.get_event_loop()
+        
+        # Check if session exists and is for the current loop
+        if self._session is not None and not self._session.closed:
+            if self._session_loop is current_loop:
+                return self._session
+            else:
+                # Session was created in a different loop - close it and create new one
+                try:
+                    await self._session.close()
+                except Exception:
+                    pass  # Ignore errors closing session from different loop
+        
+        # Create new session for this loop
+        self._session = aiohttp.ClientSession()
+        self._session_loop = current_loop
         return self._session
     
     async def generate(
@@ -87,42 +110,53 @@ class LMStudioClient(LLMClient):
             else:
                 payload["max_tokens"] = 2048  # Default for summarization
             
-            # Make request
+            # Make request with explicit timeout using asyncio.wait_for
+            # This works correctly in threads without a Task wrapper
             url = f"{self.base_url}/chat/completions"
-            async with session.post(url, json=payload) as response:
-                if response.status != 200:
-                    error_text = await response.text()
-                    raise LLMResponseError(f"LMStudio API error {response.status}: {error_text}")
-                
-                response_data = await response.json()
-                
-                # Extract content
-                if "choices" not in response_data or not response_data["choices"]:
-                    raise LLMResponseError("No choices in LMStudio response")
-                
-                choice = response_data["choices"][0]
-                if "message" not in choice or "content" not in choice["message"]:
-                    raise LLMResponseError("Invalid message format in LMStudio response")
-                
-                content = choice["message"]["content"]
-                
-                # Extract usage info
-                tokens_used = None
-                if "usage" in response_data and "total_tokens" in response_data["usage"]:
-                    tokens_used = response_data["usage"]["total_tokens"]
-                
-                # Get actual model name from response
-                actual_model = response_data.get("model", self.model)
-                
-                response_time_ms = (time.time() - start_time) * 1000
-                
-                return LLMResponse(
-                    content=content,
-                    model=actual_model,
-                    tokens_used=tokens_used,
-                    response_time_ms=response_time_ms,
-                    raw_response=response_data
-                )
+            
+            async def do_request():
+                async with session.post(url, json=payload) as response:
+                    if response.status != 200:
+                        error_text = await response.text()
+                        raise LLMResponseError(f"LMStudio API error {response.status}: {error_text}")
+                    
+                    response_data = await response.json()
+                    
+                    # Extract content
+                    if "choices" not in response_data or not response_data["choices"]:
+                        raise LLMResponseError("No choices in LMStudio response")
+                    
+                    choice = response_data["choices"][0]
+                    if "message" not in choice or "content" not in choice["message"]:
+                        raise LLMResponseError("Invalid message format in LMStudio response")
+                    
+                    return response_data
+            
+            try:
+                response_data = await asyncio.wait_for(do_request(), timeout=self.timeout)
+            except asyncio.TimeoutError:
+                raise LLMConnectionError(f"LMStudio request timed out after {self.timeout}s")
+            
+            choice = response_data["choices"][0]
+            content = choice["message"]["content"]
+            
+            # Extract usage info
+            tokens_used = None
+            if "usage" in response_data and "total_tokens" in response_data["usage"]:
+                tokens_used = response_data["usage"]["total_tokens"]
+            
+            # Get actual model name from response
+            actual_model = response_data.get("model", self.model)
+            
+            response_time_ms = (time.time() - start_time) * 1000
+            
+            return LLMResponse(
+                content=content,
+                model=actual_model,
+                tokens_used=tokens_used,
+                response_time_ms=response_time_ms,
+                raw_response=response_data
+            )
                 
         except aiohttp.ClientError as e:
             raise LLMConnectionError(f"Failed to connect to LMStudio: {e}")
@@ -143,20 +177,30 @@ class LMStudioClient(LLMClient):
         try:
             session = await self._get_session()
             
-            # Check if service is running
+            # Check if service is running with explicit timeout
             url = f"{self.base_url}/models"
-            async with session.get(url) as response:
-                if response.status != 200:
-                    return False
-                
-                models_data = await response.json()
-                
-                # Check if any models are available
-                if "data" not in models_data or not models_data["data"]:
-                    logger.warning("LMStudio is running but no models are loaded")
-                    return False
-                
-                return True
+            
+            async def do_request():
+                async with session.get(url) as response:
+                    if response.status != 200:
+                        return None
+                    return await response.json()
+            
+            try:
+                models_data = await asyncio.wait_for(do_request(), timeout=10.0)
+            except asyncio.TimeoutError:
+                logger.debug("LMStudio health check timed out")
+                return False
+            
+            if models_data is None:
+                return False
+            
+            # Check if any models are available
+            if "data" not in models_data or not models_data["data"]:
+                logger.warning("LMStudio is running but no models are loaded")
+                return False
+            
+            return True
                 
         except Exception as e:
             logger.debug(f"LMStudio health check failed: {e}")
@@ -173,16 +217,22 @@ class LMStudioClient(LLMClient):
             session = await self._get_session()
             
             url = f"{self.base_url}/models"
-            async with session.get(url) as response:
-                if response.status != 200:
-                    raise LLMConnectionError(f"Failed to list models: HTTP {response.status}")
-                
-                models_data = await response.json()
-                
-                if "data" not in models_data:
-                    return []
-                
-                return [model["id"] for model in models_data["data"]]
+            
+            async def do_request():
+                async with session.get(url) as response:
+                    if response.status != 200:
+                        raise LLMConnectionError(f"Failed to list models: HTTP {response.status}")
+                    return await response.json()
+            
+            try:
+                models_data = await asyncio.wait_for(do_request(), timeout=10.0)
+            except asyncio.TimeoutError:
+                raise LLMConnectionError("Timed out listing models")
+            
+            if "data" not in models_data:
+                return []
+            
+            return [model["id"] for model in models_data["data"]]
                 
         except aiohttp.ClientError as e:
             raise LLMConnectionError(f"Failed to connect to LMStudio: {e}")
