@@ -6,6 +6,8 @@ Usage:
     python scripts/test_postgres_connection.py --config ~/.conductor-memory/config.json
 
 Reads postgres_url from config file or CONDUCTOR_POSTGRES_URL environment variable.
+
+Requires: pip install conductor-memory[postgres]
 """
 
 import argparse
@@ -16,7 +18,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from conductor_memory.storage.postgres import PostgresMetadataStore
+try:
+    from conductor_memory.storage.postgres import PostgresMetadataStore
+except ImportError as e:
+    print("ERROR: PostgreSQL support requires additional dependencies.")
+    print("Install with: pip install conductor-memory[postgres]")
+    print(f"Details: {e}")
+    sys.exit(1)
 
 
 def get_postgres_url(config_path: str = None) -> str:

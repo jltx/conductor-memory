@@ -14,6 +14,7 @@ Usage:
 Prerequisites:
     1. Run setup_postgres.py first to create the database
     2. Ensure conductor-memory is not running (to avoid conflicts)
+    3. Install postgres support: pip install conductor-memory[postgres]
 """
 
 import argparse
@@ -28,7 +29,14 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from conductor_memory.config.server import ServerConfig
 from conductor_memory.storage.chroma import ChromaVectorStore
-from conductor_memory.storage.postgres import PostgresMetadataStore
+
+try:
+    from conductor_memory.storage.postgres import PostgresMetadataStore
+except ImportError as e:
+    print("ERROR: PostgreSQL support requires additional dependencies.")
+    print("Install with: pip install conductor-memory[postgres]")
+    print(f"Details: {e}")
+    sys.exit(1)
 
 logging.basicConfig(
     level=logging.INFO,

@@ -70,5 +70,8 @@ NUL
 .claude/
 
 # Temp files
-tmpclaude-*/
+tmpclaude-*
 test_schema_version_tmp/
+
+# Package manager lock files (use requirements.txt for pinning)
+uv.lock

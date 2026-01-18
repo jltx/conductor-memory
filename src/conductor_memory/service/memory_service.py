@@ -40,7 +40,14 @@ from ..search.verification import (
     Evidence,
 )
 from ..llm.summarizer import FileSummarizer, FileSummary
-from ..storage.postgres import PostgresMetadataStore
+
+# PostgreSQL is optional - only import if asyncpg is available
+try:
+    from ..storage.postgres import PostgresMetadataStore
+    POSTGRES_AVAILABLE = True
+except ImportError:
+    PostgresMetadataStore = None  # type: ignore
+    POSTGRES_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -173,11 +180,14 @@ class MemoryService:
         self._count_cache_initialized = False
 
         # PostgreSQL metadata store (optional, for fast dashboard queries)
-        self._postgres: Optional[PostgresMetadataStore] = None
+        self._postgres: Optional[Any] = None  # PostgresMetadataStore when available
         self._postgres_initialized = False
-        if config.postgres_url:
+        if config.postgres_url and POSTGRES_AVAILABLE:
             self._postgres = PostgresMetadataStore(config.postgres_url)
             logger.info(f"PostgreSQL metadata store configured")
+        elif config.postgres_url and not POSTGRES_AVAILABLE:
+            logger.warning("postgres_url configured but asyncpg not installed. "
+                         "Install with: pip install conductor-memory[postgres]")
 
         # Initialize vector stores for each enabled codebase
         for codebase in config.get_enabled_codebases():
@@ -211,9 +221,13 @@ class MemoryService:
             logger.debug("_ensure_postgres: already initialized")
             return True
 
-        # No PostgreSQL URL configured
+        # No PostgreSQL URL configured or library not available
         if not self.config.postgres_url:
             logger.warning("_ensure_postgres: no postgres_url configured")
+            return False
+
+        if not POSTGRES_AVAILABLE:
+            logger.warning("_ensure_postgres: asyncpg not installed")
             return False
 
         logger.info("_ensure_postgres: attempting connection...")

@@ -41,13 +41,8 @@ def main():
     print(f"Found {len(collections)} collections")
     print()
 
-    # Test a few key collections
-    test_collections = [
-        "conductor_memory_files",
-        "conductor_memory_summaries",
-        "options_ml_trader_files",
-        "options_ml_trader_summaries",
-    ]
+    # Test all found collections
+    test_collections = [c.name for c in collections]
 
     print("Measuring count() times (5 iterations each):")
     print("-" * 50)

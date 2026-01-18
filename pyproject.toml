@@ -46,9 +46,6 @@ dependencies = [
     "tree-sitter-swift>=0.0.1",
     "tree-sitter-objc>=3.0.0",
     "tree-sitter-typescript>=0.23.0",
-    # PostgreSQL support for fast metadata queries
-    "asyncpg>=0.29.0",
-    "psycopg2-binary>=2.9.0",
 ]
 
 [project.optional-dependencies]
@@ -58,6 +55,11 @@ dev = [
 ]
 windows-service = [
     "pywin32>=306",
+]
+# PostgreSQL support for fast dashboard queries (optional)
+postgres = [
+    "asyncpg>=0.29.0",
+    "psycopg2-binary>=2.9.0",
 ]
 
 [project.scripts]

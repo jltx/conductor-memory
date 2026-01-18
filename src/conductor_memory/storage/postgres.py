@@ -2,6 +2,9 @@
 PostgreSQL Metadata Store
 
 Fast metadata storage for dashboard operations. ChromaDB handles vectors only.
+
+Requires optional 'postgres' dependencies:
+    pip install conductor-memory[postgres]
 """
 
 import asyncio
@@ -11,7 +14,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-import asyncpg
+try:
+    import asyncpg
+    ASYNCPG_AVAILABLE = True
+except ImportError:
+    asyncpg = None  # type: ignore
+    ASYNCPG_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -35,9 +43,17 @@ class PostgresMetadataStore:
         Args:
             connection_string: PostgreSQL connection URL
                 e.g., "postgresql://user:pass@host:5432/conductor_memory"
+
+        Raises:
+            ImportError: If asyncpg is not installed
         """
+        if not ASYNCPG_AVAILABLE:
+            raise ImportError(
+                "PostgreSQL support requires the 'postgres' extra. "
+                "Install with: pip install conductor-memory[postgres]"
+            )
         self.connection_string = connection_string
-        self.pool: Optional[asyncpg.Pool] = None
+        self.pool: Optional[Any] = None  # asyncpg.Pool when available
         self._initialized = False
         self._pool_loop: Optional[asyncio.AbstractEventLoop] = None
         self._connect_lock: Optional[asyncio.Lock] = None
