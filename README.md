@@ -64,6 +64,19 @@ cd conductor-memory
 pip install -e .
 ```
 
+### Optional Features
+
+```bash
+# PostgreSQL support for faster dashboard queries (large codebases)
+pip install conductor-memory[postgres]
+
+# Windows service support
+pip install conductor-memory[windows-service]
+
+# Development tools
+pip install conductor-memory[dev]
+```
+
 📖 **For detailed installation instructions, see [INSTALL.md](INSTALL.md)**
 
 ## Quick Start
@@ -211,6 +224,38 @@ EMBEDDING_DEVICE=cuda  # Use GPU if available
 | `model` | LLM model for summarization | `qwen2.5-coder:1.5b` |
 | `rate_limit_seconds` | Delay between LLM calls | `0.5` |
 | `timeout_seconds` | LLM request timeout | `30.0` |
+
+### Advanced Configuration
+
+| Field | Description | Default |
+|-------|-------------|---------|
+| `chroma_mode` | ChromaDB mode: `"embedded"` (SQLite) or `"http"` (standalone server) | `"embedded"` |
+| `chroma_host` | ChromaDB server host (when using http mode) | `"localhost"` |
+| `chroma_port` | ChromaDB server port (when using http mode) | `8000` |
+| `postgres_url` | PostgreSQL URL for faster dashboard queries (optional) | `null` |
+| `watch_interval` | Seconds between file change checks | `5.0` |
+
+#### PostgreSQL Integration (Optional)
+
+For large codebases (1000+ files), PostgreSQL provides faster dashboard queries:
+
+```json
+{
+  "postgres_url": "postgresql://user:pass@localhost:5432/conductor_memory"
+}
+```
+
+Setup:
+```bash
+# Install PostgreSQL support
+pip install conductor-memory[postgres]
+
+# Create database and schema
+python scripts/setup_postgres.py --host localhost --user postgres
+
+# Migrate existing data (optional)
+python scripts/migrate_to_postgres.py --config ~/.conductor-memory/config.json
+```
 
 ## Search Modes
 

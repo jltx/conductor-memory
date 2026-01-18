@@ -29,6 +29,24 @@ cd conductor-memory
 pip install -e .
 ```
 
+### Optional Extras
+
+Install optional features as needed:
+
+```bash
+# PostgreSQL support for faster dashboard queries (recommended for 1000+ files)
+pip install conductor-memory[postgres]
+
+# Windows service support
+pip install conductor-memory[windows-service]
+
+# Development tools (pytest, etc.)
+pip install conductor-memory[dev]
+
+# Multiple extras
+pip install conductor-memory[postgres,windows-service]
+```
+
 ## Platform-Specific Instructions
 
 ### Windows
@@ -280,6 +298,54 @@ python -m pywin32_postinstall -install
 #### Service starts but HTTP API not responding
 - Wait 30-60 seconds for initial codebase indexing
 - Check if ports 9800/9801 are available: `netstat -an | findstr "9800"`
+
+## Optional: PostgreSQL Integration
+
+For large codebases (1000+ files), PostgreSQL provides significantly faster dashboard queries by storing metadata separately from ChromaDB vectors.
+
+### Prerequisites
+
+- PostgreSQL 12+ server (local or remote)
+- `conductor-memory[postgres]` installed
+
+### Setup
+
+```bash
+# 1. Install PostgreSQL support
+pip install conductor-memory[postgres]
+
+# 2. Create database and schema
+python scripts/setup_postgres.py --host localhost --user postgres --port 5432
+
+# 3. Add to config.json
+```
+
+Add to your `~/.conductor-memory/config.json`:
+```json
+{
+  "postgres_url": "postgresql://user:password@localhost:5432/conductor_memory"
+}
+```
+
+### Migrating Existing Data
+
+If you have existing indexed files:
+```bash
+python scripts/migrate_to_postgres.py --config ~/.conductor-memory/config.json
+```
+
+### Verifying Connection
+
+```bash
+python scripts/test_postgres_connection.py --config ~/.conductor-memory/config.json
+```
+
+### Notes
+
+- PostgreSQL is **optional** - ChromaDB (SQLite) works without it
+- ChromaDB still handles all vector operations and embeddings
+- PostgreSQL only stores file/summary metadata for faster dashboard queries
+- If PostgreSQL is unavailable, the system falls back to ChromaDB automatically
 
 ## Optional: LLM Integration
 

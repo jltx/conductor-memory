@@ -24,27 +24,30 @@ Conductor Memory is a semantic memory service designed for AI agent integration.
 │                     │  MemoryService  │                                 │
 │                     │  (Orchestrator) │                                 │
 │                     └────────┬────────┘                                 │
-│                                   │                                      │
-│         ┌─────────────────────────┼─────────────────────────┐           │
-│         │                         │                         │           │
-│  ┌──────┴──────┐          ┌───────┴───────┐         ┌───────┴──────┐   │
-│  │   Vector    │          │    Hybrid     │         │   Chunking   │   │
-│  │   Store     │          │   Searcher    │         │   Manager    │   │
-│  │  (Chroma)   │          │  (BM25+Vec)   │         │   (AST)      │   │
-│  └──────┬──────┘          └───────┬───────┘         └──────────────┘   │
-│         │                         │                                     │
-│  ┌──────┴──────┐          ┌───────┴───────┐                            │
-│  │  Embedder   │          │  BM25 Index   │                            │
-│  │ (SentTrans) │          │  (rank_bm25)  │                            │
-│  └─────────────┘          └───────────────┘                            │
+│                              │                                           │
+│         ┌────────────────────┼────────────────────┐                     │
+│         │                    │                    │                     │
+│  ┌──────┴──────┐      ┌──────┴──────┐     ┌──────┴──────┐              │
+│  │   Vector    │      │   Hybrid    │     │  Chunking   │              │
+│  │   Store     │      │  Searcher   │     │   Manager   │              │
+│  │  (Chroma)   │      │ (BM25+Vec)  │     │    (AST)    │              │
+│  └──────┬──────┘      └──────┬──────┘     └─────────────┘              │
+│         │                    │                                          │
+│  ┌──────┴──────┐      ┌──────┴──────┐                                  │
+│  │  Embedder   │      │  BM25 Index │                                  │
+│  │ (SentTrans) │      │ (rank_bm25) │                                  │
+│  └─────────────┘      └─────────────┘                                  │
 │                                                                          │
 └─────────────────────────────────────────────────────────────────────────┘
-                                   │
-                                   ▼
-                    ┌──────────────────────────┐
-                    │   ChromaDB (Persistent)  │
-                    │   ~/.conductor-memory/   │
-                    └──────────────────────────┘
+                    │                              │
+                    ▼                              ▼ (optional)
+     ┌──────────────────────────┐    ┌──────────────────────────┐
+     │   ChromaDB (Persistent)  │    │   PostgreSQL (Metadata)  │
+     │   ~/.conductor-memory/   │    │   Fast dashboard queries │
+     │   - Vector embeddings    │    │   - File index metadata  │
+     │   - Full-text content    │    │   - Summary metadata     │
+     └──────────────────────────┘    │   - Materialized stats   │
+                                     └──────────────────────────┘
 ```
 
 ## Component Details
@@ -72,6 +75,14 @@ Conductor Memory is a semantic memory service designed for AI agent integration.
 - File index metadata for incremental indexing
 - `needs_reindex()`: Check if file changed (mtime + content hash)
 - `update_file_index()`: Track indexed files
+- Modes: `embedded` (SQLite) or `http` (standalone server)
+
+**postgres.py** - PostgreSQL metadata store (optional)
+- Fast metadata queries for dashboard operations
+- Sub-millisecond counts via materialized views
+- Paginated file/summary listing with filtering
+- Automatic fallback to ChromaDB if unavailable
+- Requires: `pip install conductor-memory[postgres]`
 
 ### Embedding Layer (`embedding/`)
 
@@ -205,6 +216,46 @@ Background task per codebase:
 - **Incremental indexing**: Only changed files re-processed
 - **Content hashing**: Avoids re-indexing unchanged files with new mtime
 - **In-memory BM25**: Fast keyword search without external service
+- **Thread pool executor**: File watcher operations run in executor to avoid blocking event loop
+- **Metadata caching**: 60-second TTL cache for file index metadata
+
+## Storage Strategy
+
+### Default: ChromaDB Only
+
+ChromaDB handles both vectors and metadata:
+- Vector embeddings for semantic search
+- File content and chunked text
+- File index metadata (mtime, hash, etc.)
+
+This works well for small-to-medium codebases (<1000 files).
+
+### Optional: ChromaDB + PostgreSQL
+
+For large codebases, add PostgreSQL for metadata:
+
+| Operation | ChromaDB | PostgreSQL |
+|-----------|----------|------------|
+| Vector search | ✓ | - |
+| File content storage | ✓ | - |
+| Embedding generation | ✓ | - |
+| Dashboard file counts | Slow | ✓ Fast |
+| Paginated file lists | Slow | ✓ Fast |
+| Summary filtering | Slow | ✓ Fast |
+
+PostgreSQL uses:
+- **Materialized views** for instant count queries
+- **Proper indexes** for filtered pagination
+- **Async connection pooling** via asyncpg
+
+Configuration:
+```json
+{
+  "postgres_url": "postgresql://user:pass@host:5432/conductor_memory"
+}
+```
+
+If PostgreSQL is unavailable, the system automatically falls back to ChromaDB.
 
 ## Extension Points
 
