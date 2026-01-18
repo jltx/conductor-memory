@@ -325,19 +325,21 @@ async def api_validation_queue(request):
         status = params.get("status", "unreviewed")
         pattern = params.get("pattern", "")
         domain = params.get("domain", "")
+        sort = params.get("sort", "recent")
         offset = int(params.get("offset", 0))
         limit = int(params.get("limit", 20))
-        
+
         if not codebase:
             return JSONResponse({"error": "codebase is required"}, status_code=400)
-        
+
         result = await memory_service.get_validation_queue_async(
             codebase=codebase,
             status=status,
             pattern=pattern,
             domain=domain,
             offset=offset,
-            limit=limit
+            limit=limit,
+            sort=sort
         )
         return JSONResponse(result)
     except Exception as e:
@@ -498,11 +500,12 @@ async def web_dashboard(request):
     <title>Conductor Memory - Dashboard</title>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
-        body { 
+        html, body {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background: #1a1a2e; 
-            color: #eee; 
-            min-height: 100vh;
+            background: #1a1a2e;
+            color: #eee;
+            height: 100vh;
+            overflow: hidden;
         }
         
         /* Header */
@@ -535,9 +538,26 @@ async def web_dashboard(request):
         .tab.active { background: #0f3460; color: #00d4ff; border-color: #00d4ff; }
         
         /* Main content */
-        .container { max-width: 1600px; margin: 0 auto; padding: 20px 40px; }
+        .container {
+            max-width: 1600px;
+            margin: 0 auto;
+            padding: 20px 40px;
+            height: calc(100vh - 60px);
+            overflow-y: auto;
+        }
         .tab-content { display: none; }
         .tab-content.active { display: block; }
+        /* Full height tabs - summaries and browse */
+        #summaries-tab.active, #browse-tab.active {
+            display: flex;
+            flex-direction: column;
+            height: calc(100vh - 100px);
+            overflow: hidden;
+        }
+        #summaries-tab h2, #browse-tab h2 { flex-shrink: 0; }
+        .container:has(#summaries-tab.active), .container:has(#browse-tab.active) {
+            overflow: hidden;
+        }
         
         /* Cards */
         h2 { color: #888; font-size: 14px; text-transform: uppercase; margin: 20px 0 10px; }
@@ -804,8 +824,9 @@ async def web_dashboard(request):
         }
         
         /* Browse tab styles */
-        .browse-controls { 
+        .browse-controls {
             display: flex; gap: 15px; margin-bottom: 10px; flex-wrap: wrap; align-items: center;
+            flex-shrink: 0;
         }
         .browse-controls select {
             padding: 8px 12px; background: #0f3460; border: 1px solid #1a3a6e;
@@ -818,9 +839,10 @@ async def web_dashboard(request):
         
         /* Quick Filters */
         .browse-quick-filters {
-            display: flex; gap: 12px; margin-bottom: 15px; flex-wrap: wrap; 
+            display: flex; gap: 12px; margin-bottom: 15px; flex-wrap: wrap;
             align-items: center; padding: 10px 15px;
             background: #0f3460; border-radius: 6px;
+            flex-shrink: 0;
         }
         .browse-quick-filters label {
             font-size: 12px; color: #888;
@@ -851,7 +873,8 @@ async def web_dashboard(request):
             display: grid;
             grid-template-columns: 30% 70%;
             gap: 20px;
-            min-height: 500px;
+            flex: 1;
+            min-height: 0;
         }
         .browse-list-panel {
             background: #16213e;
@@ -868,6 +891,98 @@ async def web_dashboard(request):
             color: #888;
             display: flex;
             justify-content: space-between;
+            align-items: center;
+        }
+        .browse-view-toggle {
+            display: flex;
+            gap: 4px;
+        }
+        .view-toggle-btn {
+            padding: 4px 8px;
+            background: transparent;
+            border: 1px solid #1a3a6e;
+            border-radius: 4px;
+            color: #555;
+            cursor: pointer;
+            font-size: 12px;
+            transition: all 0.2s;
+        }
+        .view-toggle-btn:hover {
+            border-color: #00d4ff;
+            color: #888;
+        }
+        .view-toggle-btn.active {
+            background: #0f3460;
+            border-color: #00d4ff;
+            color: #00d4ff;
+        }
+        /* Tree view styles */
+        .tree-node {
+            user-select: none;
+        }
+        .tree-folder {
+            padding: 6px 10px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            color: #888;
+            transition: background 0.15s;
+        }
+        .tree-folder:hover {
+            background: rgba(0, 212, 255, 0.05);
+        }
+        .tree-folder-icon {
+            font-size: 12px;
+            width: 16px;
+            text-align: center;
+            transition: transform 0.15s;
+        }
+        .tree-folder.expanded .tree-folder-icon {
+            transform: rotate(90deg);
+        }
+        .tree-folder-name {
+            font-family: monospace;
+            font-size: 12px;
+        }
+        .tree-folder-count {
+            font-size: 10px;
+            color: #555;
+            margin-left: auto;
+        }
+        .tree-children {
+            display: none;
+            padding-left: 16px;
+        }
+        .tree-children.expanded {
+            display: block;
+        }
+        .tree-file {
+            padding: 5px 10px 5px 26px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            color: #ccc;
+            font-family: monospace;
+            font-size: 12px;
+            transition: background 0.15s;
+        }
+        .tree-file:hover {
+            background: rgba(0, 212, 255, 0.05);
+        }
+        .tree-file.selected {
+            background: rgba(0, 212, 255, 0.15);
+            border-left: 2px solid #00d4ff;
+        }
+        .tree-file-icon {
+            font-size: 10px;
+            color: #555;
+        }
+        .tree-file-meta {
+            margin-left: auto;
+            display: flex;
+            gap: 6px;
             align-items: center;
         }
         .browse-list-content {
@@ -1081,6 +1196,7 @@ async def web_dashboard(request):
             margin-bottom: 15px;
             flex-wrap: wrap;
             align-items: center;
+            flex-shrink: 0;
         }
         .validate-filter-bar label {
             display: flex;
@@ -1108,6 +1224,20 @@ async def web_dashboard(request):
             font-size: 13px;
             color: #00d4ff;
         }
+        .validate-refresh-btn {
+            padding: 6px 10px;
+            background: #0f3460;
+            border: 1px solid #1a3a6e;
+            border-radius: 4px;
+            color: #888;
+            cursor: pointer;
+            font-size: 14px;
+            transition: all 0.2s;
+        }
+        .validate-refresh-btn:hover {
+            border-color: #00d4ff;
+            color: #00d4ff;
+        }
         .validate-filter-reset {
             color: #ff6b6b;
             cursor: pointer;
@@ -1121,7 +1251,8 @@ async def web_dashboard(request):
             display: grid;
             grid-template-columns: 25% 1fr 1fr;
             gap: 15px;
-            min-height: 500px;
+            flex: 1;
+            min-height: 0;
             margin-bottom: 15px;
         }
         
@@ -1282,6 +1413,7 @@ async def web_dashboard(request):
             background: #16213e;
             border-radius: 8px;
             border: 1px solid #0f3460;
+            flex-shrink: 0;
         }
         .validate-action-group {
             display: flex;
@@ -1356,9 +1488,9 @@ async def web_dashboard(request):
         
         /* Phase 2: Collapsible sections */
         .collapsible-section {
-            margin-top: 12px;
+            margin-top: 6px;
             border-top: 1px solid rgba(255,255,255,0.1);
-            padding-top: 12px;
+            padding-top: 6px;
         }
         .collapsible-header {
             display: flex;
@@ -1379,8 +1511,8 @@ async def web_dashboard(request):
         }
         .collapsible-body {
             display: none;
-            margin-top: 8px;
-            padding: 10px;
+            margin-top: 4px;
+            padding: 6px;
             background: rgba(0,0,0,0.2);
             border-radius: 4px;
             font-size: 13px;
@@ -1430,6 +1562,7 @@ async def web_dashboard(request):
         /* Summary Statistics Section */
         .summary-stats-container {
             margin-bottom: 15px;
+            flex-shrink: 0;
         }
         .summary-stats-header {
             display: flex;
@@ -2057,7 +2190,10 @@ async def web_dashboard(request):
                 <div class="browse-list-panel">
                     <div class="browse-list-header">
                         <span id="browse-list-count">Loading...</span>
-                        <span style="font-size: 11px; color: #555;">↑↓ to navigate, Enter to select</span>
+                        <div class="browse-view-toggle">
+                            <button class="view-toggle-btn active" id="btn-tree-view" onclick="setBrowseViewMode('tree')" title="Tree view">🌲</button>
+                            <button class="view-toggle-btn" id="btn-list-view" onclick="setBrowseViewMode('list')" title="List view">☰</button>
+                        </div>
                     </div>
                     <div class="browse-list-content" id="browse-list-content" tabindex="0">
                         <div class="loading" style="padding: 40px; text-align: center;">Loading...</div>
@@ -2120,6 +2256,13 @@ async def web_dashboard(request):
                         <option value="">All Domains</option>
                     </select>
                 </label>
+                <label>Sort:
+                    <select id="validate-sort">
+                        <option value="recent">Most Recent</option>
+                        <option value="alpha">A-Z</option>
+                        <option value="alpha-desc">Z-A</option>
+                    </select>
+                </label>
                 <label>Per page:
                     <select id="validate-page-size">
                         <option value="20">20</option>
@@ -2128,6 +2271,7 @@ async def web_dashboard(request):
                         <option value="50">50</option>
                     </select>
                 </label>
+                <button class="validate-refresh-btn" id="validate-refresh-btn" onclick="loadValidateFiles()" title="Refresh list">↻</button>
                 <span class="validate-filter-reset" id="validate-filter-reset" style="display: none;">✕ Clear filters</span>
                 <span class="validate-progress" id="validate-progress">Loading...</span>
             </div>
@@ -2724,6 +2868,92 @@ async def web_dashboard(request):
         // =========== Browse Tab ===========
         let browseData = { files: [], memories: [], summaries: [] };
         let selectedIndex = -1;
+        let browseViewMode = 'tree';  // 'tree' or 'list'
+
+        function setBrowseViewMode(mode) {
+            browseViewMode = mode;
+            document.getElementById('btn-tree-view').classList.toggle('active', mode === 'tree');
+            document.getElementById('btn-list-view').classList.toggle('active', mode === 'list');
+            // Re-render current data
+            if (browseData.currentView === 'files' && browseData.files.length > 0) {
+                renderFilesList({ files: browseData.files, total: browseData.total || browseData.files.length, offset: browseData.offset || 0 });
+            }
+        }
+
+        function buildFileTree(files) {
+            const root = { children: {}, files: [] };
+            files.forEach((file, idx) => {
+                const parts = file.path.split(/[\\/\\\\]/);
+                let current = root;
+                // Navigate to the folder, creating nodes as needed
+                for (let i = 0; i < parts.length - 1; i++) {
+                    const part = parts[i];
+                    if (!current.children[part]) {
+                        current.children[part] = { children: {}, files: [] };
+                    }
+                    current = current.children[part];
+                }
+                // Add file to the final folder
+                current.files.push({ ...file, _idx: idx });
+            });
+            return root;
+        }
+
+        function renderTreeNode(node, name = '', depth = 0) {
+            let html = '';
+            const nodeId = 'tree-' + Math.random().toString(36).substr(2, 9);
+
+            // Render folders first
+            const folders = Object.entries(node.children).sort((a, b) => a[0].localeCompare(b[0]));
+            folders.forEach(([folderName, childNode]) => {
+                const fileCount = countFilesInNode(childNode);
+                const isExpanded = depth < 1;  // Auto-expand first level
+                html += `
+                    <div class="tree-node">
+                        <div class="tree-folder ${isExpanded ? 'expanded' : ''}" onclick="toggleTreeFolder(this)" style="padding-left: ${10 + depth * 12}px;">
+                            <span class="tree-folder-icon">▶</span>
+                            <span class="tree-folder-name">${escapeHtml(folderName)}</span>
+                            <span class="tree-folder-count">${fileCount}</span>
+                        </div>
+                        <div class="tree-children ${isExpanded ? 'expanded' : ''}">
+                            ${renderTreeNode(childNode, folderName, depth + 1)}
+                        </div>
+                    </div>`;
+            });
+
+            // Render files
+            node.files.forEach(file => {
+                const summaryBadge = getSummaryBadge(file.has_summary, file.simple_file, file.simple_file_reason);
+                const fileName = file.path.split(/[\\/\\\\]/).pop();
+                html += `
+                    <div class="tree-file" data-index="${file._idx}" onclick="selectFileItem(${file._idx})" style="padding-left: ${16 + depth * 12}px;">
+                        <span class="tree-file-icon">📄</span>
+                        <span>${escapeHtml(fileName)}</span>
+                        <div class="tree-file-meta">
+                            ${summaryBadge}
+                            <span style="font-size: 10px; color: #555;">${file.chunk_count}</span>
+                        </div>
+                    </div>`;
+            });
+
+            return html;
+        }
+
+        function countFilesInNode(node) {
+            let count = node.files.length;
+            Object.values(node.children).forEach(child => {
+                count += countFilesInNode(child);
+            });
+            return count;
+        }
+
+        function toggleTreeFolder(folderEl) {
+            folderEl.classList.toggle('expanded');
+            const children = folderEl.nextElementSibling;
+            if (children) {
+                children.classList.toggle('expanded');
+            }
+        }
         
         function updateQuickFiltersVisibility() {
             const view = document.getElementById('browse-view').value;
@@ -2839,46 +3069,59 @@ async def web_dashboard(request):
             const listContent = document.getElementById('browse-list-content');
             const countSpan = document.getElementById('browse-list-count');
             const files = data.files || [];
-            
+
+            // Store data for view mode switching
+            browseData.total = data.total;
+            browseData.offset = data.offset;
+
             // Show active filters count
             const activeFilters = getActiveFiltersCount();
             const filterNote = activeFilters > 0 ? ` (${activeFilters} filter${activeFilters > 1 ? 's' : ''})` : '';
-            
+
             if (files.length === 0) {
                 listContent.innerHTML = `<div class="empty-state" style="padding: 40px;">No files found${filterNote ? ' - try clearing filters' : ''}</div>`;
                 countSpan.textContent = `0 files${filterNote}`;
                 renderPagination(0, 0);
                 return;
             }
-            
+
             countSpan.textContent = `${data.offset + 1}-${data.offset + files.length} of ${data.total} files${filterNote}`;
-            
+
             let html = '';
-            files.forEach((f, idx) => {
-                const patternTag = f.pattern ? `<span class="tag" style="font-size: 10px;">${f.pattern}</span>` : '';
-                const summaryBadge = getSummaryBadge(f.has_summary, f.simple_file, f.simple_file_reason);
-                html += `
-                    <div class="file-list-item" data-index="${idx}" onclick="selectFileItem(${idx})" tabindex="-1">
-                        <span class="file-item-path" title="${escapeHtml(f.path)}">${escapeHtml(f.path)}</span>
-                        <div class="file-item-meta">
-                            ${summaryBadge}
-                            ${patternTag}
-                            <span class="file-item-chunks">${f.chunk_count}</span>
+
+            if (browseViewMode === 'tree') {
+                // Tree view
+                const tree = buildFileTree(files);
+                html = renderTreeNode(tree);
+            } else {
+                // List view
+                files.forEach((f, idx) => {
+                    const patternTag = f.pattern ? `<span class="tag" style="font-size: 10px;">${f.pattern}</span>` : '';
+                    const summaryBadge = getSummaryBadge(f.has_summary, f.simple_file, f.simple_file_reason);
+                    html += `
+                        <div class="file-list-item" data-index="${idx}" onclick="selectFileItem(${idx})" tabindex="-1">
+                            <span class="file-item-path" title="${escapeHtml(f.path)}">${escapeHtml(f.path)}</span>
+                            <div class="file-item-meta">
+                                ${summaryBadge}
+                                ${patternTag}
+                                <span class="file-item-chunks">${f.chunk_count}</span>
+                            </div>
                         </div>
-                    </div>
-                `;
-            });
-            
+                    `;
+                });
+            }
+
             listContent.innerHTML = html;
             renderPagination(data.total, data.offset);
         }
         
         function selectFileItem(idx) {
             const view = browseData.currentView;
-            
-            // Update selection UI
-            document.querySelectorAll('.file-list-item').forEach((el, i) => {
-                el.classList.toggle('selected', i === idx);
+
+            // Update selection UI (handle both list and tree views)
+            document.querySelectorAll('.file-list-item, .tree-file').forEach(el => {
+                const elIdx = parseInt(el.getAttribute('data-index'));
+                el.classList.toggle('selected', elIdx === idx);
             });
             selectedIndex = idx;
             
@@ -3419,30 +3662,30 @@ async def web_dashboard(request):
                 html += `</div></div>`;
             }
             
-            // How It Works (collapsible)
+            // How It Works (expanded by default)
             if (summary.how_it_works) {
                 const sectionId = 'validate-how-it-works-' + Math.random().toString(36).substr(2, 9);
                 html += `
-                    <div class="collapsible-section" style="margin-bottom: 12px;">
-                        <div class="collapsible-header" onclick="toggleCollapsible('${sectionId}', this)">
+                    <div class="collapsible-section" style="margin-bottom: 8px;">
+                        <div class="collapsible-header expanded" onclick="toggleCollapsible('${sectionId}', this)">
                             <span class="collapsible-arrow">▶</span>
                             <span>How It Works</span>
                         </div>
-                        <div class="collapsible-body" id="${sectionId}">${escapeHtml(summary.how_it_works)}</div>
+                        <div class="collapsible-body show" id="${sectionId}">${escapeHtml(summary.how_it_works)}</div>
                     </div>`;
             }
-            
-            // Method Summaries (collapsible list)
+
+            // Method Summaries (expanded by default)
             if (summary.method_summaries && Object.keys(summary.method_summaries).length > 0) {
                 const methods = Object.entries(summary.method_summaries);
                 const sectionId = 'validate-methods-' + Math.random().toString(36).substr(2, 9);
                 html += `
-                    <div class="collapsible-section" style="margin-bottom: 12px;">
-                        <div class="collapsible-header" onclick="toggleCollapsible('${sectionId}', this)">
+                    <div class="collapsible-section" style="margin-bottom: 8px;">
+                        <div class="collapsible-header expanded" onclick="toggleCollapsible('${sectionId}', this)">
                             <span class="collapsible-arrow">▶</span>
                             <span>Methods (${methods.length})</span>
                         </div>
-                        <div class="collapsible-body" id="${sectionId}">
+                        <div class="collapsible-body show" id="${sectionId}">
                             <div class="method-summaries-list">`;
                 methods.forEach(([name, desc]) => {
                     html += `
@@ -3601,26 +3844,33 @@ async def web_dashboard(request):
             return parseInt(document.getElementById('validate-page-size').value) || 20;
         }
         
+        // Alias for refresh button
+        function loadValidateFiles() {
+            loadValidationQueue();
+        }
+
         async function loadValidationQueue() {
             const codebase = document.getElementById('validate-codebase').value;
             const status = document.getElementById('validate-status').value;
             const pattern = document.getElementById('validate-pattern').value;
             const domain = document.getElementById('validate-domain').value;
+            const sort = document.getElementById('validate-sort').value;
             const limit = getValidatePageSize();
-            
+
             if (!codebase) {
                 document.getElementById('validate-progress').textContent = 'Select a codebase';
                 return;
             }
-            
+
             document.getElementById('validate-list-content').innerHTML = '<div class="loading" style="padding: 20px;">Loading...</div>';
-            
+
             try {
                 const params = new URLSearchParams({
                     codebase,
                     status,
                     offset: validateOffset,
-                    limit
+                    limit,
+                    sort
                 });
                 if (pattern) params.append('pattern', pattern);
                 if (domain) params.append('domain', domain);
@@ -4041,7 +4291,7 @@ async def web_dashboard(request):
         });
         
         // Validate tab filter event listeners
-        ['validate-codebase', 'validate-status', 'validate-pattern', 'validate-domain', 'validate-page-size'].forEach(id => {
+        ['validate-codebase', 'validate-status', 'validate-pattern', 'validate-domain', 'validate-sort', 'validate-page-size'].forEach(id => {
             document.getElementById(id).addEventListener('change', () => {
                 validateOffset = 0;
                 validateSelectedIndex = -1;

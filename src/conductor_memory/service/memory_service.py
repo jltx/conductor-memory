@@ -4685,11 +4685,12 @@ Dependencies: {dependencies}"""
         pattern: str = "",
         domain: str = "",
         offset: int = 0,
-        limit: int = 20
+        limit: int = 20,
+        sort: str = "recent"
     ) -> Dict[str, Any]:
         """
         Get files for summary validation with pagination and filtering.
-        
+
         Args:
             codebase: Codebase name
             status: Filter by validation status: "unreviewed", "approved", "rejected", "all"
@@ -4697,7 +4698,8 @@ Dependencies: {dependencies}"""
             domain: Filter by domain (e.g., "api", "database")
             offset: Pagination offset
             limit: Page size (max 50)
-            
+            sort: Sort order: "recent" (most recently summarized), "alpha", "alpha-desc"
+
         Returns:
             Dict with paginated files list, counts, and filter options
         """
@@ -4754,11 +4756,20 @@ Dependencies: {dependencies}"""
                     "status": validation_status,
                     "pattern": file_pattern,
                     "domain": file_domain,
-                    "simple_file": info.get("simple_file", False)
+                    "simple_file": info.get("simple_file", False),
+                    "summarized_at": info.get("summarized_at", "")
                 })
-            
-            # Sort by path
-            files.sort(key=lambda f: f["path"])
+
+            # Apply sorting
+            if sort == "recent":
+                # Sort by summarized_at descending (most recent first)
+                files.sort(key=lambda f: f.get("summarized_at", ""), reverse=True)
+            elif sort == "alpha-desc":
+                # Sort by path descending (Z-A)
+                files.sort(key=lambda f: f["path"], reverse=True)
+            else:
+                # Default: alpha (A-Z)
+                files.sort(key=lambda f: f["path"])
             
             # Total before pagination
             total = len(files)
