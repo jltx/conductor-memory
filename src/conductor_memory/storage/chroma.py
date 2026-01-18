@@ -8,7 +8,7 @@ import os
 import logging
 import hashlib
 import time
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 from pathlib import Path
 from datetime import datetime
 import chromadb
@@ -37,7 +37,7 @@ class FileIndexMetadata:
         # Cache for get_all_indexed_files (invalidated on updates)
         self._cache: Optional[Dict[str, Dict[str, Any]]] = None
         self._cache_time: float = 0
-        self._cache_ttl: float = 5.0  # 5 second cache TTL
+        self._cache_ttl: float = 60.0  # 60 second cache TTL (was 5s, caused event loop blocking)
         
         try:
             self.collection = self.client.get_collection(name=collection_name)
@@ -155,20 +155,61 @@ class FileIndexMetadata:
         now = time.time()
         if self._cache is not None and (now - self._cache_time) < self._cache_ttl:
             return self._cache
-        
+
         indexed_files = {}
         try:
             result = self.collection.get(include=["metadatas"])
             if result["ids"]:
                 for i, file_path in enumerate(result["ids"]):
                     indexed_files[file_path] = result["metadatas"][i]
-            
+
             # Update cache
             self._cache = indexed_files
             self._cache_time = now
         except Exception as e:
             logger.warning(f"Error getting indexed files: {e}")
         return indexed_files
+
+    def get_indexed_files_paginated(
+        self, limit: int = 50, offset: int = 0
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        """
+        Get paginated list of indexed files with total count.
+
+        Uses ChromaDB's native limit/offset for efficient pagination without
+        loading the entire collection into memory.
+
+        Args:
+            limit: Maximum number of files to return
+            offset: Number of files to skip
+
+        Returns:
+            Tuple of (list of file dicts with path and metadata, total count)
+        """
+        try:
+            # Get total count (fast O(1) operation)
+            total = self.collection.count()
+
+            # Get paginated results
+            result = self.collection.get(
+                limit=limit,
+                offset=offset,
+                include=["metadatas"]
+            )
+
+            files = []
+            if result["ids"]:
+                for i, file_path in enumerate(result["ids"]):
+                    files.append({
+                        "path": file_path,
+                        **result["metadatas"][i]
+                    })
+
+            return files, total
+
+        except Exception as e:
+            logger.warning(f"Error getting paginated indexed files: {e}")
+            return [], 0
 
 
 # Schema version for summary index structure.
@@ -569,7 +610,69 @@ class SummaryIndexMetadata:
         except Exception as e:
             logger.debug(f"Error getting full summary for {file_path}: {e}")
             return None
-    
+
+    def get_full_summaries_batch(self, file_paths: List[str]) -> Dict[str, Dict[str, Any]]:
+        """
+        Get full structured summaries for multiple files in a single query.
+
+        This is much more efficient than calling get_full_summary() in a loop
+        as it makes a single ChromaDB query instead of N queries.
+
+        Args:
+            file_paths: List of relative file paths
+
+        Returns:
+            Dict mapping file_path -> summary data (or empty dict if not found)
+        """
+        import json
+
+        if not file_paths:
+            return {}
+
+        try:
+            result = self.collection.get(
+                ids=file_paths,
+                include=["documents", "metadatas"]
+            )
+
+            summaries = {}
+            for i, file_path in enumerate(result["ids"]):
+                metadata = result["metadatas"][i] if result["metadatas"] else {}
+                document = result["documents"][i] if result["documents"] else ""
+
+                # Parse document as JSON (new format)
+                summary_data = None
+                if document:
+                    try:
+                        summary_data = json.loads(document)
+                    except json.JSONDecodeError:
+                        # Old format: document is plain text
+                        summary_data = {
+                            "purpose": document,
+                            "pattern": metadata.get("pattern", ""),
+                            "domain": metadata.get("domain", ""),
+                            "model_used": metadata.get("model", ""),
+                        }
+
+                if not summary_data:
+                    summary_data = {}
+
+                # Merge metadata fields
+                summary_data["content_hash"] = metadata.get("content_hash", "")
+                summary_data["validation_status"] = metadata.get("validation_status", "unreviewed")
+                summary_data["summarized_at"] = metadata.get("summarized_at", "")
+                summary_data["summary_chunk_id"] = metadata.get("summary_chunk_id", "")
+                summary_data["has_how_it_works"] = metadata.get("has_how_it_works", False)
+                summary_data["has_method_summaries"] = metadata.get("has_method_summaries", False)
+
+                summaries[file_path] = summary_data
+
+            return summaries
+
+        except Exception as e:
+            logger.debug(f"Error getting batch summaries: {e}")
+            return {}
+
     def get_summary_stats(self) -> Dict[str, Any]:
         """Get summary statistics"""
         try:

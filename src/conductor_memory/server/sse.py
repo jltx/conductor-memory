@@ -103,6 +103,15 @@ async def indexing_status_api(request):
     return JSONResponse({"error": "Service not initialized"}, status_code=503)
 
 
+# Ultra-fast counts endpoint for dashboard polling
+@mcp.custom_route("/api/status/counts", methods=["GET"])
+async def status_counts_api(request):
+    """Get lightweight status counts (optimized for polling)."""
+    if memory_service:
+        return JSONResponse(memory_service.get_status_counts())
+    return JSONResponse({"error": "Service not initialized"}, status_code=503)
+
+
 # ChromaDB status API endpoint
 @mcp.custom_route("/api/chroma-status", methods=["GET"])
 async def chroma_status_api(request):

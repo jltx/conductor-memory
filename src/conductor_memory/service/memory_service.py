@@ -40,6 +40,7 @@ from ..search.verification import (
     Evidence,
 )
 from ..llm.summarizer import FileSummarizer, FileSummary
+from ..storage.postgres import PostgresMetadataStore
 
 logger = logging.getLogger(__name__)
 
@@ -165,7 +166,19 @@ class MemoryService:
         # Indexing completion tracking for callback-based summarizer startup
         self._indexing_completion_callbacks = []
         self._completed_codebases = set()
-        
+
+        # In-memory count cache (avoids slow ChromaDB count() queries)
+        # Structure: {codebase_name: {"indexed": int, "summarized": int}}
+        self._count_cache: Dict[str, Dict[str, int]] = {}
+        self._count_cache_initialized = False
+
+        # PostgreSQL metadata store (optional, for fast dashboard queries)
+        self._postgres: Optional[PostgresMetadataStore] = None
+        self._postgres_initialized = False
+        if config.postgres_url:
+            self._postgres = PostgresMetadataStore(config.postgres_url)
+            logger.info(f"PostgreSQL metadata store configured")
+
         # Initialize vector stores for each enabled codebase
         for codebase in config.get_enabled_codebases():
             self._init_codebase(codebase)
@@ -175,7 +188,7 @@ class MemoryService:
     
     async def _run_blocking(self, func, *args, **kwargs):
         """Run a blocking function in a thread pool executor.
-        
+
         Use this to wrap synchronous I/O operations (ChromaDB, embeddings)
         to prevent blocking the async event loop.
         """
@@ -183,6 +196,51 @@ class MemoryService:
         if kwargs:
             return await loop.run_in_executor(None, lambda: func(*args, **kwargs))
         return await loop.run_in_executor(None, func, *args)
+
+    async def _ensure_postgres(self) -> bool:
+        """
+        Lazily ensure PostgreSQL is connected.
+
+        Allows retry after startup failure - called on each API request.
+        Returns True if PostgreSQL is available, False otherwise.
+        """
+        logger.info("_ensure_postgres called")
+
+        # Already initialized and working
+        if self._postgres_initialized and self._postgres:
+            logger.debug("_ensure_postgres: already initialized")
+            return True
+
+        # No PostgreSQL URL configured
+        if not self.config.postgres_url:
+            logger.warning("_ensure_postgres: no postgres_url configured")
+            return False
+
+        logger.info("_ensure_postgres: attempting connection...")
+
+        # Recreate PostgreSQL store if it was set to None after failure
+        if self._postgres is None:
+            logger.info("_ensure_postgres: recreating PostgresMetadataStore")
+            self._postgres = PostgresMetadataStore(self.config.postgres_url)
+
+        try:
+            logger.info("_ensure_postgres: calling connect()...")
+            await self._postgres.connect()
+            self._postgres_initialized = True
+            logger.info("PostgreSQL metadata store connected (lazy init)")
+
+            # Ensure codebases exist in PostgreSQL
+            for codebase in self.config.get_enabled_codebases():
+                await self._postgres.upsert_codebase(
+                    name=codebase.name,
+                    path=codebase.path,
+                    description=codebase.description,
+                    enabled=codebase.enabled
+                )
+            return True
+        except Exception as e:
+            logger.warning(f"PostgreSQL lazy init failed: {e}")
+            return False
     
     def _init_codebase(self, codebase: CodebaseConfig) -> None:
         """Initialize vector store and status for a codebase"""
@@ -253,11 +311,31 @@ class MemoryService:
     async def initialize_async(self, wait_for_indexing: bool = False) -> None:
         """
         Start indexing and file watchers for all codebases.
-        
+
         Args:
             wait_for_indexing: If True, wait for all indexing to complete before returning.
                               If False, start indexing in background tasks.
         """
+        # Initialize PostgreSQL connection if configured
+        if self._postgres and not self._postgres_initialized:
+            try:
+                await self._postgres.connect()
+                self._postgres_initialized = True
+                logger.info("PostgreSQL metadata store connected")
+
+                # Ensure codebases exist in PostgreSQL
+                for codebase in self.config.get_enabled_codebases():
+                    await self._postgres.upsert_codebase(
+                        name=codebase.name,
+                        path=codebase.path,
+                        description=codebase.description,
+                        enabled=codebase.enabled
+                    )
+            except Exception as e:
+                logger.error(f"Failed to connect to PostgreSQL: {e}")
+                logger.warning("Falling back to ChromaDB-only mode")
+                self._postgres = None
+
         enabled_codebases = self.config.get_enabled_codebases()
         
         if not enabled_codebases:
@@ -2271,49 +2349,73 @@ class MemoryService:
         
         return deduplicated
     
+    def _scan_for_file_changes_sync(
+        self,
+        codebase: CodebaseConfig,
+        codebase_path: Path,
+        vector_store: ChromaVectorStore,
+        code_extensions: set
+    ) -> tuple:
+        """
+        Synchronous file scanning - runs in executor to avoid blocking event loop.
+
+        Returns:
+            Tuple of (indexed_files, current_file_paths, files_changed)
+        """
+        indexed_files = vector_store.get_indexed_files()
+        current_file_paths = set()
+        files_changed = []
+
+        for ext in code_extensions:
+            for file_path in codebase_path.rglob(f'*{ext}'):
+                if codebase.should_ignore(str(file_path)):
+                    continue
+
+                relative_path = str(file_path.relative_to(codebase_path))
+                current_file_paths.add(relative_path)
+
+                try:
+                    mtime = file_path.stat().st_mtime
+                    file_info = indexed_files.get(relative_path)
+                    if file_info and file_info.get("mtime") == mtime:
+                        continue
+
+                    with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                        content = f.read()
+                    content_hash = ChromaVectorStore.compute_content_hash(content)
+
+                    if vector_store.needs_reindex(relative_path, mtime, content_hash):
+                        files_changed.append((file_path, mtime, content_hash, content, relative_path in indexed_files))
+                except Exception as e:
+                    logger.debug(f"[{codebase.name}] Error checking file {file_path}: {e}")
+
+        return indexed_files, current_file_paths, files_changed
+
     async def _watch_for_changes(self, codebase: CodebaseConfig) -> None:
         """Background task to watch for file changes"""
         logger.info(f"[{codebase.name}] Starting file watcher for: {codebase.path}")
-        
+
         codebase_path = Path(codebase.path)
         vector_store = self._vector_stores[codebase.name]
         status = self._indexing_status[codebase.name]
         code_extensions = codebase.get_extension_set()
-        
+
         while True:
             try:
                 await asyncio.sleep(self._watch_interval)
-                
+
                 # Skip while indexing
                 if status["status"] == "indexing":
                     continue
-                
-                indexed_files = vector_store.get_indexed_files()
-                current_file_paths = set()
-                files_changed = []
-                
-                for ext in code_extensions:
-                    for file_path in codebase_path.rglob(f'*{ext}'):
-                        if codebase.should_ignore(str(file_path)):
-                            continue
-                        
-                        relative_path = str(file_path.relative_to(codebase_path))
-                        current_file_paths.add(relative_path)
-                        
-                        try:
-                            mtime = file_path.stat().st_mtime
-                            file_info = indexed_files.get(relative_path)
-                            if file_info and file_info.get("mtime") == mtime:
-                                continue
-                            
-                            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                                content = f.read()
-                            content_hash = ChromaVectorStore.compute_content_hash(content)
-                            
-                            if vector_store.needs_reindex(relative_path, mtime, content_hash):
-                                files_changed.append((file_path, mtime, content_hash, content, relative_path in indexed_files))
-                        except Exception as e:
-                            logger.debug(f"[{codebase.name}] Error checking file {file_path}: {e}")
+
+                # Run entire file scan in executor to avoid blocking event loop
+                indexed_files, current_file_paths, files_changed = await self._run_blocking(
+                    self._scan_for_file_changes_sync,
+                    codebase,
+                    codebase_path,
+                    vector_store,
+                    code_extensions
+                )
                 
                 # Handle deleted files
                 deleted_files = set(indexed_files.keys()) - current_file_paths
@@ -3184,7 +3286,11 @@ Dependencies: {dependencies}"""
             )
         
         logger.debug(f"[Summarization] Stored summary for: {file_path}")
-    
+
+        # Update count cache (only increment if this was a new summary, not an update)
+        if not existing_info:
+            self._update_count_cache(codebase, summarized_delta=1)
+
     async def stop_background_summarizer_async(self) -> None:
         """Stop the background summarization task/thread."""
         # Stop the thread if running
@@ -3300,30 +3406,35 @@ Dependencies: {dependencies}"""
     
     def get_summarization_status_basic(self) -> Dict[str, Any]:
         """
-        Get basic summarization status (fast, uses count() for totals).
-        
-        This version uses collection.count() for totals instead of fetching
-        all document metadata. Suitable for health checks and dashboard polling.
-        
+        Get basic summarization status (fast, uses in-memory cache).
+
+        This version uses the in-memory count cache instead of querying
+        ChromaDB. Suitable for health checks and dashboard polling.
+
         Returns:
             Dictionary with basic summarization status including timing info
         """
-        # Get summary counts from all codebases using fast count() method
+        # Initialize cache if needed (one-time startup cost)
+        if not self._count_cache_initialized:
+            self._initialize_count_cache()
+
+        # Get summary counts from in-memory cache (instant)
         total_summarized = 0
+        summary_stats_by_codebase = {}
+
+        for codebase_name in self._vector_stores.keys():
+            counts = self._count_cache.get(codebase_name, {})
+            summarized = counts.get("summarized", 0)
+            total_summarized += summarized
+            summary_stats_by_codebase[codebase_name] = {
+                "total_summarized": summarized,
+                "simple_count": None,  # Not tracked in cache
+                "llm_count": None,
+            }
+
+        # simple/llm breakdown not available from cache
         total_simple = 0
         total_llm = 0
-        summary_stats_by_codebase = {}
-        
-        for codebase_name, vector_store in self._vector_stores.items():
-            try:
-                # Use get_summary_stats for per-codebase breakdown
-                stats = vector_store.summary_index.get_summary_stats()
-                summary_stats_by_codebase[codebase_name] = stats
-                total_summarized += stats.get("total_summarized", 0)
-                total_simple += stats.get("simple_count", 0)
-                total_llm += stats.get("llm_count", 0)
-            except Exception as e:
-                logger.debug(f"[{codebase_name}] Error getting summary count: {e}")
         
         # Use thread-safe queue size (the threaded queue is what's actually being processed)
         files_queued = self._summary_queue_threaded.qsize() if self._summary_queue_threaded else 0
@@ -3364,7 +3475,83 @@ Dependencies: {dependencies}"""
             "estimated_time_remaining_minutes": estimated_time_remaining / 60.0,
             "total_processing_time_seconds": self._summarization_stats.get("total_time_seconds", 0.0)
         }
-    
+
+    def _initialize_count_cache(self) -> None:
+        """
+        Initialize count cache from ChromaDB (called once at startup).
+
+        This queries ChromaDB once to populate the in-memory cache.
+        Subsequent operations update the cache incrementally.
+        """
+        if self._count_cache_initialized:
+            return
+
+        logger.info("Initializing count cache from ChromaDB...")
+        start = time.time()
+
+        for codebase_name, vector_store in self._vector_stores.items():
+            try:
+                indexed = vector_store.file_index.collection.count()
+                summarized = vector_store.summary_index.get_summary_count()
+                self._count_cache[codebase_name] = {
+                    "indexed": indexed,
+                    "summarized": summarized,
+                }
+            except Exception as e:
+                logger.warning(f"Failed to get counts for {codebase_name}: {e}")
+                self._count_cache[codebase_name] = {"indexed": 0, "summarized": 0}
+
+        self._count_cache_initialized = True
+        elapsed = (time.time() - start) * 1000
+        logger.info(f"Count cache initialized in {elapsed:.0f}ms")
+
+    def _update_count_cache(self, codebase: str, indexed_delta: int = 0, summarized_delta: int = 0) -> None:
+        """Update count cache incrementally (call when files are added/removed)."""
+        if codebase not in self._count_cache:
+            self._count_cache[codebase] = {"indexed": 0, "summarized": 0}
+
+        self._count_cache[codebase]["indexed"] += indexed_delta
+        self._count_cache[codebase]["summarized"] += summarized_delta
+
+    def get_status_counts(self) -> Dict[str, Any]:
+        """
+        Get ultra-lightweight status counts for dashboard polling.
+
+        Returns counts from in-memory cache (instant, never queries ChromaDB).
+        Cache is populated once at startup and updated incrementally.
+
+        Returns:
+            Dictionary with minimal status info for polling
+        """
+        start = time.time()
+
+        # Initialize cache if needed (one-time startup cost)
+        if not self._count_cache_initialized:
+            logger.info("get_status_counts: cache not initialized, initializing...")
+            self._initialize_count_cache()
+        else:
+            logger.debug("get_status_counts: using cached counts")
+
+        # Sum counts from cache (instant - no ChromaDB queries)
+        total_indexed = sum(c.get("indexed", 0) for c in self._count_cache.values())
+        total_summarized = sum(c.get("summarized", 0) for c in self._count_cache.values())
+
+        elapsed = (time.time() - start) * 1000
+        logger.info(f"get_status_counts completed in {elapsed:.0f}ms (cached={self._count_cache_initialized})")
+
+        # Queue stats from in-memory (instant, always fresh)
+        files_queued = self._summary_queue_threaded.qsize() if self._summary_queue_threaded else 0
+
+        return {
+            "total_indexed": total_indexed,
+            "total_summarized": total_summarized,
+            "files_queued": files_queued,
+            "is_running": self._summarization_stats["is_running"],
+            "current_file": self._summarization_stats["current_file"],
+            "files_completed": self._summarization_stats["files_summarized"],
+            "files_failed": self._summarization_stats["files_failed"],
+        }
+
     async def queue_file_for_summarization(
         self, 
         codebase_name: str, 
@@ -3693,7 +3880,7 @@ Dependencies: {dependencies}"""
     ) -> Dict[str, Any]:
         """
         List indexed files with pagination and filtering support.
-        
+
         Args:
             codebase: Codebase name (None = first available)
             limit: Maximum number of results
@@ -3703,12 +3890,34 @@ Dependencies: {dependencies}"""
             pattern: Filter by pattern from summary (e.g., "service", "utility")
             domain: Filter by domain from summary (e.g., "api", "database")
             language: Filter by programming language
-            
+
         Returns:
             Dict with files list, total count, and pagination info
         """
         if not self._vector_stores:
             return {"error": "No codebases configured", "files": [], "total": 0}
+
+        # FAST PATH: Use PostgreSQL if available (sub-50ms queries)
+        if not search_filter and await self._ensure_postgres():
+            try:
+                files, total = await self._postgres.get_files_paginated(
+                    codebase=codebase,
+                    limit=limit,
+                    offset=offset,
+                    has_summary=has_summary,
+                    pattern=pattern,
+                    domain=domain
+                )
+                return {
+                    "files": files,
+                    "total": total,
+                    "limit": limit,
+                    "offset": offset,
+                    "codebase": codebase or next(iter(self._vector_stores.keys())),
+                    "source": "postgresql"
+                }
+            except Exception as e:
+                logger.warning(f"PostgreSQL query failed, falling back to ChromaDB: {e}")
         
         # Get target codebase
         if codebase:
@@ -3721,79 +3930,110 @@ Dependencies: {dependencies}"""
             vector_store = self._vector_stores[codebase]
         
         try:
-            # Get all indexed files
-            indexed_files = vector_store.file_index.get_all_indexed_files()
-            
-            # Get all summarized files with their data for filtering
-            summarized_files = vector_store.summary_index.get_all_summarized_files()
-            
-            # Build file list with metadata
-            files = []
-            for file_path, metadata in indexed_files.items():
-                # Apply search filter if provided
-                if search_filter and search_filter.lower() not in file_path.lower():
-                    continue
-                
-                file_has_summary = file_path in summarized_files
-                summary_data = summarized_files.get(file_path, {}) if file_has_summary else {}
-                
-                # Apply has_summary filter
-                if has_summary is not None:
-                    if has_summary and not file_has_summary:
+            # Check if any filters are applied
+            has_filters = any([search_filter, has_summary is not None, pattern, domain, language])
+
+            if not has_filters:
+                # FAST PATH: No filters - use database-level pagination
+                paginated_files, total = vector_store.file_index.get_indexed_files_paginated(
+                    limit=limit, offset=offset
+                )
+
+                # Get summary data for just these files (cached, fast lookup)
+                summarized_files = vector_store.summary_index.get_all_summarized_files()
+
+                files = []
+                for file_data in paginated_files:
+                    file_path = file_data["path"]
+                    file_has_summary = file_path in summarized_files
+                    summary_data = summarized_files.get(file_path, {})
+
+                    chunk_ids_str = file_data.get("chunk_ids", "")
+                    chunk_count = len(chunk_ids_str.split(",")) if chunk_ids_str else 0
+
+                    files.append({
+                        "path": file_path,
+                        "mtime": file_data.get("mtime"),
+                        "content_hash": file_data.get("content_hash", "")[:12] + "...",
+                        "chunk_count": chunk_count,
+                        "indexed_at": file_data.get("indexed_at"),
+                        "has_summary": file_has_summary,
+                        "pattern": summary_data.get("pattern"),
+                        "domain": summary_data.get("domain"),
+                        "simple_file": summary_data.get("simple_file", False),
+                        "simple_file_reason": summary_data.get("simple_file_reason")
+                    })
+            else:
+                # FILTERED PATH: Need to load all and filter in Python
+                indexed_files = vector_store.file_index.get_all_indexed_files()
+                summarized_files = vector_store.summary_index.get_all_summarized_files()
+
+                files = []
+                for file_path, metadata in indexed_files.items():
+                    # Apply search filter if provided
+                    if search_filter and search_filter.lower() not in file_path.lower():
                         continue
-                    if not has_summary and file_has_summary:
-                        continue
-                
-                # Apply pattern filter (from summary)
-                if pattern:
-                    file_pattern = summary_data.get("pattern", "")
-                    if pattern.lower() != file_pattern.lower():
-                        continue
-                
-                # Apply domain filter (from summary)
-                if domain:
-                    file_domain = summary_data.get("domain", "")
-                    if domain.lower() != file_domain.lower():
-                        continue
-                
-                # Apply language filter (from file extension)
-                if language:
-                    ext_to_lang = {
-                        ".py": "python",
-                        ".kt": "kotlin",
-                        ".java": "java",
-                        ".ts": "typescript",
-                        ".tsx": "typescript",
-                        ".js": "javascript",
-                        ".jsx": "javascript",
-                    }
-                    file_ext = "." + file_path.rsplit(".", 1)[-1].lower() if "." in file_path else ""
-                    file_language = ext_to_lang.get(file_ext, "")
-                    if language.lower() != file_language:
-                        continue
-                
-                chunk_ids_str = metadata.get("chunk_ids", "")
-                chunk_count = len(chunk_ids_str.split(",")) if chunk_ids_str else 0
-                
-                files.append({
-                    "path": file_path,
-                    "mtime": metadata.get("mtime"),
-                    "content_hash": metadata.get("content_hash", "")[:12] + "...",  # Truncate hash
-                    "chunk_count": chunk_count,
-                    "indexed_at": metadata.get("indexed_at"),
-                    "has_summary": file_has_summary,
-                    "pattern": summary_data.get("pattern"),
-                    "domain": summary_data.get("domain"),
-                    "simple_file": summary_data.get("simple_file", False),
-                    "simple_file_reason": summary_data.get("simple_file_reason")
-                })
-            
-            # Sort by path
-            files.sort(key=lambda f: f["path"])
-            
-            # Apply pagination
-            total = len(files)
-            files = files[offset:offset + limit]
+
+                    file_has_summary = file_path in summarized_files
+                    summary_data = summarized_files.get(file_path, {}) if file_has_summary else {}
+
+                    # Apply has_summary filter
+                    if has_summary is not None:
+                        if has_summary and not file_has_summary:
+                            continue
+                        if not has_summary and file_has_summary:
+                            continue
+
+                    # Apply pattern filter (from summary)
+                    if pattern:
+                        file_pattern = summary_data.get("pattern", "")
+                        if pattern.lower() != file_pattern.lower():
+                            continue
+
+                    # Apply domain filter (from summary)
+                    if domain:
+                        file_domain = summary_data.get("domain", "")
+                        if domain.lower() != file_domain.lower():
+                            continue
+
+                    # Apply language filter (from file extension)
+                    if language:
+                        ext_to_lang = {
+                            ".py": "python",
+                            ".kt": "kotlin",
+                            ".java": "java",
+                            ".ts": "typescript",
+                            ".tsx": "typescript",
+                            ".js": "javascript",
+                            ".jsx": "javascript",
+                        }
+                        file_ext = "." + file_path.rsplit(".", 1)[-1].lower() if "." in file_path else ""
+                        file_language = ext_to_lang.get(file_ext, "")
+                        if language.lower() != file_language:
+                            continue
+
+                    chunk_ids_str = metadata.get("chunk_ids", "")
+                    chunk_count = len(chunk_ids_str.split(",")) if chunk_ids_str else 0
+
+                    files.append({
+                        "path": file_path,
+                        "mtime": metadata.get("mtime"),
+                        "content_hash": metadata.get("content_hash", "")[:12] + "...",
+                        "chunk_count": chunk_count,
+                        "indexed_at": metadata.get("indexed_at"),
+                        "has_summary": file_has_summary,
+                        "pattern": summary_data.get("pattern"),
+                        "domain": summary_data.get("domain"),
+                        "simple_file": summary_data.get("simple_file", False),
+                        "simple_file_reason": summary_data.get("simple_file_reason")
+                    })
+
+                # Sort by path
+                files.sort(key=lambda f: f["path"])
+
+                # Apply pagination
+                total = len(files)
+                files = files[offset:offset + limit]
             
             return {
                 "codebase": codebase,
@@ -3826,10 +4066,18 @@ Dependencies: {dependencies}"""
         vector_store = self._vector_stores.get(codebase)
         if not vector_store:
             return {"error": f"Codebase not found: {codebase}"}
-        
+
         try:
-            # Get file index metadata
+            # Get file index metadata - try both path separator formats
             file_info = vector_store.file_index.get_file_info(file_path)
+            if not file_info:
+                # Try with normalized forward slashes
+                normalized_path = file_path.replace("\\", "/")
+                file_info = vector_store.file_index.get_file_info(normalized_path)
+            if not file_info:
+                # Try with backslashes
+                normalized_path = file_path.replace("/", "\\")
+                file_info = vector_store.file_index.get_file_info(normalized_path)
             if not file_info:
                 return {"error": f"File not found in index: {file_path}"}
             
@@ -4009,18 +4257,51 @@ Dependencies: {dependencies}"""
     ) -> Dict[str, Any]:
         """
         List files that have LLM-generated summaries.
-        
+
         Args:
             codebase: Codebase name (None = first available)
             limit: Maximum number of results
             offset: Offset for pagination
-            
+
         Returns:
             Dict with summaries list, total count, and pagination info
         """
         if not self._vector_stores:
             return {"error": "No codebases configured", "summaries": [], "total": 0}
-        
+
+        # FAST PATH: Use PostgreSQL if available (sub-50ms queries)
+        if await self._ensure_postgres():
+            try:
+                summaries, total = await self._postgres.get_summaries_paginated(
+                    codebase=codebase,
+                    limit=limit,
+                    offset=offset
+                )
+                return {
+                    "codebase": codebase or next(iter(self._vector_stores.keys())),
+                    "summaries": [
+                        {
+                            "file_path": s.get("relative_path", s.get("file_path", "")),
+                            "pattern": s.get("pattern", ""),
+                            "domain": s.get("domain", ""),
+                            "model": "llm",
+                            "summarized_at": s.get("created_at", ""),
+                            "content_preview": (s.get("summary_text", "")[:300] + "...")
+                                if len(s.get("summary_text", "")) > 300
+                                else s.get("summary_text", ""),
+                            "content": s.get("summary_text", "")
+                        }
+                        for s in summaries
+                    ],
+                    "total": total,
+                    "limit": limit,
+                    "offset": offset,
+                    "has_more": offset + limit < total,
+                    "source": "postgresql"
+                }
+            except Exception as e:
+                logger.warning(f"PostgreSQL query failed, falling back to ChromaDB: {e}")
+
         # Get target codebase
         if codebase:
             vector_store = self._vector_stores.get(codebase)
@@ -4031,26 +4312,26 @@ Dependencies: {dependencies}"""
             vector_store = self._vector_stores[codebase]
         
         try:
-            # Get all summarized files
+            # Get all summarized files metadata (cached, fast)
             summarized_files = vector_store.summary_index.get_all_summarized_files()
-            
-            # Build summary list
+
+            # Sort file paths and apply pagination BEFORE fetching content
+            sorted_paths = sorted(summarized_files.keys())
+            total = len(sorted_paths)
+            page_paths = sorted_paths[offset:offset + limit]
+
+            # Batch fetch full summaries for only the current page (1 query instead of N)
+            full_summaries = vector_store.summary_index.get_full_summaries_batch(page_paths)
+
+            # Build summary list from batch results
             summaries = []
-            for file_path, info in summarized_files.items():
-                # Fetch summary content
-                summary_content = ""
-                summary_chunk_id = info.get("summary_chunk_id")
-                if summary_chunk_id:
-                    try:
-                        result = vector_store.collection.get(
-                            ids=[summary_chunk_id],
-                            include=["documents"]
-                        )
-                        if result["ids"] and result["documents"]:
-                            summary_content = result["documents"][0]
-                    except Exception:
-                        pass
-                
+            for file_path in page_paths:
+                info = summarized_files.get(file_path, {})
+                summary_data = full_summaries.get(file_path, {})
+
+                # Get purpose/content from full summary
+                summary_content = summary_data.get("purpose", "")
+
                 summaries.append({
                     "file_path": file_path,
                     "pattern": info.get("pattern", ""),
@@ -4060,14 +4341,7 @@ Dependencies: {dependencies}"""
                     "content_preview": summary_content[:300] + "..." if len(summary_content) > 300 else summary_content,
                     "content": summary_content
                 })
-            
-            # Sort by file path
-            summaries.sort(key=lambda s: s["file_path"])
-            
-            # Apply pagination
-            total = len(summaries)
-            summaries = summaries[offset:offset + limit]
-            
+
             return {
                 "codebase": codebase,
                 "summaries": summaries,
@@ -4514,11 +4788,16 @@ Dependencies: {dependencies}"""
         vector_store = self._vector_stores.get(codebase)
         if not vector_store:
             return {"error": f"Codebase not found: {codebase}"}
-        
+
         try:
             # Use the new get_full_summary method which parses stored JSON
+            # Try both path separator formats for Windows compatibility
             full_summary = vector_store.summary_index.get_full_summary(file_path)
-            
+            if not full_summary:
+                full_summary = vector_store.summary_index.get_full_summary(file_path.replace("\\", "/"))
+            if not full_summary:
+                full_summary = vector_store.summary_index.get_full_summary(file_path.replace("/", "\\"))
+
             if not full_summary:
                 return {"codebase": codebase, "file_path": file_path, "summary": None}
             

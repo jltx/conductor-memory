@@ -54,7 +54,7 @@ class ChromaServerManager:
     async def is_healthy(self) -> bool:
         """Check if ChromaDB server is responding to health checks."""
         try:
-            async with httpx.AsyncClient(timeout=2.0) as client:
+            async with httpx.AsyncClient(timeout=5.0) as client:
                 # Try v1 heartbeat first, then v2
                 for endpoint in ["/api/v1/heartbeat", "/api/v2/heartbeat"]:
                     try:
@@ -71,11 +71,11 @@ class ChromaServerManager:
         """Synchronous health check for use during startup."""
         import urllib.request
         import urllib.error
-        
+
         for endpoint in ["/api/v1/heartbeat", "/api/v2/heartbeat"]:
             try:
                 req = urllib.request.Request(f"{self.base_url}{endpoint}")
-                with urllib.request.urlopen(req, timeout=2.0) as response:
+                with urllib.request.urlopen(req, timeout=5.0) as response:
                     if response.status == 200:
                         return True
             except Exception:
@@ -222,30 +222,45 @@ class ChromaServerManager:
         """Monitor ChromaDB server and restart if needed."""
         restart_count = 0
         max_restarts = 5
-        
+        consecutive_failures = 0
+        failures_before_restart = 3  # Require 3 consecutive failures before restart
+
         while not self._shutdown_event.is_set():
             await asyncio.sleep(self.health_check_interval)
-            
+
             if self._shutdown_event.is_set():
                 break
-            
-            if not self.is_running() or not await self.is_healthy():
+
+            # Check if process is running and healthy
+            process_running = self.is_running()
+            is_healthy = await self.is_healthy() if process_running else False
+
+            if not process_running or not is_healthy:
+                consecutive_failures += 1
+                if consecutive_failures < failures_before_restart:
+                    # Don't restart yet - ChromaDB might just be busy
+                    logger.debug(f"ChromaDB health check failed ({consecutive_failures}/{failures_before_restart})")
+                    continue
+
+                # Too many consecutive failures - restart
                 if restart_count >= max_restarts:
                     logger.error(f"ChromaDB server failed {max_restarts} times, giving up")
                     break
-                
+
                 restart_count += 1
-                logger.warning(f"ChromaDB server not healthy, restarting (attempt {restart_count}/{max_restarts})")
-                
+                consecutive_failures = 0
+                logger.warning(f"ChromaDB server not healthy after {failures_before_restart} checks, restarting (attempt {restart_count}/{max_restarts})")
+
                 # Kill existing process if any
                 self.stop_sync()
-                
+
                 # Restart
                 loop = asyncio.get_event_loop()
                 if await loop.run_in_executor(None, self.start_sync):
                     restart_count = 0  # Reset on successful restart
             else:
-                restart_count = 0  # Reset on healthy check
+                consecutive_failures = 0  # Reset on healthy check
+                restart_count = 0
     
     async def stop(self) -> None:
         """Stop the ChromaDB server subprocess."""

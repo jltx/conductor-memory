@@ -61,4 +61,14 @@ config.json
 # OS
 .DS_Store
 Thumbs.db
+NUL
+
+# Benchmark/test results
 /benchmark_results.json
+
+# Claude Code
+.claude/
+
+# Temp files
+tmpclaude-*/
+test_schema_version_tmp/

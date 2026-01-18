@@ -236,6 +236,11 @@ class ServerConfig:
     # Path for ChromaDB server data (when running in http mode)
     # If None, uses persist_directory + "/chroma-server"
     chroma_server_path: Optional[str] = None
+
+    # PostgreSQL connection URL for metadata storage (optional)
+    # If set, metadata is stored in PostgreSQL for faster dashboard queries
+    # Example: "postgresql://user:pass@host:5432/conductor_memory"
+    postgres_url: Optional[str] = None
     
     def __post_init__(self):
         """Validate and normalize the configuration"""
@@ -270,7 +275,8 @@ class ServerConfig:
             'chroma_mode': self.chroma_mode,
             'chroma_host': self.chroma_host,
             'chroma_port': self.chroma_port,
-            'chroma_server_path': self.chroma_server_path
+            'chroma_server_path': self.chroma_server_path,
+            'postgres_url': self.postgres_url
         }
     
     @classmethod
@@ -297,7 +303,8 @@ class ServerConfig:
             chroma_mode=data.get('chroma_mode', 'embedded'),
             chroma_host=data.get('chroma_host', 'localhost'),
             chroma_port=data.get('chroma_port', 8000),
-            chroma_server_path=data.get('chroma_server_path')
+            chroma_server_path=data.get('chroma_server_path'),
+            postgres_url=data.get('postgres_url')
         )
     
     @classmethod
