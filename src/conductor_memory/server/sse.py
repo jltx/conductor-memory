@@ -2871,12 +2871,14 @@ async def web_dashboard(request):
         let browseViewMode = 'tree';  // 'tree' or 'list'
 
         function setBrowseViewMode(mode) {
+            if (browseViewMode === mode) return;
             browseViewMode = mode;
             document.getElementById('btn-tree-view').classList.toggle('active', mode === 'tree');
             document.getElementById('btn-list-view').classList.toggle('active', mode === 'list');
-            // Re-render current data
-            if (browseData.currentView === 'files' && browseData.files.length > 0) {
-                renderFilesList({ files: browseData.files, total: browseData.total || browseData.files.length, offset: browseData.offset || 0 });
+            // Reload data - tree needs all files, list needs paginated
+            if (browseData.currentView === 'files') {
+                currentBrowseOffset = 0;
+                loadBrowseData();
             }
         }
 
@@ -3015,20 +3017,25 @@ async def web_dashboard(request):
                 let url, data;
                 
                 if (view === 'files') {
-                    url = `/api/files?codebase=${codebase}&limit=${BROWSE_LIMIT}&offset=${currentBrowseOffset}`;
+                    // Tree view fetches all files, list view uses pagination
+                    if (browseViewMode === 'tree') {
+                        url = `/api/files?codebase=${codebase}&limit=5000`;
+                    } else {
+                        url = `/api/files?codebase=${codebase}&limit=${BROWSE_LIMIT}&offset=${currentBrowseOffset}`;
+                    }
                     if (filter) url += `&filter=${encodeURIComponent(filter)}`;
-                    
+
                     // Add quick filter params
                     const hasSummary = document.getElementById('filter-has-summary').value;
                     const pattern = document.getElementById('filter-pattern').value;
                     const domain = document.getElementById('filter-domain').value;
                     const language = document.getElementById('filter-language').value;
-                    
+
                     if (hasSummary) url += `&has_summary=${hasSummary}`;
                     if (pattern) url += `&pattern=${encodeURIComponent(pattern)}`;
                     if (domain) url += `&domain=${encodeURIComponent(domain)}`;
                     if (language) url += `&language=${encodeURIComponent(language)}`;
-                    
+
                     const res = await fetch(url);
                     data = await res.json();
                     browseData.files = data.files || [];
@@ -3068,6 +3075,7 @@ async def web_dashboard(request):
         function renderFilesList(data) {
             const listContent = document.getElementById('browse-list-content');
             const countSpan = document.getElementById('browse-list-count');
+            const paginationEl = document.getElementById('browse-pagination');
             const files = data.files || [];
 
             // Store data for view mode switching
@@ -3081,20 +3089,23 @@ async def web_dashboard(request):
             if (files.length === 0) {
                 listContent.innerHTML = `<div class="empty-state" style="padding: 40px;">No files found${filterNote ? ' - try clearing filters' : ''}</div>`;
                 countSpan.textContent = `0 files${filterNote}`;
-                renderPagination(0, 0);
+                paginationEl.style.display = 'none';
                 return;
             }
-
-            countSpan.textContent = `${data.offset + 1}-${data.offset + files.length} of ${data.total} files${filterNote}`;
 
             let html = '';
 
             if (browseViewMode === 'tree') {
-                // Tree view
+                // Tree view - show total count, hide pagination
+                countSpan.textContent = `${files.length} files${filterNote}`;
+                paginationEl.style.display = 'none';
                 const tree = buildFileTree(files);
                 html = renderTreeNode(tree);
             } else {
-                // List view
+                // List view - show range and pagination
+                countSpan.textContent = `${data.offset + 1}-${data.offset + files.length} of ${data.total} files${filterNote}`;
+                paginationEl.style.display = 'flex';
+                renderPagination(data.total, data.offset);
                 files.forEach((f, idx) => {
                     const patternTag = f.pattern ? `<span class="tag" style="font-size: 10px;">${f.pattern}</span>` : '';
                     const summaryBadge = getSummaryBadge(f.has_summary, f.simple_file, f.simple_file_reason);
@@ -3112,7 +3123,6 @@ async def web_dashboard(request):
             }
 
             listContent.innerHTML = html;
-            renderPagination(data.total, data.offset);
         }
         
         function selectFileItem(idx) {
