@@ -22,6 +22,7 @@ class ChunkingStrategy(str, Enum):
     PARAGRAPH = "paragraph"
     SENTENCE = "sentence"
     TOKEN_WINDOW = "token_window"
+    JSONL_CONVERSATION = "jsonl_conversation"  # Claude Code conversation files
 
 @dataclass
 class ChunkMetadata:
@@ -153,12 +154,22 @@ class ChunkingManager:
     def chunk_text(self, text: str, file_path: str, commit_hash: Optional[str] = None) -> List[Tuple[str, ChunkMetadata]]:
         """
         Split text into chunks based on the configured strategy.
-        
+
         After chunking, enhances each chunk with implementation signals
         (method calls, attribute access, subscripts) for better searchability.
-        
+
         Returns list of (chunk_text, metadata) tuples
         """
+        # Check for conversation files first (JSONL format)
+        if file_path.endswith('.jsonl'):
+            try:
+                from .parsers import ConversationParser
+                parser = ConversationParser()
+                return parser.parse(text, file_path, commit_hash)
+            except Exception as e:
+                logger.warning(f"Conversation parsing failed for {file_path}: {e}, falling back to token window")
+                return self._chunk_by_token_window(text, file_path, commit_hash)
+
         # Try tree-sitter first for supported languages
         if self.tree_sitter_parser and self.tree_sitter_parser.supports(file_path):
             try:
