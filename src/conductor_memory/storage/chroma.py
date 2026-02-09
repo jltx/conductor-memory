@@ -954,8 +954,8 @@ class ChromaVectorStore(VectorStore):
         chunks = []
         if results["ids"] and results["ids"][0]:
             for i, chunk_id in enumerate(results["ids"][0]):
-                metadata = results["metadatas"][0][i]
-                document = results["documents"][0][i]
+                metadata = results["metadatas"][0][i] if results["metadatas"] else {}
+                document = results["documents"][0][i] if results["documents"] else ""
                 
                 # Calculate relevance score from ChromaDB distance
                 # ChromaDB returns cosine distance (0 = identical, 2 = opposite)
