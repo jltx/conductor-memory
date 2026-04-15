@@ -4593,35 +4593,7 @@ async def memory_search(
     include_summaries: bool = False,
     boost_summarized: bool = True
 ) -> dict[str, Any]:
-    """
-    Search for relevant memories using semantic similarity, keyword matching, or both.
-    
-    Args:
-        query: Search query for semantic similarity
-        max_results: Maximum number of results to return (default 10)
-        project_id: Optional filter by project ID
-        codebase: Optional codebase name to search (None = search all codebases)
-        min_relevance: Minimum relevance score 0-1 (default 0.1)
-        search_mode: Search mode - "auto" (default), "semantic", "keyword", "hybrid", or "verify"
-        include_tags: Include only results matching these tags (supports prefix:* patterns)
-        exclude_tags: Exclude results matching these tags (supports prefix:* patterns)
-        languages: Filter by programming languages (e.g., ['python', 'java'])
-        class_names: Filter by class names (e.g., ['UserService', 'TestClass'])
-        function_names: Filter by function names (e.g., ['process_data', 'validate'])
-        annotations: Filter by annotations (e.g., ['@Test', '@Component'])
-        has_annotations: Filter files that have/don't have annotations
-        has_docstrings: Filter files that have/don't have docstrings
-        min_class_count: Minimum number of classes in file
-        min_function_count: Minimum number of functions in file
-        calls: Filter by method calls (matches calls:* tags, e.g., ['iloc', 'fit'])
-        accesses: Filter by attribute access (matches reads:* tags, e.g., ['bar_index'])
-        subscripts: Filter by subscript patterns (matches subscript:* tags, e.g., ['iloc'])
-        include_summaries: Include file summary data in results (Phase 5)
-        boost_summarized: Apply relevance boost to files with summaries (Phase 5)
-    
-    Returns:
-        Dictionary with search results and metadata including search_mode_used
-    """
+    """Search memories via semantic/keyword/hybrid matching. Filters: tags, languages, class/function names, calls, accesses."""  # noqa: E501
     if not memory_service:
         return {"error": "Memory service not initialized", "results": []}
     
@@ -4660,21 +4632,7 @@ async def memory_store(
     pin: bool = False,
     source: str = "opencode"
 ) -> dict[str, Any]:
-    """
-    Store a new memory chunk for later retrieval.
-    
-    Args:
-        content: The text content to store
-        project_id: Project identifier (default "default")
-        codebase: Codebase to store in (default: first configured codebase)
-        role: Role of the memory - user, assistant, system, tool (default "user")
-        tags: Optional list of tags for categorization
-        pin: Pin this memory to prevent pruning (default False)
-        source: Source of the memory (default "opencode")
-    
-    Returns:
-        Dictionary with stored memory details
-    """
+    """Store a memory chunk for later retrieval."""
     if not memory_service:
         return {"error": "Memory service not initialized", "success": False}
     
@@ -4698,10 +4656,7 @@ async def memory_store_decision(
     project_id: str = "default",
     codebase: str | None = None
 ) -> dict[str, Any]:
-    """
-    Store an architectural decision for later retrieval.
-    Decisions are automatically pinned and tagged as 'decision'.
-    """
+    """Store an architectural decision (auto-pinned, tagged 'decision')."""
     if not memory_service:
         return {"error": "Memory service not initialized", "success": False}
     
@@ -4730,10 +4685,7 @@ async def memory_store_lesson(
     project_id: str = "default",
     codebase: str | None = None
 ) -> dict[str, Any]:
-    """
-    Store a debugging insight or lesson learned for later retrieval.
-    Lessons are automatically pinned and tagged as 'lesson'.
-    """
+    """Store a debugging lesson (auto-pinned, tagged 'lesson')."""
     if not memory_service:
         return {"error": "Memory service not initialized", "success": False}
     
@@ -4757,12 +4709,7 @@ async def memory_store_lesson(
 
 @mcp.tool()
 async def memory_status() -> dict[str, Any]:
-    """
-    Get the current status of the memory system.
-    
-    Returns:
-        Dictionary with memory system status including indexing progress
-    """
+    """Get memory system status and indexing progress."""
     if not memory_service:
         return {"error": "Memory service not initialized"}
     
@@ -4775,9 +4722,7 @@ async def memory_prune(
     project_id: str | None = None,
     max_age_days: int = 30
 ) -> dict[str, Any]:
-    """
-    Prune obsolete memories based on age and relevance.
-    """
+    """Prune obsolete memories by age and relevance."""
     if not memory_service:
         return {"error": "Memory service not initialized", "pruned": 0, "kept": 0, "total_processed": 0}
     
@@ -4793,19 +4738,7 @@ async def memory_delete(
     memory_id: str,
     codebase: str | None = None
 ) -> dict[str, Any]:
-    """
-    Delete a specific memory by ID.
-    
-    Use this to remove outdated decisions or lessons when they are superseded.
-    Unlike prune, this can delete pinned memories (decisions, lessons).
-    
-    Args:
-        memory_id: The ID of the memory to delete (returned when storing)
-        codebase: Optional codebase to delete from (searches all if not specified)
-    
-    Returns:
-        Dictionary with deletion result
-    """
+    """Delete a memory by ID. Can delete pinned memories (decisions, lessons)."""
     if not memory_service:
         return {"error": "Memory service not initialized", "success": False}
     
@@ -4819,15 +4752,7 @@ async def memory_delete(
 async def memory_import_graph_stats(
     codebase: str | None = None
 ) -> dict[str, Any]:
-    """
-    Get import graph statistics for codebases.
-    
-    Args:
-        codebase: Optional codebase name (None = all codebases)
-    
-    Returns:
-        Dictionary with import graph statistics including file counts, edges, and centrality info
-    """
+    """Get import graph statistics (file counts, edges, centrality) for a codebase."""
     if not memory_service:
         return {"error": "Memory service not initialized"}
     
@@ -4839,19 +4764,7 @@ async def memory_file_centrality(
     codebase: str,
     max_files: int = 20
 ) -> dict[str, Any]:
-    """
-    Get files sorted by centrality score (importance in dependency graph).
-    
-    Files with higher centrality are more "central" to the codebase and are
-    imported by many other files, making them good candidates for LLM summarization.
-    
-    Args:
-        codebase: Codebase name
-        max_files: Maximum number of files to return (default 20)
-    
-    Returns:
-        Dictionary with list of files and their centrality scores
-    """
+    """Get files ranked by import centrality (most-imported first)."""
     if not memory_service:
         return {"error": "Memory service not initialized"}
     
@@ -4874,16 +4787,7 @@ async def memory_file_dependencies(
     codebase: str,
     file_path: str
 ) -> dict[str, Any]:
-    """
-    Get dependency information for a specific file.
-    
-    Args:
-        codebase: Codebase name
-        file_path: Path to the file
-    
-    Returns:
-        Dictionary with file dependency information including imports and imported_by lists
-    """
+    """Get imports and imported_by lists for a specific file."""
     if not memory_service:
         return {"error": "Memory service not initialized"}
     
@@ -4899,21 +4803,7 @@ async def memory_file_dependencies(
 
 @mcp.tool()
 async def memory_summarization_status() -> dict[str, Any]:
-    """
-    Get the status of background LLM summarization.
-    
-    Returns:
-        Dictionary with summarization status including:
-        - enabled: Whether summarization is enabled
-        - is_running: Whether summarization is currently active
-        - files_queued: Files waiting to be summarized
-        - files_completed: Files summarized this session
-        - total_summarized: Total files with summaries (persistent)
-        - current_file: File currently being processed
-        - avg_time_per_file_seconds: Average processing time per file
-        - estimated_time_remaining_seconds: Estimated time to complete queue
-        - estimated_time_remaining_minutes: Estimated time in minutes
-    """
+    """Get background LLM summarization status: queue size, progress, ETA."""
     if not memory_service:
         return {"error": "Memory service not initialized"}
     
@@ -4922,15 +4812,7 @@ async def memory_summarization_status() -> dict[str, Any]:
 
 @mcp.tool()
 async def memory_reindex_codebase(codebase: str) -> dict[str, Any]:
-    """
-    Force reindexing of a specific codebase to update metadata and heuristics.
-    
-    Args:
-        codebase: Name of the codebase to reindex
-    
-    Returns:
-        Dictionary with reindexing results
-    """
+    """Force reindex a codebase to update metadata and heuristics."""
     if not memory_service:
         return {"error": "Memory service not initialized"}
     
@@ -4946,34 +4828,7 @@ async def memory_queue_codebase_summarization(
     codebase: str, 
     only_missing: bool = True
 ) -> dict[str, Any]:
-    """
-    Queue all files from a specific codebase for LLM summarization.
-    
-    Use this when:
-    - Adding a new codebase that hasn't been summarized yet
-    - Re-summarizing an existing codebase after making changes
-    - Resuming summarization after it was interrupted
-    
-    Args:
-        codebase: Name of the codebase to queue for summarization
-        only_missing: If True (default), only queue files without summaries.
-                     If False, queue all files for re-summarization.
-    
-    Returns:
-        Dictionary with queue results:
-        - success: Whether the operation succeeded
-        - message: Human-readable status message
-        - files_queued: Number of files added to the queue
-        - files_skipped: Number of files skipped (already summarized or excluded)
-        - total_queue_size: Current total queue size
-    
-    Example:
-        # Queue new codebase for first-time summarization
-        memory_queue_codebase_summarization("my-new-project")
-        
-        # Re-summarize entire codebase
-        memory_queue_codebase_summarization("my-project", only_missing=False)
-    """
+    """Queue codebase files for LLM summarization. only_missing=True skips already-summarized files."""
     if not memory_service:
         return {"error": "Memory service not initialized"}
     
@@ -4990,50 +4845,7 @@ async def memory_method_relationships(
     codebase: str | None = None,
     relationship: str = "all"
 ) -> dict[str, Any]:
-    """
-    Query method call relationships (callers and callees) for a specific method.
-    
-    This enables "what calls X?" and "what does X call?" queries using the
-    method call graph built during indexing.
-    
-    Args:
-        method: The method name to query. Can be:
-            - Simple name: "process_data" - matches any method with this name
-            - Qualified name: "MyClass.process_data" - matches exact qualified name
-        codebase: Codebase to search in (None = uses first/default codebase)
-        relationship: Type of relationships to return:
-            - "callers": Only methods that call this method
-            - "callees": Only methods called by this method
-            - "all" (default): Both callers and callees
-    
-    Returns:
-        Dictionary with:
-        - method: The queried method name
-        - codebase: The codebase searched
-        - callers: List of calling methods (if relationship is "callers" or "all")
-        - callees: List of called methods (if relationship is "callees" or "all")
-        - stats: Summary counts (caller_count, callee_count)
-        
-        Each caller/callee entry contains:
-        - name: The qualified method name
-        - file: Path to the source file
-        - line: Line number where method is defined
-        - class_name: Containing class (if any)
-    
-    Example:
-        # Find what calls _generate_features
-        memory_method_relationships(
-            method="_generate_features",
-            codebase="options-ml-trader",
-            relationship="callers"
-        )
-        
-        # Find what process_data calls
-        memory_method_relationships(
-            method="MyClass.process_data",
-            relationship="callees"
-        )
-    """
+    """Query callers/callees for a method. relationship: 'callers', 'callees', or 'all'."""
     if not memory_service:
         return {"error": "Memory service not initialized"}
     
@@ -5127,40 +4939,7 @@ async def memory_method_relationships(
 async def memory_invalidate_summaries(
     codebase: str | None = None
 ) -> dict[str, Any]:
-    """
-    Invalidate all existing summaries to force re-summarization.
-    
-    This is useful when:
-    - The summary schema has changed (new fields, different format)
-    - Summaries need to be regenerated with a different model
-    - Summaries are corrupted or inconsistent
-    
-    The operation clears:
-    1. All entries from the summary index (file -> summary mapping)
-    2. All summary chunks from the main collection (searchable summary text)
-    3. Updates the schema version to current
-    
-    After invalidation:
-    - Use memory_queue_codebase_summarization to re-summarize files
-    - Or wait for the background summarizer to pick up the files
-    
-    Args:
-        codebase: Optional codebase name to invalidate (None = all codebases)
-    
-    Returns:
-        Dictionary with:
-        - success: Whether the operation succeeded
-        - total_summaries_cleared: Total summary entries removed
-        - total_chunks_removed: Total summary chunks removed from main collection
-        - codebases: Per-codebase breakdown
-    
-    Example:
-        # Invalidate all summaries in all codebases
-        memory_invalidate_summaries()
-        
-        # Invalidate summaries for a specific codebase
-        memory_invalidate_summaries(codebase="my-project")
-    """
+    """Clear all summaries to force re-summarization. Use memory_queue_codebase_summarization after."""
     if not memory_service:
         return {"error": "Memory service not initialized"}
     
